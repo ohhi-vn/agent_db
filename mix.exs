@@ -36,7 +36,9 @@ defmodule AgentDb.MixProject do
       {:jason, "~> 1.4"},
       {:req, "~> 0.5"},
       {:tailwind, "~> 0.2", runtime: false, manager: :mix},
-      {:esbuild, "~> 0.7", runtime: false, manager: :mix}
+      {:esbuild, "~> 0.7", runtime: false, manager: :mix},
+      {:emlx, "~> 0.4.2", runtime: false, manager: :mix, override: true},
+      {:emlx_axon, "~> 0.4.2", optional: true, runtime: false, manager: :mix}
     ]
   end
 end
