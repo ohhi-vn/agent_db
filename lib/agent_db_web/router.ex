@@ -1,0 +1,48 @@
+defmodule AgentDbWeb.Router do
+  use AgentDbWeb, :router
+
+  import Phoenix.LiveView.Router
+
+  alias AgentDbWeb.Plugs.{AuthPlug, CORSPlug, SessionAuth}
+
+  pipeline :browser do
+    plug :accepts, ["html"]
+    plug :fetch_session
+    plug :fetch_live_flash
+    plug :put_secure_browser_headers
+    plug :protect_from_forgery
+    plug SessionAuth
+  end
+
+  pipeline :api do
+    plug :accepts, ["json"]
+    plug AuthPlug
+    plug CORSPlug
+  end
+
+  scope "/", AgentDbWeb do
+    pipe_through :browser
+    live "/admin", AdminLive, :index
+    live "/admin/documents/:id/edit", DocumentEditorLive, :edit
+  end
+
+  scope "/api/v1", AgentDbWeb.Controllers do
+    pipe_through :api
+    get "/health", HealthController, :show
+    resources "/documents", DocumentController, except: [:new, :edit]
+    post "/search", SearchController, :search
+    get "/search/suggest", SearchController, :suggest
+    resources "/sessions", SessionController, only: [:create, :show] do
+      post "/messages", SessionController, :append_message
+      post "/commit", SessionController, :commit
+    end
+    get "/models/status", ModelController, :status
+  end
+
+  if Mix.env() == :dev do
+    scope "/dev", AgentDbWeb do
+      pipe_through :browser
+      forward "/dashboard", Phoenix.LiveDashboard, metrics: true
+    end
+  end
+end

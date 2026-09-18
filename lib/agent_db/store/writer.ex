@@ -1,0 +1,70 @@
+defmodule AgentDb.Store.Writer do
+  @moduledoc false
+
+  # Single writer process: owns the only SQLite write connection and serializes
+  # every write. Readers use their own connections (see AgentDb.Store).
+  # All database mutation funs run in this process via GenServer.call.
+
+  use GenServer
+  alias AgentDb.Store.SQLite
+
+  @type write_fun :: (SQLite.conn() -> {:ok, term()} | {:error, term()} | term())
+
+  # -- Client API --
+
+  @spec start_link(keyword()) :: GenServer.on_start()
+  def start_link(opts) do
+    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+  end
+
+  @doc """
+  Runs `fun.(write_conn)` on the writer connection. The reply is whatever `fun`
+  returns; callers must return ok/error tuples for composable error handling.
+  """
+  @spec call(write_fun(), non_neg_integer() | nil) :: term()
+  def call(fun, timeout \\ nil) do
+    case timeout do
+      nil -> GenServer.call(__MODULE__, {:write, fun})
+      ms -> GenServer.call(__MODULE__, {:write, fun}, ms)
+    end
+  end
+
+  @doc "Returns the writer connection for read-only fallback use in tests."
+  @spec conn() :: SQLite.conn()
+  def conn do
+    GenServer.call(__MODULE__, :conn)
+  end
+
+  # -- Server callbacks --
+
+  @impl true
+  def init(opts) do
+    path = Keyword.fetch!(opts, :path)
+    schema? = Keyword.get(opts, :ensure_schema, true)
+
+    case SQLite.open(path) do
+      {:ok, conn} ->
+        with :ok <- maybe_schema(conn, schema?) do
+          {:ok, %{conn: conn}}
+        else
+          {:error, reason} -> {:stop, {:schema_failed, reason}}
+        end
+
+      {:error, reason} ->
+        {:stop, {:open_failed, reason}}
+    end
+  end
+
+  @impl true
+  def handle_call({:write, fun}, _from, state) do
+    {:reply, fun.(state.conn), state}
+  end
+
+  @impl true
+  def handle_call(:conn, _from, state) do
+    {:reply, state.conn, state}
+  end
+
+  defp maybe_schema(_conn, false), do: :ok
+  defp maybe_schema(conn, true), do: SQLite.ensure_schema(conn)
+end
