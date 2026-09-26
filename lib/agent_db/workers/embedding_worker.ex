@@ -15,6 +15,10 @@ defmodule AgentDb.Workers.EmbeddingWorker do
 
   require Logger
 
+  # How long to wait before re-checking a model that is still loading. Short
+  # enough that a completed load is picked up promptly, long enough not to spin.
+  @model_loading_delay_ms 1_000
+
   @type state :: %{
           worker_id: String.t(),
           running: boolean()
@@ -79,29 +83,35 @@ defmodule AgentDb.Workers.EmbeddingWorker do
       {:ok, [embedding]} ->
         # Store embedding in vec_nodes
         Writer.call(fn conn ->
-          case SQLite.exec_write(
-                 conn,
-                 """
-                 INSERT INTO vec_nodes (embedding, uri)
-                 VALUES (?1, ?2)
-                 ON CONFLICT(uri) DO UPDATE SET embedding = excluded.embedding
-                 """,
-                 [to_binary(embedding), uri]
-               ) do
-            :ok ->
-              # Update nodes.updated_at
-              Nodes.update_updated_at(conn, uri, System.system_time(:millisecond))
-              JobQueue.complete(job_id)
-              Invalidate.on_write(uri)
-              Logger.info("Embedding stored for #{uri}")
+          # The node may have been removed while we were embedding. Embedding is
+          # computed outside any transaction, so a removal that committed
+          # mid-compute is invisible to us until we look now. Cancelling the
+          # queued job cannot close that window, because dequeue/1 already
+          # flipped it to "running" before this process started. Re-checking
+          # here, on the same connection that persists the result, is what
+          # makes "a removed URI never regains an embedding" hold.
+          case Nodes.exists?(conn, uri) do
+            {:ok, false} ->
+              Logger.info("Discarding embedding for removed #{uri}")
+              JobQueue.complete(conn, job_id)
               :ok
 
-            {:error, err} ->
-              Logger.error("Failed to store embedding for #{uri}: #{inspect(err)}")
-              JobQueue.fail(job_id, err)
-              {:error, err}
+            {:ok, true} ->
+              store_embedding(conn, job_id, uri, embedding)
+
+            {:error, reason} ->
+              Logger.error("Existence check failed for #{uri}: #{inspect(reason)}")
+              JobQueue.fail(conn, job_id, reason)
+              {:error, reason}
           end
         end)
+
+      # A model that is still loading is not a failure. Requeue without
+      # spending a retry attempt, so a slow first download cannot exhaust the
+      # budget and mark the job failed before the model could ever arrive.
+      {:error, :model_loading} ->
+        Logger.info("Deferring embed for #{uri}: model still loading")
+        JobQueue.defer(job_id, @model_loading_delay_ms)
 
       {:error, reason} ->
         Logger.error("Failed to generate embedding for #{uri}: #{inspect(reason)}")
@@ -110,6 +120,31 @@ defmodule AgentDb.Workers.EmbeddingWorker do
   end
 
   defp process_embed_job(%{id: job_id, kind: kind}), do: JobQueue.fail(job_id, {:invalid_kind, kind})
+
+  defp store_embedding(conn, job_id, uri, embedding) do
+    case SQLite.exec_write(
+           conn,
+           """
+           INSERT INTO vec_nodes (embedding, uri)
+           VALUES (?1, ?2)
+           ON CONFLICT(uri) DO UPDATE SET embedding = excluded.embedding
+           """,
+           [to_binary(embedding), uri]
+         ) do
+      :ok ->
+        # Update nodes.updated_at
+        Nodes.update_updated_at(conn, uri, System.system_time(:millisecond))
+        JobQueue.complete(conn, job_id)
+        Invalidate.on_write(uri)
+        Logger.info("Embedding stored for #{uri}")
+        :ok
+
+      {:error, err} ->
+        Logger.error("Failed to store embedding for #{uri}: #{inspect(err)}")
+        JobQueue.fail(conn, job_id, err)
+        {:error, err}
+    end
+  end
 
   defp to_binary(tensor) do
     # Convert Nx.Tensor to binary blob of float32 for sqlite-vec

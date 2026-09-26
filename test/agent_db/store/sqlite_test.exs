@@ -177,6 +177,96 @@ defmodule AgentDb.Store.SQLiteTest do
     :ok = SQLite.close(conn)
   end
 
+  describe "vec_available?/1" do
+    test "reports false when the sqlite-vec extension is not loaded" do
+      path = temp_path()
+      on_exit(fn -> File.rm(path) end)
+
+      {:ok, conn} = SQLite.open(path)
+      :ok = SQLite.ensure_schema(conn)
+
+      # vec_nodes is only created when the extension loads, so availability and
+      # the table's existence must agree.
+      assert SQLite.vec_available?(conn) == ("vec_nodes" in table_names(conn))
+
+      :ok = SQLite.close(conn)
+    end
+  end
+
+  describe "transaction/2" do
+    setup do
+      path = temp_path()
+      on_exit(fn -> File.rm(path) end)
+
+      {:ok, conn} = SQLite.open(path)
+      :ok = SQLite.ensure_schema(conn)
+      %{conn: conn}
+    end
+
+    test "commits when the fun returns :ok or {:ok, _}", %{conn: conn} do
+      assert :ok = SQLite.transaction(conn, fn c -> insert_node(c, "viking://a") end)
+      assert {:ok, [1]} = count_nodes(conn, "viking://a")
+
+      assert {:ok, :inserted} =
+               SQLite.transaction(conn, fn c ->
+                 with :ok <- insert_node(c, "viking://b"), do: {:ok, :inserted}
+               end)
+
+      assert {:ok, [1]} = count_nodes(conn, "viking://b")
+    end
+
+    test "rolls back and propagates the error when the fun fails", %{conn: conn} do
+      assert {:error, :boom} =
+               SQLite.transaction(conn, fn c ->
+                 :ok = insert_node(c, "viking://a")
+                 {:error, :boom}
+               end)
+
+      assert {:ok, [0]} = count_nodes(conn, "viking://a")
+
+      # The connection must still be usable, and not left inside a transaction.
+      assert :ok = SQLite.transaction(conn, fn c -> insert_node(c, "viking://c") end)
+      assert {:ok, [1]} = count_nodes(conn, "viking://c")
+    end
+
+    test "rolls back when the fun raises, leaving the connection usable", %{conn: conn} do
+      assert_raise RuntimeError, "kaboom", fn ->
+        SQLite.transaction(conn, fn c ->
+          :ok = insert_node(c, "viking://a")
+          raise "kaboom"
+        end)
+      end
+
+      # No manual ROLLBACK: the helper must have unwound the transaction itself,
+      # otherwise the Writer's connection stays poisoned for every later write.
+      assert {:ok, [0]} = count_nodes(conn, "viking://a")
+
+      assert :ok = SQLite.transaction(conn, fn c -> insert_node(c, "viking://c") end)
+      assert {:ok, [1]} = count_nodes(conn, "viking://c")
+    end
+  end
+
+  defp insert_node(conn, uri) do
+    now = System.system_time(:millisecond)
+
+    SQLite.exec_write(
+      conn,
+      "INSERT INTO nodes (uri, parent_uri, name, kind, content, created_at, updated_at) VALUES (?1, NULL, 'n', 'doc', 'c', ?2, ?2)",
+      [uri, now]
+    )
+  end
+
+  defp count_nodes(conn, uri) do
+    SQLite.query_one(conn, "SELECT COUNT(*) FROM nodes WHERE uri = ?1", [uri])
+  end
+
+  defp table_names(conn) do
+    {:ok, rows} =
+      SQLite.query(conn, "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+
+    Enum.map(rows, &hd/1)
+  end
+
   defp temp_path,
     do: Path.join(System.tmp_dir!(), "agent_db_test_#{:erlang.unique_integer([:positive])}.db")
 end

@@ -10,10 +10,12 @@ defmodule AgentDb.Workers.SummarizationWorker do
 
   alias AgentDb.JobQueue
   alias AgentDb.ML.ModelManager
-  alias AgentDb.Store.{SQLite, Writer}
+  alias AgentDb.Store.{Nodes, SQLite, Writer}
   alias AgentDb.Cache.Invalidate
 
   require Logger
+
+  @model_loading_delay_ms 1_000
 
   @type state :: %{
           worker_id: String.t(),
@@ -93,28 +95,57 @@ defmodule AgentDb.Workers.SummarizationWorker do
     case ModelManager.summarize(prompt, max_tokens: 256) do
       {:ok, summary} ->
         Writer.call(fn conn ->
-          field_col = if field == :abstract, do: "abstract", else: "overview"
-          case SQLite.exec_write(
-                 conn,
-                 "UPDATE nodes SET #{field_col} = ?1, updated_at = ?2 WHERE uri = ?3",
-                 [summary, System.system_time(:millisecond), uri]
-               ) do
-            :ok ->
-              JobQueue.complete(job_id)
-              Invalidate.on_write(uri)
-              Logger.info("#{field} generated for #{uri}")
+          # The node may have been removed while the LLM was running. Summaries
+          # are computed outside any transaction, so a removal that committed
+          # mid-compute is invisible until we look now, and cancelling the
+          # queued job cannot help because dequeue/1 already claimed it. Check
+          # on the same connection that persists the result.
+          case Nodes.exists?(conn, uri) do
+            {:ok, false} ->
+              Logger.info("Discarding #{field} for removed #{uri}")
+              JobQueue.complete(conn, job_id)
               :ok
 
-            {:error, err} ->
-              Logger.error("Failed to store #{field} for #{uri}: #{inspect(err)}")
-              JobQueue.fail(job_id, err)
-              {:error, err}
+            {:ok, true} ->
+              store_summary(conn, job_id, uri, summary, field)
+
+            {:error, reason} ->
+              Logger.error("Existence check failed for #{uri}: #{inspect(reason)}")
+              JobQueue.fail(conn, job_id, reason)
+              {:error, reason}
           end
         end)
+
+      # See EmbeddingWorker: waiting for a model is not a failure and must not
+      # consume the job's retry budget.
+      {:error, :model_loading} ->
+        Logger.info("Deferring #{field} for #{uri}: model still loading")
+        JobQueue.defer(job_id, @model_loading_delay_ms)
 
       {:error, reason} ->
         Logger.error("Failed to generate #{field} for #{uri}: #{inspect(reason)}")
         JobQueue.fail(job_id, reason)
+    end
+  end
+
+  defp store_summary(conn, job_id, uri, summary, field) do
+    field_col = if field == :abstract, do: "abstract", else: "overview"
+
+    case SQLite.exec_write(
+           conn,
+           "UPDATE nodes SET #{field_col} = ?1, updated_at = ?2 WHERE uri = ?3",
+           [summary, System.system_time(:millisecond), uri]
+         ) do
+      :ok ->
+        JobQueue.complete(conn, job_id)
+        Invalidate.on_write(uri)
+        Logger.info("#{field} generated for #{uri}")
+        :ok
+
+      {:error, err} ->
+        Logger.error("Failed to store #{field} for #{uri}: #{inspect(err)}")
+        JobQueue.fail(conn, job_id, err)
+        {:error, err}
     end
   end
 

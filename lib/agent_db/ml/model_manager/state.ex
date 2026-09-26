@@ -8,17 +8,21 @@ defmodule AgentDb.ML.ModelManager.State do
           serving: module()
         }
 
+  @type load_status :: :idle | :loading | :ready | :failed
+
   @type t :: %__MODULE__{
           embedding_model: model_ref() | nil,
           llm_model: model_ref() | nil,
-          loading: map(),
+          loading: %{optional(:embedding) => load_status(), optional(:llm) => load_status()},
+          loading_ref: reference() | nil,
           config: map()
         }
 
   defstruct [
     embedding_model: nil,
     llm_model: nil,
-    loading: %{},
+    loading: %{embedding: :idle, llm: :idle},
+    loading_ref: nil,
     config: %{}
   ]
 end

@@ -10,11 +10,24 @@ defmodule AgentDb do
   alias AgentDb.Cache.Invalidate
   alias AgentDb.JobQueue
   alias AgentDb.ML.ModelManager
+  alias AgentDb.Store.Memories
   alias AgentDb.Store.Nodes
   alias AgentDb.Store.Reader
   alias AgentDb.Store.Writer
   alias AgentDb.URI
   alias AgentDb.Config
+
+  @sync_write_timeout_ms 30_000
+  @sync_write_poll_ms 100
+
+  # Memories live in a reserved subtree, and a memory's type is the first path
+  # segment beneath it. Deriving the type from the URI rather than taking it as
+  # an option is what keeps a memory an ordinary document: recall by type is
+  # then a prefix query, and a memory's stated type can never contradict where
+  # it is filed.
+  @memories_root ["user", "memories"]
+  @memory_types ~w(profile preferences entities events experiences)
+  @default_confidence 0.5
 
   @type uri :: String.t()
   @type content :: String.t()
@@ -28,7 +41,16 @@ defmodule AgentDb do
   
   When `async_writes: true` (default), returns immediately and enqueues
   background jobs for embedding generation and LLM summarization.
-  When `async_writes: false`, blocks until all background jobs complete.
+  When `async_writes: false`, blocks until all background jobs complete and
+  reports which of three things happened: completed (`:ok`), failed
+  (`{:error, {:background_jobs_failed, uri}}`), or still outstanding
+  (`{:error, {:background_jobs_pending, uri}}`). A failed job is never
+  reported as success.
+
+  Options:
+    - `:async` - override `async_writes`
+    - `:sync_timeout_ms` - how long sync mode waits before reporting work as
+      still outstanding (default 30_000)
   """
   @spec write(uri(), content(), keyword()) :: :ok | {:error, term()}
   def write(uri, content, opts \\ []) when is_binary(content) do
@@ -53,68 +75,80 @@ defmodule AgentDb do
   end
 
   defp enqueue_background_jobs(uri, content, opts) do
-    # Always enqueue embedding job
-    JobQueue.enqueue(:embed, %{uri: uri, content: content})
+    kinds =
+      [:embed] ++
+        summarization_kinds(opts)
 
-    # Enqueue abstract summarization if not provided
-    if Keyword.get(opts, :abstract) == nil do
-      JobQueue.enqueue(:summarize_abstract, %{uri: uri, content: content})
-    end
+    enqueue_jobs(uri, content, kinds)
+  end
 
-    # Enqueue overview summarization if not provided
-    if Keyword.get(opts, :overview) == nil do
-      JobQueue.enqueue(:summarize_overview, %{uri: uri, content: content})
-    end
+  # Summarization is skipped when the caller supplied that layer, so a re-write
+  # that already carries an abstract does not pay to regenerate one.
+  defp summarization_kinds(opts) do
+    Enum.filter(
+      [
+        summarize_abstract: Keyword.get(opts, :abstract),
+        summarize_overview: Keyword.get(opts, :overview)
+      ],
+      fn {_kind, supplied} -> supplied == nil end
+    )
+    |> Enum.map(&elem(&1, 0))
+  end
+
+  defp enqueue_jobs(uri, content, kinds) do
+    Enum.each(kinds, &JobQueue.enqueue(&1, %{uri: uri, content: content}))
   end
 
   defp wait_for_background_jobs(uri, content, opts) do
-    # For sync mode, we wait for all jobs to complete
-    # This is a simplified implementation - in production you'd want
-    # proper polling with timeout
-    jobs_to_wait = 1  # embedding
-    jobs_to_wait = jobs_to_wait + (if Keyword.get(opts, :abstract) == nil, do: 1, else: 0)
-    jobs_to_wait = jobs_to_wait + (if Keyword.get(opts, :overview) == nil, do: 1, else: 0)
-
     enqueue_background_jobs(uri, content, opts)
-    
-    # Poll for completion with timeout
-    timeout = 30_000  # 30 seconds
-    poll_interval = 100
-    max_polls = div(timeout, poll_interval)
-    
-    wait_for_jobs(uri, jobs_to_wait, max_polls, poll_interval)
+    timeout = Keyword.get(opts, :sync_timeout_ms, @sync_write_timeout_ms)
+    await_jobs(uri, timeout, @sync_write_poll_ms)
   end
 
-  defp wait_for_jobs(_uri, 0, _max_polls, _poll_interval), do: :ok
-  
-  defp wait_for_jobs(uri, _jobs_remaining, max_polls, poll_interval) when max_polls > 0 do
-    :timer.sleep(poll_interval)
-    
-    # Check how many jobs are still pending/running for this URI
-    remaining = count_pending_jobs(uri)
-    
-    if remaining == 0 do
-      :ok
-    else
-      wait_for_jobs(uri, remaining, max_polls - 1, poll_interval)
+  # Sync mode reports which of three things happened. It used to return :ok
+  # whenever the queue looked idle, but the pending count excluded 'failed', so
+  # a job that died on its first attempt read as "nothing outstanding" and the
+  # write reported success having done nothing.
+  defp await_jobs(uri, timeout, poll_interval) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+    do_await_jobs(uri, deadline, poll_interval)
+  end
+
+  defp do_await_jobs(uri, deadline, poll_interval) do
+    cond do
+      count_active_jobs(uri) > 0 ->
+        if System.monotonic_time(:millisecond) >= deadline do
+          {:error, {:background_jobs_pending, uri}}
+        else
+          :timer.sleep(poll_interval)
+          do_await_jobs(uri, deadline, poll_interval)
+        end
+
+      count_failed_jobs(uri) > 0 ->
+        {:error, {:background_jobs_failed, uri}}
+
+      true ->
+        :ok
     end
   end
 
-  defp wait_for_jobs(_uri, _remaining, 0, _poll_interval) do
-    # Timeout reached
-    :ok
-  end
+  defp count_active_jobs(uri), do: count_jobs(uri, ["pending", "running"])
 
-  defp count_pending_jobs(uri) do
+  defp count_failed_jobs(uri), do: count_jobs(uri, ["failed"])
+
+  defp count_jobs(uri, statuses) do
+    placeholders = Enum.map_join(statuses, ", ", fn _ -> "?" end)
+
     Reader.read(fn conn ->
+      query =
+        "SELECT COUNT(*) FROM job_queue " <>
+          "WHERE json_extract(payload, '$.uri') = ?1 " <>
+          "AND status IN (#{placeholders})"
+
       case AgentDb.Store.SQLite.query_one(
              conn,
-             """
-             SELECT COUNT(*) FROM job_queue 
-             WHERE (payload LIKE ?1 OR payload LIKE ?2 OR payload LIKE ?3)
-             AND status IN ('pending', 'running')
-             """,
-             ["%#{uri}%", "%#{uri}%", "%#{uri}%"]
+             query,
+             [uri | Enum.map(statuses, & &1)]
            ) do
         {:ok, [count]} -> count
         _ -> 0
@@ -270,30 +304,27 @@ defmodule AgentDb do
 
   defp hybrid_search(term, opts) do
     top_k = Keyword.get(opts, :top_k, 10)
-    scope = Keyword.get(opts, :scope)
     {w_keyword, w_vector} = Keyword.get(opts, :hybrid_weights, {0.5, 0.5})
     k = 60  # RRF constant
-
-    _scope_prefix =
-      case scope do
-        nil -> nil
-        uri ->
-          case URI.parse(uri) do
-            {:ok, segs} -> URI.scope_prefix(nil, segs)
-            {:error, _} = err -> err
-          end
-      end
 
     # Run both searches in parallel
     keyword_task = Task.async(fn -> keyword_search(term, opts) end)
     vector_task = Task.async(fn -> vector_search(term, opts) end)
 
-    {:ok, keyword_results} = Task.await(keyword_task, 10_000)
-    {:ok, vector_results} = Task.await(vector_task, 10_000)
+    # Both legs are drained before either is inspected, so a failure in one
+    # does not leave the other task's result unread.
+    keyword_result = Task.await(keyword_task, 10_000)
+    vector_result = Task.await(vector_task, 10_000)
 
-    # Reciprocal Rank Fusion
-    fused = rrf_fuse(keyword_results, vector_results, k, w_keyword, w_vector)
-    {:ok, Enum.take(fused, top_k)}
+    # Either leg can be unservable -- no vector index, or no embedding model.
+    # That is reported to the caller rather than raised, so a remote client
+    # gets an error response instead of a dead process.
+    with {:ok, keyword_results} <- keyword_result,
+         {:ok, vector_results} <- vector_result do
+      # Reciprocal Rank Fusion
+      fused = rrf_fuse(keyword_results, vector_results, k, w_keyword, w_vector)
+      {:ok, Enum.take(fused, top_k)}
+    end
   end
 
   defp vector_search_impl(conn, query_embedding, top_k, scope_prefix) do
@@ -451,6 +482,12 @@ defmodule AgentDb do
     with {:ok, segments} <- URI.parse(destination_uri),
          {:ok, messages} <- get_session(session_id),
          {:ok, result} <- persist_commit(segments, session_id, messages, opts) do
+      # :unchanged left SQLite untouched, so the cache already matches disk and
+      # dropping it would be a wasted rebuild. A real commit rewrote the
+      # document, so the warm cache would otherwise keep serving the content
+      # from before this commit.
+      if result != :unchanged, do: Invalidate.on_write(result)
+
       {:ok, result}
     else
       :root -> {:error, :is_root}
@@ -474,7 +511,7 @@ defmodule AgentDb do
              "SELECT content_hash FROM commit_meta WHERE session_id = ?1 AND destination_uri = ?2",
              [session_id, URI.build(segments)]
            ) do
-        {:ok, [[^hash]]} ->
+        {:ok, [^hash]} ->
           {:ok, :unchanged}
 
         _ ->
@@ -516,6 +553,236 @@ defmodule AgentDb do
   defp format_messages(messages) do
     Enum.map(messages, fn m -> "#{m.role}: #{m.content}" end)
     |> Enum.join("\n\n")
+  end
+
+  # -- Memory --
+
+  @doc """
+  Records a durable fact as a memory at `uri`, which must sit beneath
+  `viking://user/memories/<type>/`. The `<type>` segment is drawn from
+  `profile`, `preferences`, `entities`, `events`, `experiences` and is the
+  memory's type.
+
+  The URI is the identity of the thing being asserted, so recording at a URI
+  that already holds a memory revises it: the prior value is retained as
+  superseded and linked to the assertion that replaced it. Recording at a URI
+  that holds nothing creates it.
+
+  Recording enqueues embedding generation and no summarization: L0 and L1 exist
+  to compress a document large enough that reading it whole is wasteful, and
+  they can say nothing about an atomic fact that its value does not already say.
+  No language model is required, so this succeeds with none loaded.
+
+  Options:
+    - `:confidence` - how firmly the fact is held, 0.0..1.0 (default #{@default_confidence})
+    - `:source` - provenance, e.g. the originating session id
+
+  Returns `{:ok, uri}`, `{:error, {:invalid_memory_type, type}}` for a type
+  outside the taxonomy, `{:error, {:not_a_memory_uri, uri}}` for a URI outside
+  the memories root, or `{:error, :invalid_uri}`.
+  """
+  @spec remember(uri(), content(), keyword()) :: {:ok, uri()} | {:error, term()}
+  def remember(uri, value, opts \\ []) when is_binary(value) do
+    confidence = Keyword.get(opts, :confidence, @default_confidence)
+    source = Keyword.get(opts, :source)
+
+    with {:ok, segments} <- memory_location(uri),
+         :ok <- validate_confidence(confidence),
+         {:ok, ^uri} <- persist_memory(segments, value, confidence, source) do
+      Invalidate.on_write(uri)
+      enqueue_jobs(uri, value, [:embed])
+      {:ok, uri}
+    end
+  end
+
+  @doc """
+  Reads memories back. Accepts a URI directly, or options:
+
+    - `:uri` - recall one memory or a subtree
+    - `:type` - recall a whole type, e.g. `:events`
+    - `:term` - restrict to memories whose value contains this substring
+    - `:include_superseded` - also return superseded assertions, for inspecting
+      how a memory's value changed (default `false`)
+
+  `:uri` and `:type` both scope the recall; when both are given `:uri` wins.
+  Results are ordered by descending confidence. A recall matching nothing
+  returns `{:ok, []}`.
+
+  Each entry carries `:id`, `:uri`, `:value`, `:type`, `:confidence`, `:source`,
+  `:status`, `:supersedes` and `:updated_at`. With `include_superseded: true`,
+  a superseded entry's `:supersedes` is the `:id` of the assertion that replaced
+  it, so the chain can be walked from either end.
+  """
+  @spec recall(uri() | keyword()) :: {:ok, [map()]} | {:error, term()}
+  def recall(uri_or_opts \\ [])
+
+  def recall(uri) when is_binary(uri), do: recall(uri: uri)
+
+  def recall(opts) when is_list(opts) do
+    term = Keyword.get(opts, :term)
+
+    statuses =
+      if Keyword.get(opts, :include_superseded, false) do
+        [:active, :superseded]
+      else
+        [:active]
+      end
+
+    with {:ok, prefix} <- recall_scope(opts) do
+      Reader.read(fn conn ->
+        case Memories.list(conn, prefix, term, statuses) do
+          {:ok, rows} -> {:ok, Enum.map(rows, &memory_entry/1)}
+          {:error, _} = err -> err
+        end
+      end)
+    end
+  end
+
+  @doc """
+  Removes the memory at `uri` along with its provenance: its value, every
+  assertion recorded there including superseded ones, and its document. Returns
+  `:ok`, or `{:error, :no_memory}` when no memory is recorded at that URI.
+
+  Supersession, not forgetting, is what preserves history. A URI holding only
+  an ordinary document is left alone.
+  """
+  @spec forget(uri()) :: :ok | {:error, term()}
+  def forget(uri) do
+    with {:ok, segments} <- URI.parse(uri),
+         {:ok, true} <- memory_recorded?(uri),
+         :ok <- persist_rm(segments) do
+      Invalidate.on_rm(uri)
+      :ok
+    else
+      :root -> {:error, :is_root}
+      {:ok, false} -> {:error, :no_memory}
+      {:error, _} = err -> err
+    end
+  end
+
+  @doc "The memory types, for callers that need to enumerate the taxonomy."
+  @spec memory_types() :: [String.t()]
+  def memory_types, do: @memory_types
+
+  @doc "The default confidence recorded when a caller supplies none."
+  @spec default_confidence() :: float()
+  def default_confidence, do: @default_confidence
+
+  # Parses `uri` and checks it names a slot inside the memories root whose first
+  # segment is a known type. Returns the segments to persist and the type.
+  defp memory_location(uri) do
+    case URI.parse(uri) do
+      {:ok, [_user, "memories", type | rest]} when rest != [] ->
+        if type in @memory_types do
+          {:ok, URI.parse(uri) |> elem(1)}
+        else
+          {:error, {:invalid_memory_type, type}}
+        end
+
+      {:ok, _segments} ->
+        {:error, {:not_a_memory_uri, uri}}
+
+      {:error, :invalid_uri} ->
+        {:error, :invalid_uri}
+    end
+  end
+
+  defp validate_confidence(confidence) when is_number(confidence) do
+    if confidence >= 0.0 and confidence <= 1.0 do
+      :ok
+    else
+      {:error, {:invalid_confidence, confidence}}
+    end
+  end
+
+  defp validate_confidence(confidence), do: {:error, {:invalid_confidence, confidence}}
+
+  # Node and assertion are written in one Writer call so a memory can never
+  # exist as a document with no assertion behind it, which would make it
+  # invisible to recall while still occupying the URI. Memories.record/5 opens
+  # its own transaction, which is safe here: Writer.call is a serialized call,
+  # not a transaction, so nothing nests.
+  defp persist_memory(segments, value, confidence, source) do
+    Writer.call(fn conn ->
+      uri = URI.build(segments)
+      name = List.last(segments)
+      parent = parent_uri(segments)
+
+      with :ok <- ensure_parents(conn, segments),
+           :ok <- Nodes.upsert_doc(conn, uri, parent, name, value, []),
+           {:ok, _row} <- Memories.record(conn, uri, value, confidence, source) do
+        {:ok, uri}
+      else
+        {:error, _} = err -> err
+      end
+    end)
+  end
+
+  defp memory_recorded?(uri) do
+    Reader.read(fn conn -> Memories.exists_at?(conn, uri) end)
+  end
+
+  # `:uri` scopes directly; `:type` scopes to that type's subtree; neither
+  # scopes to the whole memories root. The store matches a scope as
+  # exact-uri-or-descendant, so no trailing separator is involved here and a
+  # scope of `.../preferences` cannot reach a sibling `preferences-extra`.
+  defp recall_scope(opts) do
+    case {Keyword.get(opts, :uri), Keyword.get(opts, :type)} do
+      {nil, nil} ->
+        {:ok, memories_root_uri()}
+
+      {uri, _type} when is_binary(uri) ->
+        with :ok <- validate_memory_scope(uri) do
+          {:ok, uri}
+        end
+
+      {nil, type} ->
+        with {:ok, type} <- validate_memory_type(type) do
+          {:ok, memories_root_uri() <> "/" <> type}
+        end
+
+      {_uri, type} ->
+        # An explicit URI already fixes the scope; the type still has to be one
+        # this store recognises, so a typo is reported rather than ignored.
+        validate_memory_type(type)
+    end
+  end
+
+  # A type arrives either as a URI segment (a string) or as an option a caller
+  # naturally writes as an atom. Both resolve to the segment form, which is what
+  # the URI and the taxonomy actually speak.
+  defp validate_memory_type(type) when is_atom(type) and not is_nil(type) do
+    validate_memory_type(Atom.to_string(type))
+  end
+
+  defp validate_memory_type(type) when is_binary(type) do
+    if type in @memory_types, do: {:ok, type}, else: {:error, {:invalid_memory_type, type}}
+  end
+
+  defp validate_memory_type(type), do: {:error, {:invalid_memory_type, type}}
+
+  defp validate_memory_scope(uri) do
+    segments = URI.parse(uri) |> elem(1)
+
+    if Enum.take(segments, length(@memories_root)) == @memories_root do
+      :ok
+    else
+      {:error, {:not_a_memory_uri, uri}}
+    end
+  end
+
+  defp memories_root_uri, do: URI.build(@memories_root)
+
+  # `:id` is exposed so a superseded row's `:supersedes` can be resolved to the
+  # assertion that replaced it; without it the chain is a dangling number.
+  defp memory_entry(row) do
+    row
+    |> Map.take([:id, :uri, :value, :confidence, :source, :status, :supersedes, :updated_at])
+    |> Map.put(:type, memory_type(row.uri))
+  end
+
+  defp memory_type(uri) do
+    uri |> URI.parse() |> elem(1) |> Enum.at(length(@memories_root))
   end
 
   # -- internal tree helpers --

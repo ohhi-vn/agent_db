@@ -12,6 +12,7 @@
 - **LLM summarization** — Auto-generates abstract/overview using local Phi-3-mini (configurable)
 - **Async writes** — Immediate acknowledgement, background embedding/summarization jobs
 - **Sessions** — Append-only message lists with commit-to-context-tree
+- **Memory** — Typed, durable facts under `viking://user/memories/` with confidence, provenance, and supersession; recall and forgetting without a model
 - **WebSocket API** — Phoenix Channel at `/api` with `v1.*` events, optional Bearer auth
 - **Fully local** — No external dependencies at runtime (models cached locally)
 
@@ -50,7 +51,128 @@ end
 :ok = AgentDb.append_message(session_id, :assistant, "Got it")
 {:ok, messages} = AgentDb.get_session(session_id)
 {:ok, uri} = AgentDb.commit_session(session_id, "viking://user/me/memories/session-1")
+
+# Memory
+{:ok, uri} = AgentDb.remember("viking://user/memories/preferences/language", "prefers Elixir over Go",
+       confidence: 0.9, source: session_id)
+{:ok, memories} = AgentDb.recall(type: :preferences)
+{:ok, [memory]} = AgentDb.recall("viking://user/memories/preferences/language")
+:ok = AgentDb.forget("viking://user/memories/preferences/language")
 ```
+
+## Memory
+
+`agent_db` is a library linked into your agent's own process, so **the caller is
+the extractor**: `remember/3` records a fact your agent has already decided is
+durable. No language model participates in any memory operation, so the whole
+surface is deterministic and works with no model loaded.
+
+Memories live under `viking://user/memories/<type>/<name>`. The `<type>` segment
+is the memory's type, drawn from a fixed taxonomy:
+
+| Type | Holds |
+|------|-------|
+| `profile` | name, language, timezone, occupation |
+| `preferences` | coding style, UI, communication |
+| `entities` | people, companies, projects, repositories, products |
+| `events` | "migrated X to Elixir", "released 1.2" |
+| `experiences` | task / approach / result / lessons |
+
+A memory's type is derived from its URI rather than passed as an option, so a
+memory's stated type can never contradict where it is filed, and `recall` by type
+is a subtree query.
+
+### The URI is the memory's identity
+
+Recording at a URI that already holds a memory **revises** it. Recording at a
+different URI **adds** a fact — coexistence is expressed by URI choice, not by a
+flag.
+
+```elixir
+{:ok, _} = AgentDb.remember("viking://user/memories/preferences/language",
+       "user uses Go", confidence: 0.6)
+
+{:ok, _} = AgentDb.remember("viking://user/memories/preferences/language",
+       "user moved the project to Elixir", confidence: 0.9)
+
+# One active value...
+{:ok, [active]} = AgentDb.recall("viking://user/memories/preferences/language")
+active.value
+#=> "user moved the project to Elixir"
+
+# ...and the superseded value is retained, not erased.
+{:ok, history} = AgentDb.recall(uri: "viking://user/memories/preferences/language",
+       include_superseded: true)
+
+prior = Enum.find(history, &(&1.status == :superseded))
+prior.value
+#=> "user uses Go"
+
+successor = Enum.find(history, &(&1.id == prior.supersedes))
+successor.value
+#=> "user moved the project to Elixir"
+```
+
+This is what keeps a revised belief from accumulating as a contradiction: the
+store resolves to one active value while the history of the change stays
+inspectable.
+
+### `remember/3`
+
+```elixir
+AgentDb.remember(uri, value, opts \\ [])
+```
+
+- `:confidence` — 0.0..1.0, default `0.5` (`AgentDb.default_confidence/0`)
+- `:source` — provenance, e.g. the originating session id
+
+Returns `{:ok, uri}`, or an error naming the invalid type
+(`{:error, {:invalid_memory_type, type}}`), a URI outside the memories root
+(`{:error, {:not_a_memory_uri, uri}}`), or `{:error, :invalid_uri}`.
+
+### `recall/1`
+
+```elixir
+AgentDb.recall()                                  # everything, active only
+AgentDb.recall("viking://user/memories/events")   # a subtree
+AgentDb.recall("viking://user/memories/events/2026-release")  # exactly one
+AgentDb.recall(type: :events)                     # a whole type
+AgentDb.recall(term: "kubernetes")                # matching values
+AgentDb.recall(uri: uri, include_superseded: true) # inspect a revision chain
+```
+
+A scope matches the exact URI or anything beneath it, so
+`.../preferences` does not also reach a sibling named `preferences-extra`.
+Results are ordered by descending confidence; a recall matching nothing returns
+`{:ok, []}` rather than an error.
+
+### `forget/1`
+
+```elixir
+:ok = AgentDb.forget("viking://user/memories/preferences/language")
+{:error, :no_memory} = AgentDb.forget("viking://user/memories/preferences/never-recorded")
+```
+
+Forgetting removes the value *and* its provenance, including every superseded
+assertion — a tombstone that kept the text would not have forgotten anything.
+Supersession, not forgetting, is what preserves history. A URI holding only an
+ordinary document is left alone.
+
+### Memories embed, but are not summarized
+
+Recording a memory enqueues **embedding generation only**. L0 abstracts and L1
+overviews exist to compress a document large enough that reading it whole is
+wasteful; they can say nothing about an atomic fact that its value does not
+already say, and generating them would cost two model-dependent jobs and, on a
+cold cache, a model load.
+
+Embedding is a different matter — it is what makes a memory reachable by meaning
+rather than by substring, and it is why memories become semantically retrievable
+with no further work once inference is available. Until then, memories are fully
+usable through keyword `search/2` scoped to the memories root.
+
+Memories are ordinary documents: `read/1`, `list/1`, `tree/2` and
+`search/2` reach them with no memory-specific path.
 
 ## Configuration
 
@@ -84,14 +206,57 @@ config :agent_db,
   # EXLA backend: :cpu, :cuda, :rocm
   exla_backend: :cpu,
   
-  # HTTP/WebSocket API (default: true)
+  # HTTP/WebSocket API (default: true; false in :test)
   http_enabled: true,
-  http_port: 4000,
   
   # Optional Bearer token auth
   http_auth: false,
   http_auth_tokens: ["token1", "token2"]
 ```
+
+### HTTP listener
+
+The listener is opened in every environment where HTTP is enabled. This depends
+on `server: true` being set on the endpoint configuration, which
+`config/runtime.exs` does — without it Phoenix starts the endpoint and binds
+nothing, and reports that only under a release, so the surface is silently
+absent under `mix run` and `iex -S mix`.
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `AGENT_DB_HTTP_ENABLED` | `true` (`false` in `:test`) | Whether the endpoint is started and serves |
+| `AGENT_DB_HTTP_PORT` | `4000` | Port served, and the port used for URL generation |
+| `AGENT_DB_HTTP_IP` | `127.0.0.1` | Interface bound |
+
+The port is resolved once, in `config/runtime.exs`, and used for both the
+listener and the endpoint's `url:` — so the two cannot disagree. `PORT` is **not**
+read; a deployment that sets it must move to `AGENT_DB_HTTP_PORT`.
+
+**The bind defaults to loopback.** The HTTP surface is unauthenticated by design
+— it exposes document and memory content, session identifiers and model state —
+so it does not land on every interface unless you ask for it. To serve a private
+network, set `AGENT_DB_HTTP_IP` to that address and make sure the port is not
+exposed more widely than you intend.
+
+```bash
+# reachable from other machines on the LAN
+AGENT_DB_HTTP_ENABLED=true AGENT_DB_HTTP_IP=0.0.0.0 AGENT_DB_HTTP_PORT=4000 iex -S mix
+```
+
+### Known issues on the HTTP surface
+
+The listener is live, and turning it on has made pre-existing breakage in the web
+layer visible for the first time — these routes have never been exercised, because
+until now nothing was listening:
+
+- **`/admin` returns an error.** `AgentDbWeb.AdminLive` has no `render/1` clause,
+  so it cannot render. The operations console is the subject of a separate
+  change. If you can reach `/admin` and see an error, that is why.
+- **`POST /api/v1/search` returns 500.** The controller passes the search mode as
+  a string, `AgentDb.search/2` matches on atoms, and the resulting
+  `{:invalid_mode, _}` error is then rendered through `Jason`, which cannot
+  encode a bare tuple — so the intended 422 is itself unreachable. Both defects
+  predate the listener and are not fixed by it.
 
 ### Environment Variables
 
@@ -108,8 +273,8 @@ All config can be set via environment variables:
 | `async_writes` | `AGENT_DB_ASYNC_WRITES` | `true` |
 | `job_workers` | `AGENT_DB_JOB_WORKERS` | CPU cores |
 | `exla_backend` | `AGENT_DB_EXLA_BACKEND` | `cpu` |
-| `http_enabled` | `AGENT_DB_HTTP_ENABLED` | `true` |
-| `http_port` | `AGENT_DB_HTTP_PORT` | `4000` |
+| `http_enabled` | `AGENT_DB_HTTP_ENABLED` | `true` (`false` in `:test`) |
+| `http_ip` | `AGENT_DB_HTTP_IP` | `127.0.0.1` |
 | `http_auth` | `AGENT_DB_HTTP_AUTH` | `false` |
 | `http_auth_tokens` | `AGENT_DB_HTTP_AUTH_TOKENS` | `[]` |
 
@@ -166,6 +331,27 @@ AgentDb.Application
 | `Phi-3-mini-4k-instruct` | Summarization | ~2.3GB | GGUF (q4) |
 
 Models auto-download on first use to `model_cache_dir`. Can be pre-placed manually.
+
+### Model cache notes
+
+- Downloads are written to a temporary path and renamed into place, so a file
+  named `model.safetensors` is always a complete download. Earlier versions
+  wrote directly to that path, so a `model.safetensors` left behind by an
+  interrupted download can still be truncated. **If model loading fails, delete
+  the file and let it re-download** — its presence is the only cache check.
+- `exla_backend` (`AGENT_DB_EXLA_BACKEND`) is now applied to the loaded model.
+  It previously had no effect. `:cpu` uses Nx's default backend; `:cuda` and
+  `:rocm` require a matching `config :exla, clients` entry, and **loading fails
+  with an error if none is configured** rather than quietly falling back to CPU.
+- If a model cannot be downloaded or loaded, the operation that needed it
+  returns `{:error, reason}`. It does not terminate the calling process, and the
+  rest of the store keeps working.
+- Models load lazily, so a model-dependent call made before the model is ready
+  returns `{:error, :model_loading}`. That is distinct from a failure and is
+  safe to repeat: the store waits up to `model_load_grace_ms` (default 10s) for
+  the load first, which covers a model that is already cached, and only then
+  reports `:model_loading`. `model_status/0` reports `state: :loading | :ready
+  | :failed | :idle` and stays answerable throughout.
 
 ## Requirements
 

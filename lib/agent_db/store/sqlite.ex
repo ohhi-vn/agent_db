@@ -49,6 +49,10 @@ defmodule AgentDb.Store.SQLite do
   @spec close(conn()) :: :ok
   def close(conn), do: Sqlite3.close(conn)
 
+  @doc "Rowid inserted by the most recent INSERT on this connection."
+  @spec last_insert_rowid(conn()) :: {:ok, integer()} | {:error, term()}
+  def last_insert_rowid(conn), do: Sqlite3.last_insert_rowid(conn)
+
   @doc "Runs a DDL/pragma statement."
   @spec exec(conn(), String.t()) :: ok_err()
   def exec(conn, sql), do: Sqlite3.execute(conn, sql)
@@ -64,6 +68,82 @@ defmodule AgentDb.Store.SQLite do
       {:error, _} = err -> err
       other -> {:error, {:unexpected_step_result, other}}
     end
+  end
+
+  @doc """
+  Runs `fun.(conn)` inside an explicit transaction, committing when it returns
+  `:ok` or `{:ok, _}` and rolling back otherwise. The fun's return value is
+  propagated either way. If the fun raises or throws, the transaction is rolled
+  back and the error is re-raised, so a failing caller cannot leave the
+  connection inside an open transaction.
+
+  This is the only place in the codebase that opens a transaction. It relies on
+  `AgentDb.Store.Writer` serializing every mutation, so `BEGIN` can never
+  collide with an outer transaction. Callers must not nest: a fun that itself
+  calls `transaction/2` will fail with "cannot start a transaction within a
+  transaction".
+  """
+  @spec transaction(conn(), (conn() -> term())) :: term()
+  def transaction(conn, fun) do
+    with :ok <- exec(conn, "BEGIN") do
+      # A raising fun escapes commit_or_rollback/2, which would leave the
+      # connection inside an open transaction and break every later write on
+      # it. Roll back first, then let the error through unchanged.
+      try do
+        commit_or_rollback(conn, fun.(conn))
+      rescue
+        error ->
+          rollback(conn)
+          reraise error, __STACKTRACE__
+      catch
+        kind, reason ->
+          rollback(conn)
+          :erlang.raise(kind, reason, __STACKTRACE__)
+      end
+    end
+  end
+
+  defp commit_or_rollback(conn, result) do
+    if committable?(result) do
+      case exec(conn, "COMMIT") do
+        :ok ->
+          result
+
+        {:error, reason} ->
+          rollback(conn)
+          {:error, {:commit_failed, result, reason}}
+      end
+    else
+      case rollback(conn) do
+        :ok -> result
+        {:error, reason} -> {:error, {:rollback_failed, result, reason}}
+      end
+    end
+  end
+
+  defp committable?(:ok), do: true
+  defp committable?({:ok, _}), do: true
+  defp committable?(_), do: false
+
+  defp rollback(conn) do
+    case exec(conn, "ROLLBACK") do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.error("Transaction rollback failed, connection state unknown: #{inspect(reason)}")
+        {:error, reason}
+    end
+  end
+
+  @doc """
+  True when the sqlite-vec extension is loaded and the `vec_nodes` virtual table
+  can be queried. Every `vec_nodes` statement must be guarded by this, because
+  the extension is optional at runtime (see `try_create_vec_table/1`).
+  """
+  @spec vec_available?(conn()) :: boolean()
+  def vec_available?(conn) do
+    match?({:ok, _}, query(conn, "SELECT vec_version()"))
   end
 
   @doc "Runs a SELECT and collects all rows as lists of column values."
@@ -111,7 +191,46 @@ defmodule AgentDb.Store.SQLite do
 
     # Then try to create vec_nodes table (optional, requires sqlite-vec extension)
     try_create_vec_table(conn)
+    reconcile_orphan_embeddings(conn)
     :ok
+  end
+
+  # Releases vec_nodes rows left behind by removals that predate the purge in
+  # Nodes.purge_uri_state/2. Such rows are already invisible to search (the
+  # query joins nodes), so this is about reclaiming storage and about not
+  # letting a node recreated at an old deleted URI inherit a stale embedding.
+  # Guarded by an existence check so a clean or large vec_nodes is not scanned
+  # on every boot.
+  defp reconcile_orphan_embeddings(conn) do
+    if vec_available?(conn) do
+      case query_one(
+             conn,
+             "SELECT EXISTS(SELECT 1 FROM vec_nodes v LEFT JOIN nodes n ON n.uri = v.uri WHERE n.uri IS NULL)"
+           ) do
+        {:ok, [1]} ->
+          case exec_write(
+                 conn,
+                 "DELETE FROM vec_nodes WHERE uri IN (SELECT v.uri FROM vec_nodes v LEFT JOIN nodes n ON n.uri = v.uri WHERE n.uri IS NULL)"
+               ) do
+            :ok ->
+              Logger.info("Reclaimed orphaned vec_nodes rows for removed URIs")
+              :ok
+
+            {:error, reason} ->
+              Logger.warning("Could not reclaim orphaned vec_nodes rows: #{inspect(reason)}")
+              :ok
+          end
+
+        {:ok, [0]} ->
+          :ok
+
+        {:error, reason} ->
+          Logger.warning("Could not check for orphaned vec_nodes rows: #{inspect(reason)}")
+          :ok
+      end
+    else
+      :ok
+    end
   end
 
   defp base_ddl do
@@ -158,6 +277,22 @@ defmodule AgentDb.Store.SQLite do
         FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
       )
       """,
+      """
+      CREATE TABLE IF NOT EXISTS memory_meta (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        uri TEXT NOT NULL,
+        value TEXT NOT NULL,
+        confidence REAL NOT NULL,
+        source TEXT,
+        status TEXT NOT NULL CHECK (status IN ('active', 'superseded')),
+        supersedes INTEGER REFERENCES memory_meta(id),
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        FOREIGN KEY (uri) REFERENCES nodes(uri) ON DELETE CASCADE
+      )
+      """,
+      "CREATE INDEX IF NOT EXISTS idx_memory_meta_uri_status ON memory_meta(uri, status)",
+      "CREATE INDEX IF NOT EXISTS idx_memory_meta_status ON memory_meta(status)",
       """
       CREATE TABLE IF NOT EXISTS job_queue (
         id INTEGER PRIMARY KEY AUTOINCREMENT,

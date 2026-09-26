@@ -23,7 +23,7 @@ defmodule AgentDb.WebChannel do
 
   @impl true
   def handle_in("v1.write", %{"uri" => uri, "content" => content, "opts" => opts}, socket) do
-    case AgentDb.write(uri, content, opts) do
+    case AgentDb.write(uri, content, write_opts(opts)) do
       :ok ->
         {:reply, {:ok, %{status: "ok"}}, socket}
       {:error, reason} ->
@@ -86,7 +86,7 @@ defmodule AgentDb.WebChannel do
   end
 
   def handle_in("v1.search", %{"term" => term, "opts" => opts}, socket) do
-    case AgentDb.search(term, opts) do
+    case AgentDb.search(term, search_opts(opts)) do
       {:ok, results} ->
         {:reply, {:ok, %{results: results}}, socket}
       {:error, reason} ->
@@ -122,7 +122,7 @@ defmodule AgentDb.WebChannel do
   end
 
   def handle_in("v1.commit_session", %{"session_id" => session_id, "destination_uri" => destination_uri, "opts" => opts}, socket) do
-    case AgentDb.commit_session(session_id, destination_uri, opts) do
+    case AgentDb.commit_session(session_id, destination_uri, commit_opts(opts)) do
       {:ok, result} ->
         {:reply, {:ok, %{result: result}}, socket}
       {:error, reason} ->
@@ -138,4 +138,44 @@ defmodule AgentDb.WebChannel do
   def handle_in(event, _params, socket) do
     {:reply, {:error, %{reason: "unknown_event", event: event}}, socket}
   end
+
+  # The wire format is JSON, so options arrive as a string-keyed map. The store
+  # reads them with Keyword.get/2,3, which raises FunctionClauseError on a map
+  # -- which meant every v1.write, v1.search and v1.commit_session call took the
+  # channel process down before reaching the store.
+  #
+  # Each option set is listed explicitly rather than atomized generically, so
+  # an unrecognised key is ignored instead of becoming a misspelt option.
+  defp search_opts(params) when is_map(params) do
+    Enum.reduce(params, [], fn
+      {"mode", value}, acc -> [{:mode, search_mode(value)} | acc]
+      {"scope", value}, acc -> [{:scope, value} | acc]
+      {"top_k", value}, acc -> [{:top_k, value} | acc]
+      {"hybrid_weights", {kw, vw}}, acc -> [{:hybrid_weights, {kw, vw}} | acc]
+      _other, acc -> acc
+    end)
+  end
+
+  defp search_opts(_), do: []
+
+  defp search_mode("vector"), do: :vector
+  defp search_mode("hybrid"), do: :hybrid
+  defp search_mode("keyword"), do: :keyword
+  defp search_mode(other), do: other
+
+  defp write_opts(params) when is_map(params) do
+    Enum.reduce(params, [], fn
+      {"async", value}, acc -> [{:async, value} | acc]
+      {"sync_timeout_ms", value}, acc -> [{:sync_timeout_ms, value} | acc]
+      {"abstract", value}, acc -> [{:abstract, value} | acc]
+      {"overview", value}, acc -> [{:overview, value} | acc]
+      _other, acc -> acc
+    end)
+  end
+
+  defp write_opts(_), do: []
+
+  # :formatter is a function and cannot cross a JSON boundary, so commit options
+  # carry nothing today; the function is kept so the shape stays explicit.
+  defp commit_opts(_params), do: []
 end

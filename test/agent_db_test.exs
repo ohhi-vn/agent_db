@@ -118,13 +118,225 @@ defmodule AgentDbTest do
     assert {:error, :not_found} = AgentDb.read("viking://resources/sub/x/a.md")
     assert {:error, :not_found} = AgentDb.list("viking://resources/sub")
 
-    # SQLite has no leftover rows
-    assert {:ok, [[0]]} =
+    # Every URI-keyed store must be clean, not just `nodes`. vec_nodes only
+    # exists when the sqlite-vec extension loaded.
+    assert {:ok, [0]} = count_rows("nodes", "uri", "viking://resources/sub")
+    assert {:ok, [0]} = count_rows("job_queue", :payload_uri, "viking://resources/sub")
+    assert {:ok, [0]} =
+             count_rows("commit_meta", "destination_uri", "viking://resources/sub")
+
+    if match?({:ok, true}, table_exists?("vec_nodes")) do
+      assert {:ok, [0]} = count_rows("vec_nodes", "uri", "viking://resources/sub")
+    end
+  end
+
+  # Vector-search behaviour is only observable when the sqlite-vec extension
+  # loaded and vec_nodes exists. Where it is unavailable these scenarios are
+  # inert; the store-level half of the same invariant (removal leaves nothing
+  # behind, and a recreated URI starts clean) is covered by the tests above.
+  test "a recreated URI is not searchable on the removed node's embedding" do
+    if match?({:ok, true}, table_exists?("vec_nodes")) do
+      uri = "viking://resources/recreate/a.md"
+      :ok = AgentDb.write(uri, "kubernetes scheduler internals", async: false)
+      assert {:ok, [%{uri: ^uri} | _]} = vector_search("viking://resources/recreate", "scheduler")
+
+      assert :ok = AgentDb.rm("viking://resources/recreate")
+
+      # A different document at the same URI must not inherit the old embedding.
+      :ok = AgentDb.write(uri, "entirely unrelated subject matter", async: false)
+      assert {:ok, results} = vector_search("viking://resources/recreate", "scheduler")
+      assert results == []
+
+      # Once its own embedding lands, it is searchable on its own merits.
+      :ok = AgentDb.write(uri, "entirely unrelated subject matter", async: false)
+      assert {:ok, [_ | _]} = vector_search("viking://resources/recreate", "unrelated")
+    end
+  end
+
+  test "rm works on a store opened without the sqlite-vec extension" do
+    # vec_nodes does not exist in this environment, so this exercises the
+    # degraded path: the purge must skip the vector index and still leave the
+    # node store, job queue, and commit bookkeeping consistent.
+    refute match?({:ok, true}, table_exists?("vec_nodes"))
+
+    :ok = AgentDb.write("viking://resources/nov/deep/a.md", "distinctivenovectorword")
+    {:ok, sid} = AgentDb.create_session()
+    :ok = AgentDb.append_message(sid, :user, "hello")
+    {:ok, _} = AgentDb.commit_session(sid, "viking://resources/nov/deep/committed")
+
+    assert :ok = AgentDb.rm("viking://resources/nov")
+
+    assert {:error, :not_found} = AgentDb.read("viking://resources/nov/deep/a.md")
+    assert {:ok, results} = AgentDb.search("distinctivenovectorword")
+    assert results == []
+
+    # The other three stores are still purged.
+    assert {:ok, [0]} = count_rows("nodes", "uri", "viking://resources/nov")
+    assert {:ok, [0]} = count_rows("job_queue", :payload_uri, "viking://resources/nov")
+    assert {:ok, [0]} = count_rows("commit_meta", "destination_uri", "viking://resources/nov")
+  end
+
+  test "ensure_schema leaves a clean database untouched" do
+    :ok = AgentDb.write("viking://resources/clean/a.md", "content")
+
+    # Idempotent: repeated boots must not remove or alter live rows.
+    path = Path.join(AgentDb.Config.data_dir(), "agent_db.db")
+    {:ok, conn} = AgentDb.Store.SQLite.open(path)
+    assert :ok = AgentDb.Store.SQLite.ensure_schema(conn)
+    assert :ok = AgentDb.Store.SQLite.ensure_schema(conn)
+    :ok = AgentDb.Store.SQLite.close(conn)
+
+    assert {:ok, "content"} = AgentDb.read("viking://resources/clean/a.md")
+    assert {:ok, [1]} = count_rows("nodes", "uri", "viking://resources/clean/a.md")
+  end
+
+  test "rm cancels queued jobs for the removed subtree" do
+    uri = "viking://resources/jobbed/a.md"
+    :ok = AgentDb.write(uri, "content to embed")
+    outside = "viking://resources/keep/b.md"
+    :ok = AgentDb.write(outside, "other content")
+
+    # The write enqueued embed + summarization jobs for `uri`.
+    assert {:ok, before} = jobs_for(uri)
+    assert before > 0
+
+    assert :ok = AgentDb.rm("viking://resources/jobbed")
+
+    assert {:ok, [0]} = jobs_for(uri)
+  end
+
+  test "rm leaves a removed subtree unsearchable" do
+    :ok = AgentDb.write("viking://resources/gone/x.md", "distinctiveneedlyword")
+
+    assert {:ok, results} = AgentDb.search("distinctiveneedlyword")
+    assert length(results) == 1
+
+    assert :ok = AgentDb.rm("viking://resources/gone")
+
+    assert {:ok, results} = AgentDb.search("distinctiveneedlyword")
+    assert results == []
+  end
+
+  test "rm of a missing URI returns not_found and writes nothing" do
+    :ok = AgentDb.write("viking://resources/present.md", "keep me")
+
+    assert {:error, :not_found} = AgentDb.rm("viking://resources/absent")
+
+    assert {:ok, "keep me"} = AgentDb.read("viking://resources/present.md")
+    assert {:ok, [0]} = count_rows("nodes", "uri", "viking://resources/absent")
+  end
+
+  test "rm of the tree root is rejected and leaves the tree intact" do
+    :ok = AgentDb.write("viking://resources/stays/a.md", "still here")
+
+    assert {:error, :is_root} = AgentDb.rm("viking://")
+
+    assert {:ok, "still here"} = AgentDb.read("viking://resources/stays/a.md")
+  end
+
+  test "rm of a top-level subtree succeeds and leaves siblings alone" do
+    :ok = AgentDb.write("viking://resources/p/a.md", "in resources")
+    :ok = AgentDb.write("viking://user/u1/memories/m.md", "in memories")
+
+    assert :ok = AgentDb.rm("viking://resources")
+
+    assert {:error, :not_found} = AgentDb.read("viking://resources/p/a.md")
+    assert {:ok, "in memories"} = AgentDb.read("viking://user/u1/memories/m.md")
+    assert {:ok, _} = AgentDb.list("viking://user/u1/memories")
+  end
+
+  test "cached reads and store reads agree after rm" do
+    :ok = AgentDb.write("viking://resources/cachesub/a.md", "cached content")
+
+    # Warm both the node cache and the dir cache.
+    assert {:ok, "cached content"} = AgentDb.read("viking://resources/cachesub/a.md")
+    assert {:ok, ["a.md"]} = AgentDb.list("viking://resources/cachesub")
+
+    assert :ok = AgentDb.rm("viking://resources/cachesub")
+
+    # Both paths must report not_found, and a cold read must agree.
+    assert {:error, :not_found} = AgentDb.read("viking://resources/cachesub/a.md")
+    assert {:error, :not_found} = AgentDb.list("viking://resources/cachesub")
+
+    assert {:ok, nil} =
              AgentDb.Store.Reader.read(fn conn ->
-               AgentDb.Store.SQLite.query(conn, "SELECT COUNT(*) FROM nodes WHERE uri LIKE ?", [
-                 "viking://resources/sub%"
-               ])
+               AgentDb.Store.Nodes.get(conn, "viking://resources/cachesub/a.md")
              end)
+  end
+
+  test "rm rolls back every store when one delete fails" do
+    :ok = AgentDb.write("viking://resources/atomic/a.md", "content")
+    {:ok, sid} = AgentDb.create_session()
+    :ok = AgentDb.append_message(sid, :user, "hello")
+    {:ok, _} = AgentDb.commit_session(sid, "viking://resources/atomic/committed")
+
+    # Force a delete late in the purge to fail. Without a transaction the
+    # nodes rows and the job cancellations are already committed by the time
+    # the failure is reached, leaving the subtree half-removed.
+    assert :ok =
+             AgentDb.Store.Writer.call(fn conn ->
+               AgentDb.Store.SQLite.exec(conn, "DROP TABLE job_queue")
+             end)
+
+    try do
+      assert {:error, _} = AgentDb.rm("viking://resources/atomic")
+    after
+      assert :ok =
+               AgentDb.Store.Writer.call(fn conn ->
+                 AgentDb.Store.SQLite.ensure_schema(conn)
+               end)
+    end
+
+    # Nothing was removed, in any store.
+    assert {:ok, "content"} = AgentDb.read("viking://resources/atomic/a.md")
+    assert {:ok, [1]} = count_rows("commit_meta", "destination_uri", "viking://resources/atomic")
+    assert {:ok, [1]} = count_rows("nodes", "uri", "viking://resources/atomic/committed")
+  end
+
+  # -- rm + session commit --
+
+  test "re-committing an unchanged session restores a removed destination" do
+    {:ok, sid} = AgentDb.create_session()
+    :ok = AgentDb.append_message(sid, :user, "Remember this")
+    :ok = AgentDb.append_message(sid, :assistant, "Got it")
+
+    dest = "viking://user/u1/memories/session-restore"
+    assert {:ok, ^dest} = AgentDb.commit_session(sid, dest)
+
+    assert :ok = AgentDb.rm("viking://user/u1/memories/session-restore")
+    assert {:error, :not_found} = AgentDb.read(dest)
+
+    # The old content_hash is gone with the destination, so the commit must
+    # report the URI and rebuild the document rather than claiming :unchanged.
+    assert {:ok, ^dest} = AgentDb.commit_session(sid, dest)
+
+    assert {:ok, content} = AgentDb.read(dest)
+    assert String.contains?(content, "user: Remember this")
+    assert String.contains?(content, "assistant: Got it")
+
+    # Restored, not duplicated.
+    assert {:ok, [dest]} = AgentDb.list("viking://user/u1/memories")
+  end
+
+  test "rm clears only the removed destination's commit bookkeeping" do
+    {:ok, sid} = AgentDb.create_session()
+    :ok = AgentDb.append_message(sid, :user, "shared message")
+
+    removed = "viking://user/u1/memories/gone"
+    kept = "viking://user/u1/memories/kept"
+
+    {:ok, ^removed} = AgentDb.commit_session(sid, removed)
+    {:ok, ^kept} = AgentDb.commit_session(sid, kept)
+
+    assert :ok = AgentDb.rm(removed)
+
+    # The surviving destination keeps its hash, so it is still idempotent.
+    assert {:ok, :unchanged} = AgentDb.commit_session(sid, kept)
+    assert {:ok, _} = AgentDb.read(kept)
+
+    # A different destination is unaffected too.
+    other = "viking://user/u1/memories/other"
+    assert {:ok, ^other} = AgentDb.commit_session(sid, other)
   end
 
   # -- tree --
@@ -139,6 +351,57 @@ defmodule AgentDbTest do
     {:ok, t2} = AgentDb.tree("viking://resources/t", 2)
     child_names = Enum.map(t2.children, & &1.name)
     assert Enum.sort(child_names) == ["a", "top.md"]
+  end
+
+  test "list returns direct children only, not grandchildren" do
+    :ok = AgentDb.write("viking://resources/p/docs/a.md", "grandchild content")
+    :ok = AgentDb.write("viking://resources/p/readme.md", "child content")
+
+    assert {:ok, names} = AgentDb.list("viking://resources/p")
+    assert Enum.sort(names) == ["docs", "readme.md"]
+    refute "a.md" in names
+  end
+
+  test "list of a missing URI returns not_found and writes nothing" do
+    assert {:error, :not_found} = AgentDb.list("viking://resources/no_such_dir")
+    assert {:ok, [0]} = count_rows("nodes", "uri", "viking://resources/no_such_dir")
+  end
+
+  test "tree depth 1 stops at direct children" do
+    :ok = AgentDb.write("viking://resources/depth/a/b/deep.md", "deep")
+
+    # At depth 1 children are bare names: the projection stops there, so `b`
+    # and `deep.md` cannot appear.
+    {:ok, t1} = AgentDb.tree("viking://resources/depth", 1)
+    assert t1.children == ["a"]
+
+    {:ok, t2} = AgentDb.tree("viking://resources/depth", 2)
+    assert [a] = t2.children
+    assert a.name == "a"
+    # Depth 2 expands one level past the child, as bare names.
+    assert a.children == ["b"]
+  end
+
+  test "tree of a missing URI returns not_found and writes nothing" do
+    assert {:error, :not_found} = AgentDb.tree("viking://resources/no_such_dir")
+    assert {:ok, [0]} = count_rows("nodes", "uri", "viking://resources/no_such_dir")
+  end
+
+  test "tree reflects a prior removal" do
+    :ok = AgentDb.write("viking://resources/rmtree/a/b/deep.md", "deep")
+    :ok = AgentDb.write("viking://resources/rmtree/keep.md", "keep")
+
+    {:ok, before} = AgentDb.tree("viking://resources/rmtree", 2)
+    assert Enum.sort(Enum.map(before.children, & &1.name)) == ["a", "keep.md"]
+
+    assert :ok = AgentDb.rm("viking://resources/rmtree/a")
+
+    {:ok, after_rm} = AgentDb.tree("viking://resources/rmtree", 2)
+    assert Enum.map(after_rm.children, & &1.name) == ["keep.md"]
+
+    names = collect_tree_names(after_rm)
+    refute "b" in names
+    refute "deep.md" in names
   end
 
   # -- Search --
@@ -183,6 +446,144 @@ defmodule AgentDbTest do
     assert {:ok, results} = AgentDb.search("overview")
     assert length(results) == 1
     assert hd(results).uri == "viking://resources/s.md"
+  end
+
+  # -- sync write honesty --
+
+  # A failed background job used to be invisible to write(async: false): the
+  # pending count excluded 'failed', so the queue looked idle and the write
+  # reported success having accomplished nothing.
+  test "a synchronous write reports failure rather than success" do
+    uri = "viking://resources/syncfail/a.md"
+
+    # The write enqueues its own jobs, so the outcome has to be driven against
+    # those. A task fails every job for the URI as it appears; the wait then
+    # sees nothing active but at least one failure.
+    task =
+      Task.async(fn ->
+        fail_all_jobs_for(uri, 2_000)
+      end)
+
+    assert {:error, {:background_jobs_failed, ^uri}} =
+             AgentDb.write(uri, "content", async: false, sync_timeout_ms: 3_000)
+
+    Task.await(task, 5_000)
+  end
+
+  test "a synchronous write reports work still outstanding rather than success" do
+    uri = "viking://resources/syncpending/a.md"
+
+    # Nothing consumes these jobs, so the wait reaches its deadline with work
+    # still active. This is the state a store with no available model is in,
+    # since jobs defer rather than fail.
+    assert {:error, {:background_jobs_pending, ^uri}} =
+             AgentDb.write(uri, "content", async: false, sync_timeout_ms: 200)
+  end
+
+  test "a completed background job still reports success" do
+    uri = "viking://resources/syncdone/a.md"
+
+    task = Task.async(fn -> complete_all_jobs_for(uri, 2_000) end)
+
+    assert :ok = AgentDb.write(uri, "content", async: false, sync_timeout_ms: 3_000)
+
+    Task.await(task, 5_000)
+  end
+
+  # Drives the outcome of the jobs a sync write enqueues, which the write itself
+  # blocks on.
+  # Drives the outcome of the jobs a sync write enqueues. It must keep acting
+  # across rounds: the application's own workers can claim a job first and defer
+  # it back to pending, so a single pass over the queue is not enough.
+  defp settle_jobs_for(uri, action, timeout_ms) do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+    do_settle_jobs_for(uri, action, deadline, 0, 0)
+  end
+
+  defp do_settle_jobs_for(uri, action, deadline, acted, empty_rounds) do
+    ids = job_ids_for(uri)
+    expired? = System.monotonic_time(:millisecond) >= deadline
+
+    cond do
+      ids != [] ->
+        Enum.each(ids, action)
+        if expired?, do: :ok, else: do_settle_jobs_for(uri, action, deadline, acted + 1, 0)
+
+      # Nothing left to settle, confirmed over consecutive polls so a job that
+      # is merely between claim and defer is not mistaken for a settled one.
+      acted > 0 and empty_rounds >= 3 ->
+        :ok
+
+      expired? ->
+        :ok
+
+      true ->
+        Process.sleep(20)
+        do_settle_jobs_for(uri, action, deadline, acted, empty_rounds + 1)
+    end
+  end
+
+  defp job_ids_for(uri) do
+    AgentDb.Store.Reader.read(fn conn ->
+      case AgentDb.Store.SQLite.query(
+             conn,
+             "SELECT id FROM job_queue WHERE json_extract(payload, '$.uri') = ?1 AND status = 'pending'",
+             [uri]
+           ) do
+        {:ok, rows} -> Enum.map(rows, &hd/1)
+        _ -> []
+      end
+    end)
+  end
+
+  # A job only lands in 'failed' once its attempt budget is exhausted, and the
+  # backoff between attempts is seconds. Zeroing each job's budget makes a
+  # single failure terminal whatever its current attempt count -- at
+  # max_attempts 1 a job that has not been claimed yet would still reschedule,
+  # since 0 < 1. The cap is applied per job as it is found, because the write
+  # enqueues them concurrently with this task.
+  defp fail_all_jobs_for(uri, timeout_ms) do
+    settle_jobs_for(
+      uri,
+      fn job_id ->
+        AgentDb.Store.Writer.call(fn conn ->
+          AgentDb.Store.SQLite.exec_write(
+            conn,
+            "UPDATE job_queue SET max_attempts = 0 WHERE id = ?1",
+            [job_id]
+          )
+        end)
+
+        AgentDb.JobQueue.fail(job_id, :boom)
+      end,
+      timeout_ms
+    )
+  end
+
+  defp complete_all_jobs_for(uri, timeout_ms) do
+    settle_jobs_for(uri, &AgentDb.JobQueue.complete/1, timeout_ms)
+  end
+
+  # -- unservable operations --
+
+  test "a search that needs an unavailable model reports an error, not a crash" do
+    :ok = AgentDb.write("viking://resources/novm/a.md", "content")
+
+    # No model is cached and remote downloads are skipped under test, so vector
+    # search cannot be served. It must say so rather than terminating the
+    # caller, which is what the WebSocket gateway forwards to clients.
+    assert {:error, {:model_not_found, _path}} =
+             AgentDb.search("content", mode: :vector)
+
+    # The caller survives, and unrelated operations still work.
+    assert {:ok, _} = AgentDb.read("viking://resources/novm/a.md")
+    assert {:ok, [_]} = AgentDb.search("content", mode: :keyword)
+  end
+
+  test "a hybrid search that needs an unavailable model reports an error, not a crash" do
+    :ok = AgentDb.write("viking://resources/novm2/a.md", "content")
+
+    assert {:error, {:model_not_found, _path}} = AgentDb.search("content", mode: :hybrid)
   end
 
   # -- Sessions --
@@ -240,14 +641,15 @@ defmodule AgentDbTest do
     {:ok, sid} = AgentDb.create_session()
     :ok = AgentDb.append_message(sid, :user, "msg")
 
-    {:ok, dest1} = AgentDb.commit_session(sid, "viking://user/u1/memories/commit-test")
-    {:ok, dest2} = AgentDb.commit_session(sid, "viking://user/u1/memories/commit-test")
+    dest = "viking://user/u1/memories/commit-test"
+    {:ok, ^dest} = AgentDb.commit_session(sid, dest)
 
-    assert dest1 == dest2
-    assert dest1 == "viking://user/u1/memories/commit-test"
+    # An unchanged session converges on the existing document and reports that
+    # it did so, rather than reporting the URI as if it had just written it.
+    assert {:ok, :unchanged} = AgentDb.commit_session(sid, dest)
 
     # only one document exists
-    assert {:ok, content} = AgentDb.read(dest1)
+    assert {:ok, content} = AgentDb.read(dest)
     assert String.contains?(content, "msg")
   end
 
@@ -275,6 +677,44 @@ defmodule AgentDbTest do
     assert dest == "viking://user/u1/memories/a/b/c/session.md"
     assert {:ok, content} = AgentDb.read(dest)
     assert String.contains?(content, "deep")
+  end
+
+  test "commit_session invalidates the cache for its destination" do
+    dest = "viking://user/u1/memories/cached"
+    {:ok, sid} = AgentDb.create_session()
+    :ok = AgentDb.append_message(sid, :user, "first")
+
+    {:ok, ^dest} = AgentDb.commit_session(sid, dest)
+
+    # Populates the ETS read-through entry for dest.
+    assert {:ok, before} = AgentDb.read(dest)
+    assert String.contains?(before, "first")
+
+    :ok = AgentDb.append_message(sid, :assistant, "second")
+    {:ok, ^dest} = AgentDb.commit_session(sid, dest)
+
+    # A warm cache would still hold the pre-commit content here.
+    assert {:ok, cached_read} = AgentDb.read(dest)
+    assert String.contains?(cached_read, "second")
+
+    # ...and it matches what a cold cache produces from SQLite.
+    Owner.clear()
+    assert {:ok, cold_read} = AgentDb.read(dest)
+    assert cold_read == cached_read
+  end
+
+  test "commit_session that is :unchanged leaves the cache serving the same content" do
+    dest = "viking://user/u1/memories/unchanged"
+    {:ok, sid} = AgentDb.create_session()
+    :ok = AgentDb.append_message(sid, :user, "only")
+
+    {:ok, ^dest} = AgentDb.commit_session(sid, dest)
+    assert {:ok, first} = AgentDb.read(dest)
+
+    assert {:ok, :unchanged} = AgentDb.commit_session(sid, dest)
+    assert {:ok, second} = AgentDb.read(dest)
+
+    assert first == second
   end
 
   # -- System verification: restart recovery --
@@ -381,5 +821,64 @@ defmodule AgentDbTest do
     :ok = Application.stop(:agent_db)
     {:ok, _} = Application.ensure_all_started(:agent_db)
     :ok
+  end
+
+  # Counts rows in a URI-keyed store whose key starts with `prefix`.
+  # `column` is a column name, or :payload_uri for job_queue's JSON payload.
+  # Runs a vector search, tolerating a store with no vector index.
+  defp vector_search(scope, term) do
+    AgentDb.search(term, mode: :vector, scope: scope)
+  end
+
+  # Reads through the writer's connection: every row these assertions inspect was
+  # written there, so asserting on any other connection would also be asserting
+  # on cross-connection visibility rather than on the behaviour under test.
+  defp count_rows(table, column, prefix) do
+    col = if column == :payload_uri, do: "json_extract(payload, '$.uri')", else: column
+
+    AgentDb.Store.Writer.call(fn conn ->
+      AgentDb.Store.SQLite.query_one(
+        conn,
+        "SELECT COUNT(*) FROM #{table} WHERE #{col} = ?1 OR #{col} LIKE ?2 ESCAPE '\\'",
+        [prefix, AgentDb.Store.Nodes.like_escape(prefix) <> "/%"]
+      )
+    end)
+  end
+
+  # Number of still-unfinished jobs targeting `uri` (exact or descendant).
+  defp jobs_for(uri) do
+    AgentDb.Store.Writer.call(fn conn ->
+      AgentDb.Store.SQLite.query_one(
+        conn,
+        """
+        SELECT COUNT(*) FROM job_queue
+        WHERE (json_extract(payload, '$.uri') = ?1
+               OR json_extract(payload, '$.uri') LIKE ?2 ESCAPE '\\')
+          AND status IN ('pending', 'running')
+        """,
+        [uri, AgentDb.Store.Nodes.like_escape(uri) <> "/%"]
+      )
+    end)
+  end
+
+  defp table_exists?(table) do
+    AgentDb.Store.Writer.call(fn conn ->
+      case AgentDb.Store.SQLite.query_one(
+             conn,
+             "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+             [table]
+           ) do
+        {:ok, nil} -> {:ok, false}
+        {:ok, _} -> {:ok, true}
+      end
+    end)
+  end
+
+  defp collect_tree_names(entry) do
+    children = Map.get(entry, :children) || []
+
+    Enum.flat_map(children, fn child ->
+      [child.name] ++ collect_tree_names(child)
+    end)
   end
 end

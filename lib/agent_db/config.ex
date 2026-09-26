@@ -54,14 +54,36 @@ defmodule AgentDb.Config do
     Application.get_env(:agent_db, :exla_backend, :cpu)
   end
 
+  @doc """
+  How long a model-dependent call waits for a lazy load to finish before
+  reporting that the model is still loading.
+
+  Loading is lazy, and the two paths differ by an order of magnitude: a warm
+  load from cached weights measures ~3.3s, while a cold first use including the
+  download measures ~37s. The default covers the warm path so an already-cached
+  model is invisible to the caller; a longer cold load reports
+  `{:error, :model_loading}` instead of blocking.
+  """
+  @spec model_load_grace_ms() :: pos_integer()
+  def model_load_grace_ms do
+    Application.get_env(:agent_db, :model_load_grace_ms, 10_000)
+  end
+
   @spec http_enabled() :: boolean()
   def http_enabled do
     Application.get_env(:agent_db, :http_enabled, true)
   end
 
-  @spec http_port() :: pos_integer()
-  def http_port do
-    Application.get_env(:agent_db, :http_port, 4000)
+  @doc """
+  Interface the HTTP listener binds to.
+
+  Loopback by default. The endpoint's own configuration is what actually binds;
+  this reports the resolved value, so application code and tests can ask which
+  interface is in force without duplicating the default or reading config.
+  """
+  @spec http_ip() :: :inet.ip_address()
+  def http_ip do
+    Application.get_env(:agent_db, :http_ip, {127, 0, 0, 1})
   end
 
   @spec http_auth() :: boolean()

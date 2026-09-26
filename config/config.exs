@@ -2,9 +2,12 @@
 import Config
 
 # Endpoint configuration
+#
+# Port, bind interface, `server:` and `url:` are all set in config/runtime.exs,
+# which resolves them from AGENT_DB_HTTP_PORT and AGENT_DB_HTTP_IP at boot. They
+# are not set here: a compile-time value would be a second port setting that
+# silently disagreed with the one actually served.
 config :agent_db, AgentDbWeb.Endpoint,
-  http: [port: 4000],
-  url: [host: "localhost", port: 4000],
   live_view: [signing_salt: "agent_db_live_view_salt"],
   pubsub_server: AgentDb.PubSub,
   secret_key_base: "agent_db_dev_secret_key_base"

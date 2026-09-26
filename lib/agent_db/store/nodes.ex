@@ -4,6 +4,7 @@ defmodule AgentDb.Store.Nodes do
   # Node table operations over a SQLite connection. Pure functions: the caller
   # supplies the connection (writer for mutations, reader for queries).
 
+  alias AgentDb.JobQueue
   alias AgentDb.Store.SQLite
 
   @type kind :: :doc | :dir
@@ -96,17 +97,87 @@ defmodule AgentDb.Store.Nodes do
     )
   end
 
-  @doc "Deletes the subtree at `uri` (node and all descendants). Returns :not_found when absent."
-  @spec rm_subtree(SQLite.conn(), String.t()) :: :ok | {:error, term()}
+  @doc """
+  Deletes the subtree at `uri` (node and all descendants) from every store keyed
+  by URI, in one transaction. Returns `:not_found` when absent and `:root` for
+  the tree root, which is never removable.
+
+  `vec_nodes` is skipped when the sqlite-vec extension is not loaded, since the
+  table does not exist there.
+  """
+  @spec rm_subtree(SQLite.conn(), String.t()) :: :ok | :root | {:error, term()}
+  def rm_subtree(_conn, "viking://"), do: :root
+
   def rm_subtree(conn, uri) do
-    with {:ok, [[1]]} <- exists?(conn, uri),
-         :ok <- delete_subtree(conn, uri) do
-      :ok
+    with {:ok, true} <- exists?(conn, uri) do
+      SQLite.transaction(conn, fn c -> purge_uri_state(c, uri) end)
     else
-      {:ok, [[]]} -> {:error, :not_found}
-      {:ok, []} -> {:error, :not_found}
+      {:ok, false} -> {:error, :not_found}
       {:error, _} = err -> err
     end
+  end
+
+  # Every URI-keyed delete lives here. Adding a store that holds state per URI
+  # means adding a line to this function, so a new table cannot be silently
+  # left behind holding rows for removed nodes.
+  #
+  # All four share one prefix predicate so they cannot disagree about which
+  # URIs are "in the subtree". For `nodes` the removal is doubly guaranteed:
+  # by this predicate and by the parent_uri ON DELETE CASCADE foreign key.
+  defp purge_uri_state(conn, uri) do
+    prefix = like_escape(uri <> "/") <> "%"
+
+    with :ok <- delete_nodes(conn, uri, prefix),
+         :ok <- delete_vec_nodes(conn, uri, prefix),
+         :ok <- JobQueue.cancel_for_uri(conn, uri),
+         :ok <- delete_commit_meta(conn, uri, prefix),
+         :ok <- delete_memory_meta(conn, uri, prefix) do
+      :ok
+    end
+  end
+
+  defp delete_nodes(conn, uri, prefix) do
+    SQLite.exec_write(
+      conn,
+      "DELETE FROM nodes WHERE uri = ?1 OR uri LIKE ?2 ESCAPE '\\'",
+      [uri, prefix]
+    )
+  end
+
+  # vec_nodes is a vec0 virtual table that only exists when sqlite-vec loaded.
+  defp delete_vec_nodes(conn, uri, prefix) do
+    if SQLite.vec_available?(conn) do
+      SQLite.exec_write(
+        conn,
+        "DELETE FROM vec_nodes WHERE uri = ?1 OR uri LIKE ?2 ESCAPE '\\'",
+        [uri, prefix]
+      )
+    else
+      :ok
+    end
+  end
+
+  # Keyed by destination_uri only, never session_id: a session committed to
+  # several destinations loses bookkeeping for the removed one and keeps it for
+  # the rest. Leaving a stale row here is what makes a later re-commit of an
+  # unchanged session report :unchanged without restoring the document.
+  defp delete_commit_meta(conn, uri, prefix) do
+    SQLite.exec_write(
+      conn,
+      "DELETE FROM commit_meta WHERE destination_uri = ?1 OR destination_uri LIKE ?2 ESCAPE '\\'",
+      [uri, prefix]
+    )
+  end
+
+  # Superseded assertions included, not just the active one: a removal that left
+  # them behind would let a later write at the same URI inherit a value the
+  # caller asked to have removed.
+  defp delete_memory_meta(conn, uri, prefix) do
+    SQLite.exec_write(
+      conn,
+      "DELETE FROM memory_meta WHERE uri = ?1 OR uri LIKE ?2 ESCAPE '\\'",
+      [uri, prefix]
+    )
   end
 
   @doc """
@@ -141,16 +212,14 @@ defmodule AgentDb.Store.Nodes do
     end
   end
 
-  defp exists?(conn, uri) do
-    SQLite.query(conn, "SELECT 1 FROM nodes WHERE uri = ?1", [uri])
-  end
-
-  defp delete_subtree(conn, uri) do
-    SQLite.exec_write(
-      conn,
-      "DELETE FROM nodes WHERE uri = ?1 OR uri LIKE ?2 ESCAPE '\\'",
-      [uri, like_escape(uri <> "/") <> "%"]
-    )
+  @doc "True when a node row exists at `uri`."
+  @spec exists?(SQLite.conn(), String.t()) :: {:ok, boolean()} | {:error, term()}
+  def exists?(conn, uri) do
+    case SQLite.query_one(conn, "SELECT 1 FROM nodes WHERE uri = ?1", [uri]) do
+      {:ok, nil} -> {:ok, false}
+      {:ok, _row} -> {:ok, true}
+      {:error, _} = err -> err
+    end
   end
 
   defp row_to_node([uri, parent_uri, name, kind, content, abstract, overview]) do

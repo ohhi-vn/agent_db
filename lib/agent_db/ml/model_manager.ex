@@ -12,6 +12,18 @@ defmodule AgentDb.ML.ModelManager do
 
   require Logger
 
+  # Explicit rather than relying on Req's 15s default, so a slow host cannot
+  # block the inference process indefinitely. Not yet configurable; timeout
+  # policy belongs with the loader-split change.
+  @download_receive_timeout 30_000
+
+  # Explicit rather than GenServer.call's 5s default. A call now returns
+  # :model_loading immediately unless the model is already loaded, in which
+  # case it runs inference and needs room for it.
+  @call_timeout 60_000
+
+  @load_poll_interval_ms 50
+
   @type model_ref :: %{
           tokenizer: Bumblebee.Tokenizer.t(),
           model: Bumblebee.Model.t(),
@@ -33,16 +45,82 @@ defmodule AgentDb.ML.ModelManager do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
-  @doc "Generates embeddings for the given texts."
+  @doc """
+  Generates embeddings for the given texts.
+
+  Returns `{:error, :model_loading}` when the model is not ready and has not
+  become ready within `Config.model_load_grace_ms/0`. That is distinct from a
+  load that failed, and the call is safe to repeat.
+  """
   @spec embed([String.t()]) :: {:ok, [Nx.Tensor.t()]} | {:error, term()}
   def embed(texts) do
-    GenServer.call(__MODULE__, {:embed, texts})
+    await_model(fn -> GenServer.call(__MODULE__, {:embed, texts}, @call_timeout) end, :embedding)
   end
 
-  @doc "Generates a summary for the given prompt."
+  @doc """
+  Generates a summary for the given prompt.
+
+  Returns `{:error, :model_loading}` when the model is not ready and has not
+  become ready within `Config.model_load_grace_ms/0`.
+  """
   @spec summarize(String.t(), keyword()) :: {:ok, String.t()} | {:error, term()}
   def summarize(prompt, opts \\ []) do
-    GenServer.call(__MODULE__, {:summarize, prompt, opts})
+    await_model(
+      fn -> GenServer.call(__MODULE__, {:summarize, prompt, opts}, @call_timeout) end,
+      :llm
+    )
+  end
+
+  # The load happens outside the GenServer, so a call returns :model_loading
+  # almost immediately. The wait lives here, in the caller, so that a model
+  # which becomes ready inside the grace period is invisible to it.
+  defp await_model(call, role) do
+    case call.() do
+      {:error, :model_loading} ->
+        case wait_for_load(role, Config.model_load_grace_ms()) do
+          :ready ->
+            call.()
+
+          # A load that failed during the wait is reported as the failure it
+          # was. Reporting :model_loading here would tell the caller to retry
+          # something that will keep failing.
+          {:failed, reason} ->
+            {:error, reason}
+
+          :timeout ->
+            {:error, :model_loading}
+        end
+
+      other ->
+        other
+    end
+  end
+
+  defp wait_for_load(role, grace_ms) do
+    deadline = System.monotonic_time(:millisecond) + grace_ms
+    poll_until_loaded(role, deadline)
+  end
+
+  defp poll_until_loaded(role, deadline) do
+    case load_status_for(role) do
+      :ready ->
+        :ready
+
+      {:failed, reason} ->
+        {:failed, reason}
+
+      _loading_or_idle ->
+        if System.monotonic_time(:millisecond) >= deadline do
+          :timeout
+        else
+          Process.sleep(@load_poll_interval_ms)
+          poll_until_loaded(role, deadline)
+        end
+    end
+  end
+
+  defp load_status_for(role) do
+    GenServer.call(__MODULE__, {:load_status, role}, @call_timeout)
   end
 
   @doc "Returns the status of both models."
@@ -61,7 +139,10 @@ defmodule AgentDb.ML.ModelManager do
       embedding_model_url: Config.embedding_model_url(),
       llm_model: Config.llm_model(),
       llm_model_url: Config.llm_model_url(),
-      exla_backend: Config.exla_backend()
+      exla_backend: Config.exla_backend(),
+      # The only route to the model-loading library, so the load path can be
+      # exercised without real weights. See AgentDb.ML.BumblebeeLoader.
+      loader: AgentDb.ML.BumblebeeLoader
     }
 
     state = %State{
@@ -76,146 +157,212 @@ defmodule AgentDb.ML.ModelManager do
 
   @impl true
   def handle_call({:embed, texts}, _from, state) do
-    {:reply, reply, new_state} = do_embed(texts, state)
-    {:reply, reply, new_state}
+    case ensure_embedding_model(state) do
+      {:ok, model_ref, new_state} ->
+        {reply, new_state} = run_inference(&generate_embeddings(model_ref, &1), texts, new_state)
+        {:reply, reply, new_state}
+
+      # Either an already-running load, or one this call just started.
+      {:error, :loading, new_state} ->
+        {:reply, {:error, :model_loading}, new_state}
+    end
   end
 
   @impl true
   def handle_call({:summarize, prompt, opts}, _from, state) do
-    {:reply, reply, new_state} = do_summarize(prompt, opts, state)
-    {:reply, reply, new_state}
+    case ensure_llm_model(state) do
+      {:ok, model_ref, new_state} ->
+        {reply, new_state} =
+          run_inference(&generate_summary(model_ref, &1, opts), prompt, new_state)
+
+        {:reply, reply, new_state}
+
+      {:error, :loading, new_state} ->
+        {:reply, {:error, :model_loading}, new_state}
+    end
   end
 
   @impl true
   def handle_call(:model_status, _from, state) do
-    reply = build_model_status(state)
-    {:reply, reply, state}
+    {:reply, build_model_status(state), state}
+  end
+
+  @impl true
+  def handle_call({:load_status, role}, _from, state) do
+    {:reply, load_status(state, role), state}
+  end
+
+  @impl true
+  def handle_cast({:load_result, ref, role, result}, state) do
+    # A load runs outside this process and casts its result back by name, so a
+    # result can outlive the manager that started it -- after a restart, or
+    # when a new load has already begun. Only the in-flight load may write.
+    if state.loading_ref == ref do
+      {:noreply, apply_load_result(role, result, state)}
+    else
+      {:noreply, state}
+    end
   end
 
   # -- Internal Implementation --
 
-  defp do_embed(texts, state) do
-    case ensure_embedding_model(state) do
-      {:ok, model_ref, new_state} ->
-        case generate_embeddings(model_ref, texts) do
-          {:ok, embeddings} ->
-            {:reply, {:ok, embeddings}, new_state}
+  # Inference failures are reported, never raised: an exception here would kill
+  # the only inference process and discard the loaded model along with it.
+  defp run_inference(fun, input, state) do
+    case fun.(input) do
+      {:ok, result} -> {{:ok, result}, state}
+      {:error, reason} -> {{:error, reason}, state}
+    end
+  rescue
+    error -> {{:error, {:inference_failed, error}}, state}
+  catch
+    :exit, reason -> {{:error, {:inference_failed, {:exit, reason}}}, state}
+    :throw, value -> {{:error, {:inference_failed, {:throw, value}}}, state}
+  end
 
-          {:error, reason} ->
-            {:reply, {:error, reason}, new_state}
-        end
+  defp apply_load_result(role, result, state) do
+    case result do
+      {:ok, model_ref} ->
+        state
+        |> Map.put(model_field(role), model_ref)
+        |> put_load_status(role, :ready)
 
       {:error, reason} ->
-        {:reply, {:error, reason}, state}
+        state
+        |> Map.put(model_field(role), nil)
+        |> put_load_status(role, {:failed, reason})
     end
   end
 
-  defp do_summarize(prompt, opts, state) do
-    case ensure_llm_model(state) do
-      {:ok, model_ref, new_state} ->
-        case generate_summary(model_ref, prompt, opts) do
-          {:ok, summary} ->
-            {:reply, {:ok, summary}, new_state}
+  defp model_field(:embedding), do: :embedding_model
+  defp model_field(:llm), do: :llm_model
 
-          {:error, reason} ->
-            {:reply, {:error, reason}, new_state}
-        end
-
-      {:error, reason} ->
-        {:reply, {:error, reason}, state}
-    end
+  defp put_load_status(state, role, status) do
+    %{state | loading: Map.put(state.loading, role, status)}
   end
 
-  defp ensure_embedding_model(state) do
-    case state.embedding_model do
+  defp load_state_name(:idle), do: :idle
+  defp load_state_name(:loading), do: :loading
+  defp load_state_name(:ready), do: :ready
+  defp load_state_name({:failed, _reason}), do: :failed
+
+  # Loading happens outside handle_call/3 so a multi-second (or, on a cold
+  # start, multi-minute) load does not occupy the only inference process. A
+  # caller that arrives first starts the load and is told it is loading; later
+  # callers find the model ready.
+  defp ensure_embedding_model(state), do: ensure_model(state, :embedding)
+
+  defp ensure_llm_model(state), do: ensure_model(state, :llm)
+
+  defp ensure_model(state, role) do
+    case Map.get(state, model_field(role)) do
       nil ->
-        load_embedding_model(state)
+        # :idle, :ready and {:failed, _} all start a load. A previous failure
+        # is retried rather than inherited, so a model that failed because it
+        # was momentarily unavailable can still succeed later.
+        if load_status(state, role) == :loading do
+          {:error, :loading, state}
+        else
+          start_load(state, role)
+        end
 
       model_ref ->
         {:ok, model_ref, state}
     end
   end
 
-  defp ensure_llm_model(state) do
-    case state.llm_model do
-      nil ->
-        load_llm_model(state)
+  defp load_status(state, role), do: Map.get(state.loading, role, :idle)
 
-      model_ref ->
-        {:ok, model_ref, state}
-    end
+  # Task.start rather than a supervised child: build_model_ref/3 already
+  # contains raise/exit/throw, and the load is a single pure step. The cast
+  # back is what adopts the result, so a load can outlive the call that began
+  # it and still be picked up by a later caller.
+  defp start_load(state, role) do
+    # make_ref/0, not a counter: a counter restarts at zero in each new
+    # manager, so a load left over from a previous instance could present the
+    # same reference as the current in-flight load and be accepted.
+    ref = make_ref()
+    spawn_load(state.config, role, ref)
+    {:error, :loading, %{state | loading_ref: ref} |> put_load_status(role, :loading)}
   end
 
-  defp load_embedding_model(state) do
-    config = state.config
+  defp spawn_load(config, role, ref) do
+    _ =
+      Task.start(fn ->
+        GenServer.cast(__MODULE__, {:load_result, ref, role, perform_load(config, role)})
+      end)
+
+    :ok
+  end
+
+  defp perform_load(config, :embedding), do: load_embedding_model(config)
+  defp perform_load(config, :llm), do: load_llm_model(config)
+
+  defp load_embedding_model(config) do
     model_id = config.embedding_model
-    cache_dir = config.model_cache_dir
-    _backend = config.exla_backend
 
-    # Ensure model files exist
-    case ensure_model_files(model_id, config.embedding_model_url, cache_dir) do
-      :ok ->
-        try do
-          # Load tokenizer and model
-          {:ok, tokenizer} = Bumblebee.load_tokenizer({:hf, model_id})
-          {:ok, model_info} = Bumblebee.load_model({:hf, model_id})
-          model = Bumblebee.load_model(model_info)
-
-          # Configure for EXLA backend
-          serving = Bumblebee.Text.TextEmbedding
-          model_ref = %{
-            tokenizer: tokenizer,
-            model: model,
-            serving: serving
-          }
-
-          new_state = %{state | embedding_model: model_ref}
-          {:ok, model_ref, new_state}
-        catch
-          :error, reason ->
-            Logger.error("Failed to load embedding model: #{inspect(reason)}")
-            {:error, {:model_load_failed, reason}}
-        end
-
-      {:error, reason} ->
-        {:error, reason}
+    # ensure_model_files/3 performs network I/O, so it is deliberately inside
+    # the rescue: it used to be the scrutinee of the case and therefore outside
+    # the try, which let a transport failure terminate this GenServer.
+    with :ok <- ensure_model_files(model_id, config.embedding_model_url, config.model_cache_dir),
+         {:ok, model_ref} <- build_model_ref(config, model_id, :embedding) do
+      {:ok, model_ref}
     end
   end
 
-  defp load_llm_model(state) do
-    config = state.config
+  defp load_llm_model(config) do
     model_id = config.llm_model
-    cache_dir = config.model_cache_dir
-    _backend = config.exla_backend
 
-    # Ensure model files exist
-    case ensure_model_files(model_id, config.llm_model_url, cache_dir) do
-      :ok ->
-        try do
-          # Load tokenizer and model for Phi-3-mini (GGUF format)
-          {:ok, tokenizer} = Bumblebee.load_tokenizer({:hf, model_id})
-          {:ok, model_info} = Bumblebee.load_model({:hf, model_id})
-          model = Bumblebee.load_model(model_info)
-
-          serving = Bumblebee.Text.Generation
-          model_ref = %{
-            tokenizer: tokenizer,
-            model: model,
-            serving: serving
-          }
-
-          new_state = %{state | llm_model: model_ref}
-          {:ok, model_ref, new_state}
-        catch
-          :error, reason ->
-            Logger.error("Failed to load LLM model: #{inspect(reason)}")
-            {:error, {:model_load_failed, reason}}
-        end
-
-      {:error, reason} ->
-        {:error, reason}
+    with :ok <- ensure_model_files(model_id, config.llm_model_url, config.model_cache_dir),
+         {:ok, model_ref} <- build_model_ref(config, model_id, :llm) do
+      {:ok, model_ref}
     end
   end
+
+  # Bumblebee.load_model/2 already returns the loaded model as
+  # {:ok, %{model: model, spec: spec}} -- it is a single call, not two phases.
+  # Calling it a second time with that map used to raise ArgumentError, because
+  # normalize_repository!/1 accepts only {:hf, id} or {:local, dir}.
+  #
+  # :backend is applied here so Config.exla_backend/0 stops being discarded.
+  defp build_model_ref(config, model_id, role) do
+    loader = config.loader
+
+    with {:ok, tokenizer} <- loader.load_tokenizer({:hf, model_id}),
+         {:ok, %{model: model, spec: spec}} <-
+           loader.load_model({:hf, model_id}, backend: config.exla_backend) do
+      {:ok, %{tokenizer: tokenizer, model: model, spec: spec, serving: loader.serving(role)}}
+    else
+      {:error, reason} ->
+        Logger.error("Failed to load #{inspect(role)} model: #{inspect(reason)}")
+        {:error, wrap_load_error(reason)}
+
+      unexpected ->
+        Logger.error("Unexpected #{inspect(role)} load result: #{inspect(unexpected)}")
+        {:error, wrap_load_error(unexpected)}
+    end
+  rescue
+    error ->
+      Logger.error("Raised while loading #{inspect(role)} model: #{inspect(error)}")
+      {:error, wrap_load_error(error)}
+  catch
+    # An accelerator backend resolves through EXLA.Client, which reports a
+    # missing platform by exiting rather than raising, so rescue alone would
+    # let it terminate this process.
+    :exit, reason ->
+      Logger.error("Exited while loading #{inspect(role)} model: #{inspect(reason)}")
+      {:error, wrap_load_error({:exit, reason})}
+
+    :throw, value ->
+      Logger.error("Threw while loading #{inspect(role)} model: #{inspect(value)}")
+      {:error, wrap_load_error({:throw, value})}
+  end
+
+  # Already-classified errors pass through so callers can tell "could not be
+  # obtained" from "could not be loaded".
+  defp wrap_load_error({:download_failed, _} = reason), do: reason
+  defp wrap_load_error({:model_not_found, _} = reason), do: reason
+  defp wrap_load_error(reason), do: {:model_load_failed, reason}
 
   defp ensure_model_files(model_id, model_url, cache_dir) do
     model_dir = Path.join(cache_dir, model_id)
@@ -224,33 +371,58 @@ defmodule AgentDb.ML.ModelManager do
     if File.exists?(model_file) do
       :ok
     else
-      # In test environment, don't attempt downloads - return error quickly
-      if Mix.env() == :test do
-        {:error, {:model_not_found, model_file}}
-      else
-        download_model(model_url, model_dir, model_file)
-      end
+      download_model(model_url, model_dir, model_file)
     end
   end
 
+  # Writes to a .part path and renames into place, so a file at model_file is
+  # proof of a completed download. Previously the body was written straight to
+  # the final path, so a truncated file satisfied File.exists?/1 on every
+  # later boot and then failed at load forever.
   defp download_model(url, model_dir, model_file) do
+    if skip_remote_download_in_test?(url) do
+      {:error, {:model_not_found, model_file}}
+    else
+      do_download_model(url, model_dir, model_file)
+    end
+  end
+
+  # Keep the test suite off the network without also blocking the load path or
+  # the download logic itself: loopback URLs are served by the test and are
+  # always attempted.
+  defp skip_remote_download_in_test?(url) do
+    Mix.env() == :test and not String.starts_with?(url, "http://127.0.0.1")
+  end
+
+  defp do_download_model(url, model_dir, model_file) do
+    partial = model_file <> ".part"
     File.mkdir_p!(model_dir)
 
     Logger.info("Downloading model from #{url} to #{model_file}")
 
-    case Req.get!(url) do
-      %Req.Response{status: 200, body: body} ->
-        File.write!(model_file, body)
+    case Req.get(url, receive_timeout: @download_receive_timeout) do
+      {:ok, %Req.Response{status: 200, body: body}} ->
+        File.write!(partial, body)
+        File.rename!(partial, model_file)
         Logger.info("Model downloaded successfully")
         :ok
 
-      %Req.Response{status: status} ->
+      {:ok, %Req.Response{status: status}} ->
         Logger.error("Failed to download model: HTTP #{status}")
         {:error, {:download_failed, status}}
 
-      error ->
-        Logger.error("Failed to download model: #{inspect(error)}")
-        {:error, {:download_failed, error}}
+      {:error, reason} ->
+        Logger.error("Failed to download model: #{inspect(reason)}")
+        {:error, {:download_failed, reason}}
+    end
+    |> case do
+      :ok ->
+        :ok
+
+      {:error, _} = error ->
+        # Leave nothing behind that a later run would treat as a usable cache.
+        File.rm(partial)
+        error
     end
   end
 
@@ -313,11 +485,13 @@ defmodule AgentDb.ML.ModelManager do
     %{
       embedding: %{
         loaded: embedding_model != nil,
+        state: state.loading |> Map.get(:embedding, :idle) |> load_state_name(),
         model: state.config.embedding_model,
         dim: 384
       },
       llm: %{
         loaded: llm_model != nil,
+        state: state.loading |> Map.get(:llm, :idle) |> load_state_name(),
         model: state.config.llm_model,
         params: "3.8B"
       },

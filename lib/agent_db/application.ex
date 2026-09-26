@@ -13,6 +13,11 @@ defmodule AgentDb.Application do
     path = Path.join(data_dir, "agent_db.db")
 
     children = [
+      # Ahead of the endpoint: config names AgentDb.PubSub as the pubsub_server,
+      # and subscribing to a name with no server raises. Declaring a dependency
+      # without starting it is the same class of defect as configuring a
+      # listener without setting `server: true`.
+      {Phoenix.PubSub, name: AgentDb.PubSub},
       AgentDb.Cache.Owner,
       {AgentDb.Store.Writer, path: path},
       {AgentDb.Store.Reader, path: path},
@@ -165,16 +170,21 @@ defmodule AgentDb.Application do
     # HTTP API configuration
     http_enabled =
       case System.get_env("AGENT_DB_HTTP_ENABLED") do
-        nil -> true
+        # Off by default under test. The suite restarts the application from
+        # many setup blocks, so a listener would be bound and released that many
+        # times over and could collide with a running development instance --
+        # and a failed bind takes the endpoint's start, and the suite, with it.
+        # The reachability test opts in explicitly.
+        nil -> Mix.env() != :test
         value -> String.downcase(value) == "true"
       end
+
     Application.put_env(:agent_db, :http_enabled, http_enabled)
 
-    Application.put_env(:agent_db, :http_port,
-      case System.get_env("AGENT_DB_HTTP_PORT") do
-        nil -> 4000
-        value -> String.to_integer(value)
-      end)
+    # The port is not resolved here. It is read in config/runtime.exs, which is
+    # what builds the endpoint's `http:` and `url:` settings -- setting a
+    # :http_port app env that nothing reads would suggest the port is
+    # configurable here, and it is not.
 
     http_auth =
       case System.get_env("AGENT_DB_HTTP_AUTH") do

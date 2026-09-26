@@ -5,7 +5,7 @@ defmodule AgentDb.JobQueue do
   Uses optimistic locking with single-writer serialization for concurrent dequeue.
   """
 
-  alias AgentDb.Store.{SQLite, Writer, Reader}
+  alias AgentDb.Store.{Nodes, SQLite, Writer, Reader}
 
   @type kind :: :embed | :summarize_abstract | :summarize_overview
   @type payload :: map()
@@ -44,7 +44,7 @@ defmodule AgentDb.JobQueue do
 
   @doc "Dequeues the next pending job for a worker."
   @spec dequeue(String.t()) :: {:ok, job()} | {:error, :empty} | {:error, term()}
-  def dequeue(_worker_id) do
+  def dequeue(worker_id) do
     Writer.call(fn conn ->
       now = System.system_time(:millisecond)
 
@@ -98,7 +98,7 @@ defmodule AgentDb.JobQueue do
 
                 {:ok, [0]} ->
                   # Another worker got it, retry
-                  dequeue(_worker_id)
+                  dequeue(worker_id)
 
                 {:error, _} = err ->
                   err
@@ -114,85 +114,165 @@ defmodule AgentDb.JobQueue do
     end)
   end
 
-  @doc "Marks a job as completed successfully."
+  @doc """
+  Marks a job as completed successfully.
+
+  `complete/1` acquires the writer; `complete/2` runs on a connection the
+  caller already holds. Workers must use `complete/2`, because they persist
+  their result inside a `Writer.call/1` and calling `complete/1` from there
+  would be a GenServer call to the writer from inside the writer.
+  """
   @spec complete(integer()) :: :ok | {:error, term()}
   def complete(job_id) do
-    Writer.call(fn conn ->
-      now = System.system_time(:millisecond)
-      SQLite.exec_write(
-        conn,
-        """
-        UPDATE job_queue
-        SET status = 'done', updated_at = ?1
-        WHERE id = ?2
-        """,
-        [now, job_id]
-      )
-    end)
+    Writer.call(fn conn -> complete(conn, job_id) end)
   end
 
-  @doc "Marks a job as failed, schedules retry if attempts < max_attempts."
+  @spec complete(SQLite.conn(), integer()) :: :ok | {:error, term()}
+  def complete(conn, job_id) do
+    now = System.system_time(:millisecond)
+    SQLite.exec_write(
+      conn,
+      """
+      UPDATE job_queue
+      SET status = 'done', updated_at = ?1
+      WHERE id = ?2
+      """,
+      [now, job_id]
+    )
+  end
+
+  @doc """
+  Marks a job as failed, scheduling retry if attempts < max_attempts.
+
+  As with `complete/2`, workers must use `fail/3` from inside a `Writer.call/1`.
+  """
   @spec fail(integer(), term()) :: :ok | {:error, term()}
-  def fail(job_id, _reason) do
-    Writer.call(fn conn ->
-      now = System.system_time(:millisecond)
+  def fail(job_id, reason) do
+    Writer.call(fn conn -> fail(conn, job_id, reason) end)
+  end
 
-      case SQLite.query_one(
-             conn,
-             "SELECT attempts, max_attempts FROM job_queue WHERE id = ?1",
-             [job_id]
-           ) do
-        {:ok, [attempts, max_attempts]} ->
-          if attempts < max_attempts do
-            # Exponential backoff: 1s, 2s, 4s, 8s, 16s... max 5min
-            delay = min(300_000, :math.pow(2, attempts - 1) * 1000 |> round())
-            scheduled_at = now + delay
+  @spec fail(SQLite.conn(), integer(), term()) :: :ok | {:error, term()}
+  def fail(conn, job_id, _reason) do
+    now = System.system_time(:millisecond)
 
-            SQLite.exec_write(
-              conn,
-              """
-              UPDATE job_queue
-              SET status = 'pending', scheduled_at = ?1, updated_at = ?2
-              WHERE id = ?3
-              """,
-              [scheduled_at, now, job_id]
-            )
-          else
-            SQLite.exec_write(
-              conn,
-              """
-              UPDATE job_queue
-              SET status = 'failed', updated_at = ?1
-              WHERE id = ?2
-              """,
-              [now, job_id]
-            )
-          end
+    case SQLite.query_one(
+           conn,
+           "SELECT attempts, max_attempts FROM job_queue WHERE id = ?1",
+           [job_id]
+         ) do
+      {:ok, [attempts, max_attempts]} ->
+        if attempts < max_attempts do
+          # Exponential backoff: 1s, 2s, 4s, 8s, 16s... max 5min
+          delay = min(300_000, :math.pow(2, attempts - 1) * 1000 |> round())
+          scheduled_at = now + delay
 
-        {:ok, nil} ->
-          {:error, :not_found}
+          SQLite.exec_write(
+            conn,
+            """
+            UPDATE job_queue
+            SET status = 'pending', scheduled_at = ?1, updated_at = ?2
+            WHERE id = ?3
+            """,
+            [scheduled_at, now, job_id]
+          )
+        else
+          SQLite.exec_write(
+            conn,
+            """
+            UPDATE job_queue
+            SET status = 'failed', updated_at = ?1
+            WHERE id = ?2
+            """,
+            [now, job_id]
+          )
+        end
 
-        {:error, _} = err ->
-          err
-      end
-    end)
+      {:ok, nil} ->
+        {:error, :not_found}
+
+      {:error, _} = err ->
+        err
+    end
   end
 
   @doc "Resets running jobs to pending on startup (recovery)."
   @spec reset_running_jobs() :: :ok | {:error, term()}
   def reset_running_jobs do
-    Writer.call(fn conn ->
-      now = System.system_time(:millisecond)
-      SQLite.exec_write(
-        conn,
-        """
-        UPDATE job_queue
-        SET status = 'pending', attempts = 0, scheduled_at = ?1, updated_at = ?1
-        WHERE status = 'running'
-        """,
-        [now]
-      )
-    end)
+    Writer.call(fn conn -> reset_running_jobs(conn) end)
+  end
+
+  @spec reset_running_jobs(SQLite.conn()) :: :ok | {:error, term()}
+  def reset_running_jobs(conn) do
+    now = System.system_time(:millisecond)
+    SQLite.exec_write(
+      conn,
+      """
+      UPDATE job_queue
+      SET status = 'pending', attempts = 0, scheduled_at = ?1, updated_at = ?1
+      WHERE status = 'running'
+      """,
+      [now]
+    )
+  end
+
+  @doc """
+  Deletes every job whose payload targets `uri` or a descendant of it, in any
+  state (`pending`, `running`, `done`, or `failed`).
+
+  Takes a connection rather than acquiring the writer itself, because removal
+  calls this from inside its own transaction on the writer connection.
+
+  Matches on the payload's `uri` field rather than the raw JSON text: a
+  substring match would also delete jobs for unrelated URIs whose *content*
+  happens to mention this one, which would silently drop work outside the
+  removed subtree.
+  """
+  @spec cancel_for_uri(SQLite.conn(), String.t()) :: :ok | {:error, term()}
+  def cancel_for_uri(conn, uri) do
+    SQLite.exec_write(
+      conn,
+      """
+      DELETE FROM job_queue
+      WHERE json_extract(payload, '$.uri') = ?1
+         OR json_extract(payload, '$.uri') LIKE ?2 ESCAPE '\\'
+      """,
+      [uri, Nodes.like_escape(uri <> "/") <> "%"]
+    )
+  end
+
+  @doc """
+  Returns a job to `pending` without consuming a retry attempt.
+
+  `dequeue/1` advances `attempts` when it claims a row, so a job that is merely
+  waiting for a model would otherwise spend its budget on waiting. This gives
+  the attempt back and reschedules, keeping the retry budget for failures that
+  can actually succeed on retry.
+  """
+  @spec requeue(SQLite.conn(), integer(), non_neg_integer()) :: :ok | {:error, term()}
+  def requeue(conn, job_id, delay_ms) do
+    now = System.system_time(:millisecond)
+
+    SQLite.exec_write(
+      conn,
+      """
+      UPDATE job_queue
+      SET status = 'pending',
+          attempts = MAX(attempts - 1, 0),
+          scheduled_at = ?1,
+          updated_at = ?2
+      WHERE id = ?3
+      """,
+      [now + delay_ms, now, job_id]
+    )
+  end
+
+  @doc """
+  Reschedules a job without consuming a retry attempt, for work that is merely
+  waiting rather than failing.
+  """
+  @spec defer(integer(), non_neg_integer()) :: :ok | {:error, term()}
+  def defer(job_id, delay_ms) do
+    Writer.call(fn conn -> requeue(conn, job_id, delay_ms) end)
   end
 
   @doc "Gets queue statistics."
