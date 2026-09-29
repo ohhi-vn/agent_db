@@ -1,220 +1,335 @@
 defmodule AgentDbWeb.AdminLive do
-  use Phoenix.LiveView,
-    layout: {AgentDbWeb.Layouts, :live}
+  @moduledoc """
+  The operations console.
 
-  import Phoenix.HTML
-  import Phoenix.LiveView.Helpers
+  A view of what the store holds and what it is doing, and the place an operator
+  imports Agent Skills from. It answers through the same facade every other client
+  uses, so what an operator does here is what a program gets -- there is no second,
+  more forgiving path into the store for the console's benefit.
+  """
+  use Phoenix.LiveView, layout: {AgentDbWeb.Layouts, :live}
+
+  import Phoenix.LiveView
   import Phoenix.Component
-  import Phoenix.Param
+
   alias AgentDbWeb.Context
 
+  @refresh_ms 30_000
+
+  @impl Phoenix.LiveView
   def mount(_params, _session, socket) do
     if connected?(socket) do
-      Phoenix.PubSub.subscribe(AgentDb.PubSub, "documents")
-      Phoenix.PubSub.subscribe(AgentDb.PubSub, "sessions")
-      Phoenix.PubSub.subscribe(AgentDb.PubSub, "jobs")
+      :timer.send_interval(@refresh_ms, self(), :refresh)
     end
-    
-    {:ok, assign(socket, 
-      documents: load_documents(), 
-      active_tab: "documents",
-      sessions: [],
-      model_status: load_model_status(),
-      job_stats: load_job_stats()
-    )}
+
+    {:ok,
+     socket
+     |> assign(page: 1, user_id: "", results: [], limits: AgentDb.skill_import_limits())
+     |> allow_skill_uploads()
+     |> load()}
   end
 
-  def handle_params(%{"tab" => tab}, _uri, socket) do
-    {:noreply, assign(socket, active_tab: tab)}
+  @impl Phoenix.LiveView
+  def handle_params(%{"page" => page}, _uri, socket) do
+    {:noreply, socket |> assign(page: page) |> load()}
   end
 
-  def handle_params(_params, _uri, socket) do
-    {:noreply, socket}
+  def handle_params(_params, _uri, socket), do: {:noreply, load(socket)}
+
+  @impl Phoenix.LiveView
+  def handle_info(:refresh, socket), do: {:noreply, load(socket)}
+
+  @impl Phoenix.LiveView
+  def handle_event("delete", %{"uri" => uri}, socket) do
+    {:noreply, socket |> assign(notice: delete(uri)) |> load()}
   end
 
-  def handle_event("switch_tab", %{"tab" => tab}, socket) do
-    {:noreply, assign(socket, active_tab: tab) |> push_patch(to: "/admin?tab=#{tab}")}
+  @impl Phoenix.LiveView
+  def handle_event("import_skills", params, socket) do
+    case read_source(socket) do
+      :empty ->
+        {:noreply, assign(socket, results: [], notice: "Choose a skills folder or an archive.")}
+
+      {:ok, source} ->
+        {:noreply, socket |> import_skills(params["user_id"] || "", source) |> load()}
+    end
   end
 
-  def handle_info({:doc_change, _uri}, socket) do
-    {:noreply, assign(socket, documents: load_documents())}
+  # The browser's caps are the bounds the importer itself accepts, so a bundle
+  # that would be refused is refused before it is uploaded rather than after.
+  defp allow_skill_uploads(socket) do
+    limits = socket.assigns.limits
+
+    # Any kind of file: a skill is whatever its author put in it, and the
+    # importer is what decides whether a file is one it can store. An archive is
+    # recognised by what it holds rather than by what it is called, so its
+    # extension is not filtered either -- a `.tgz`, a `.tar.gz` and a tar that
+    # was renamed are the same to the importer, and it reports one it cannot read.
+    socket
+    |> allow_upload(:skill_folder,
+      accept: :any,
+      max_entries: limits.max_entries,
+      max_file_size: limits.max_bytes
+    )
+    |> allow_upload(:skill_archive,
+      accept: :any,
+      max_entries: 1,
+      max_file_size: limits.max_bytes
+    )
   end
 
-  def handle_info({:session_change, _id}, socket) do
-    {:noreply, assign(socket, sessions: load_sessions())}
-  end
-
-  def handle_info({:job_change, _id}, socket) do
-    {:noreply, assign(socket, job_stats: load_job_stats())}
-  end
-
-  defp load_documents do
-    with {:ok, %{data: docs}} <- Context.list_documents([]) do
-      docs
+  # Which of the two forms the operator filled in. An archive is one file and a
+  # folder is many, so the choice is read off the uploads rather than asked for.
+  defp read_source(socket) do
+    if uploaded?(socket, :skill_archive) do
+      {:ok, {:archive, archive(socket)}}
     else
-      {:error, _} -> []
+      folder(socket)
     end
   end
 
-  defp load_sessions do
-    with {:ok, sessions} <- Context.list_sessions([]) do
-      sessions
+  defp folder(socket) do
+    if uploaded?(socket, :skill_folder) do
+      {:ok, {:uploads, consume_uploaded_entries(socket, :skill_folder, &folder_file/2)}}
     else
-      {:error, _reason} -> []
+      :empty
     end
   end
 
-  defp load_model_status do
-    Context.model_status()
+  defp archive(socket) do
+    [bytes] =
+      consume_uploaded_entries(socket, :skill_archive, fn %{path: path}, _entry ->
+        {:ok, File.read!(path)}
+      end)
+
+    bytes
   end
 
-  defp load_job_stats do
-    with {:ok, stats} <- AgentDb.JobQueue.stats() do
-      stats
-    else
-      {:error, _reason} -> %{}
+  # A folder selection arrives as one entry per file, each carrying the path it
+  # had inside the folder the operator chose -- which is what says whether the
+  # source is one skill or a collection of them.
+  defp folder_file(%{path: path}, entry) do
+    name = entry.client_relative_path || entry.client_name
+    {:ok, %{path: name, content: File.read!(path)}}
+  end
+
+  defp uploaded?(socket, name) do
+    case socket.assigns.uploads[name] do
+      %{entries: [_ | _] = entries} -> Enum.all?(entries, & &1.done?)
+      _none -> false
     end
   end
 
-  defp render_documents_tab(assigns, documents) do
+  defp import_skills(socket, user_id, source) do
+    case Context.import_skills(user_id, source) do
+      {:ok, %{skills: skills}} ->
+        assign(socket, user_id: user_id, results: skills, notice: summary(skills))
+
+      {:error, reason} ->
+        assign(socket,
+          results: [],
+          notice: "Import refused: #{Context.skill_import_error(reason)}"
+        )
+    end
+  end
+
+  defp summary(skills) do
+    [
+      count(skills, :imported, "imported"),
+      count(skills, :replaced, "replaced"),
+      count(skills, :failed, "failed")
+    ]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join(", ")
+  end
+
+  defp count(skills, status, label) do
+    case Enum.count(skills, &(&1.status == status)) do
+      0 -> nil
+      n -> "#{n} #{label}"
+    end
+  end
+
+  defp load(socket) do
+    assign(socket,
+      documents: documents(socket.assigns.page),
+      models: Context.model_status(),
+      jobs: Context.job_stats(),
+      notice: socket.assigns[:notice]
+    )
+  end
+
+  # The console lists the tree root, one page at a time: a store can hold more
+  # documents than fit in a table, and a console that tried to show all of them
+  # would be unusable on exactly the stores it is most needed for.
+  @page_size 50
+
+  defp documents(page) do
+    case Context.list_documents(%{"page" => page, "per_page" => @page_size}) do
+      {:ok, %{data: names, meta: meta}} -> %{names: names, meta: meta}
+      {:error, _reason} -> %{names: [], meta: %{page: page, total: 0, total_pages: 0}}
+    end
+  end
+
+  defp delete(uri) do
+    case Context.delete_document(uri) do
+      :ok -> "Removed #{uri}"
+      {:error, reason} -> "Could not remove #{uri}: #{inspect(reason)}"
+    end
+  end
+
+  @impl Phoenix.LiveView
+  def render(assigns) do
     ~H"""
-    <div class="bg-white rounded-lg shadow-sm border border-gray-200">
-      <div class="p-4 border-b border-gray-200 flex justify-between items-center">
-        <h2 class="text-lg font-medium text-gray-900">Documents (<%= length(documents) %>)</h2>
-        <a href="/admin/documents/new/edit" class="text-sm text-blue-600 hover:text-blue-800">New Document</a>
-      </div>
-      <div class="divide-y divide-gray-200">
-        <%= if documents == [] do %>
-          <div class="p-8 text-center text-gray-500">No documents found</div>
-        <% else %>
-          <%= for doc <- documents do %>
-            <div class="p-4 hover:bg-gray-50 flex justify-between items-center">
-              <div>
-                <code class="text-sm font-mono text-gray-700"><%= doc %></code>
-                <div class="flex items-center space-x-2 mt-1">
-                  <a href={"/admin/documents/#{URI.encode_www_form(doc)}/edit"} class="text-sm text-blue-600 hover:text-blue-800">Edit</a>
-                  <span class="text-gray-300">|</span>
-                  <button 
-                    phx-click="delete_document" 
-                    phx-value-uri={doc}
-                    class="text-sm text-red-600 hover:text-red-800">Delete</button>
-                </div>
-              </div>
-            </div>
-          <% end %>
-        <% end %>
-      </div>
+    <div class="p-8 space-y-8">
+      <header class="flex items-baseline justify-between">
+        <h1 class="text-2xl font-semibold text-gray-900">AgentDb</h1>
+        <p class="text-sm text-gray-500"><%= @documents.meta.total %> documents</p>
+      </header>
+
+      <p :if={@notice} class="rounded bg-blue-50 px-3 py-2 text-sm text-blue-900"><%= @notice %></p>
+
+      <section class="rounded-lg border border-gray-200">
+        <h2 class="px-4 py-3 font-medium text-gray-900">Import skills</h2>
+        <form id="import-skills" phx-submit="import_skills" class="space-y-4 px-4 pb-4">
+          <div>
+            <label for="skill-user-id" class="block text-sm text-gray-700">User ID</label>
+            <input
+              type="text"
+              id="skill-user-id"
+              name="user_id"
+              value={@user_id}
+              placeholder="alice"
+              class="mt-1 w-64 rounded border border-gray-300 px-2 py-1 font-mono text-sm"
+            />
+            <p class="mt-1 text-sm text-gray-500">
+              Skills are stored below <code class="font-mono">viking://user/&lt;user&gt;/skills</code>,
+              one subtree per user.
+            </p>
+          </div>
+
+          <div>
+            <label for="skill-folder" class="block text-sm text-gray-700">Skills folder</label>
+            <.live_file_input upload={@uploads[:skill_folder]} webkitdirectory />
+            <p class="mt-1 text-sm text-gray-500">
+              A folder holding one skill, or a collection of skill folders. Each skill needs a SKILL.md.
+            </p>
+            <ul class="mt-2 space-y-1">
+              <li
+                :for={entry <- @uploads.skill_folder.entries}
+                class="rounded bg-gray-50 px-2 py-1 text-xs text-gray-700"
+              >
+                <%= entry.client_relative_path || entry.client_name %>
+                <span :if={not entry.done?}><%= entry.progress %>%</span>
+              </li>
+            </ul>
+            <p
+              :for={reason <- upload_errors(@uploads[:skill_folder])}
+              class="mt-1 text-sm text-red-700"
+            >
+              <%= upload_error_to_string(reason) %>
+            </p>
+          </div>
+
+          <div>
+            <label for="skill-archive" class="block text-sm text-gray-700">Skills archive</label>
+            <.live_file_input upload={@uploads[:skill_archive]} />
+            <p class="mt-1 text-sm text-gray-500">
+              A .tar or .tar.gz holding the same folders, optionally under one wrapper directory.
+            </p>
+            <ul class="mt-2 space-y-1">
+              <li
+                :for={entry <- @uploads.skill_archive.entries}
+                class="rounded bg-gray-50 px-2 py-1 text-xs text-gray-700"
+              >
+                <%= entry.client_name %>
+                <span :if={not entry.done?}><%= entry.progress %>%</span>
+              </li>
+            </ul>
+            <p
+              :for={reason <- upload_errors(@uploads[:skill_archive])}
+              class="mt-1 text-sm text-red-700"
+            >
+              <%= upload_error_to_string(reason) %>
+            </p>
+          </div>
+
+          <p class="text-sm text-gray-500">
+            UTF-8 text only, at most <%= @limits.max_entries %> files and
+            <%= @limits.max_bytes %> bytes. A skill whose name is already stored is replaced whole.
+          </p>
+
+          <button type="submit" class="rounded bg-blue-600 px-4 py-2 text-sm text-white">
+            Import skills
+          </button>
+        </form>
+
+        <ul :if={@results != []} class="divide-y divide-gray-100 border-t border-gray-200">
+          <li :for={result <- @results} class="flex items-center justify-between px-4 py-2 text-sm">
+            <span class="font-mono text-gray-900"><%= result.name %></span>
+            <span :if={result.status == :failed} class="text-red-700">
+              <%= Context.skill_import_error(result.reason) %>
+            </span>
+            <span :if={result.status != :failed} class="text-gray-500">
+              <%= result.status %> &middot; <%= result.files %> files
+            </span>
+          </li>
+        </ul>
+      </section>
+
+      <section :for={{_title, _model} <- models_summary(@models)} class="rounded-lg border border-gray-200">
+        <h2 class="px-4 py-3 font-medium text-gray-900">Models</h2>
+        <dl class="grid grid-cols-2 gap-4 px-4 pb-4 text-sm">
+          <div :for={{role, entry} <- models_summary(@models)}>
+            <dt class="text-gray-500"><%= role %></dt>
+            <dd class="font-mono text-gray-900">
+              <%= entry.state %> &middot; <%= entry.loaded && "loaded" || "not loaded" %>
+            </dd>
+          </div>
+        </dl>
+      </section>
+
+      <section class="rounded-lg border border-gray-200">
+        <h2 class="px-4 py-3 font-medium text-gray-900">Queue</h2>
+        <dl class="grid grid-cols-4 gap-4 px-4 pb-4 text-sm">
+          <div :for={status <- [:pending, :running, :done, :failed]}>
+            <dt class="text-gray-500"><%= status %></dt>
+            <dd class="text-lg font-semibold text-gray-900"><%= Map.get(@jobs, status, 0) %></dd>
+          </div>
+        </dl>
+      </section>
+
+      <section class="rounded-lg border border-gray-200">
+        <h2 class="px-4 py-3 font-medium text-gray-900">Documents</h2>
+        <ul :if={@documents.names == []} class="px-4 pb-4 text-sm text-gray-500">
+          <li>No documents</li>
+        </ul>
+        <ul class="divide-y divide-gray-100">
+          <li :for={name <- @documents.names} class="flex items-center justify-between px-4 py-2">
+            <a class="font-mono text-sm text-blue-700 hover:underline" href={"/admin/documents/#{URI.encode_www_form(name)}/edit"}>
+              <%= name %>
+            </a>
+            <button phx-click="delete" phx-value-uri={name} class="text-sm text-red-600 hover:underline">
+              Remove
+            </button>
+          </li>
+        </ul>
+      </section>
     </div>
     """
   end
 
-  defp render_sessions_tab(assigns, sessions) do
-    ~H"""
-    <div class="bg-white rounded-lg shadow-sm border border-gray-200">
-      <div class="p-4 border-b border-gray-200">
-        <h2 class="text-lg font-medium text-gray-900">Sessions (<%= length(sessions) %>)</h2>
-      </div>
-      <div class="divide-y divide-gray-200">
-        <%= if sessions == [] do %>
-          <div class="p-8 text-center text-gray-500">No sessions found</div>
-        <% else %>
-          <%= for session <- sessions do %>
-            <div class="p-4 hover:bg-gray-50">
-              <code class="text-sm font-mono text-gray-700"><%= session.id %></code>
-              <div class="text-sm text-gray-500 mt-1"><%= length(session.messages) %> messages</div>
-            </div>
-          <% end %>
-        <% end %>
-      </div>
-    </div>
-    """
-  end
+  defp upload_error_to_string(:too_many_files),
+    do: "That is more files than one import accepts."
 
-  defp render_models_tab(assigns, model_status) do
-    ~H"""
-    <div class="bg-white rounded-lg shadow-sm border border-gray-200">
-      <div class="p-4 border-b border-gray-200">
-        <h2 class="text-lg font-medium text-gray-900">Model Status</h2>
-      </div>
-      <div class="p-4 space-y-4">
-        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <div class="p-4 bg-gray-50 rounded-lg">
-            <h3 class="font-medium text-gray-900 mb-2">Embedding Model</h3>
-            <%= render_model_info(assigns, model_status.embedding) %>
-          </div>
-          <div class="p-4 bg-gray-50 rounded-lg">
-            <h3 class="font-medium text-gray-900 mb-2">LLM Model</h3>
-            <%= render_model_info(assigns, model_status.llm) %>
-          </div>
-        </div>
-        <div class="p-4 bg-gray-50 rounded-lg">
-          <h3 class="font-medium text-gray-900 mb-2">Queue</h3>
-          <pre class="text-sm"><%= Jason.encode!(model_status.queue) %></pre>
-        </div>
-      </div>
-    </div>
-    """
-  end
+  defp upload_error_to_string(:too_large),
+    do: "One of those files is larger than one import accepts."
 
-  defp render_jobs_tab(assigns, job_stats) do
-    ~H"""
-    <div class="bg-white rounded-lg shadow-sm border border-gray-200">
-      <div class="p-4 border-b border-gray-200">
-        <h2 class="text-lg font-medium text-gray-900">Job Queue</h2>
-      </div>
-      <div class="p-4 space-y-4">
-        <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
-          <div class="p-4 bg-blue-50 rounded-lg">
-            <dt class="text-sm text-gray-500">Pending</dt>
-            <dd class="text-2xl font-bold text-blue-700"><%= Map.get(job_stats, :pending, 0) %></dd>
-          </div>
-          <div class="p-4 bg-yellow-50 rounded-lg">
-            <dt class="text-sm text-gray-500">Running</dt>
-            <dd class="text-2xl font-bold text-yellow-700"><%= Map.get(job_stats, :running, 0) %></dd>
-          </div>
-          <div class="p-4 bg-green-50 rounded-lg">
-            <dt class="text-sm text-gray-500">Completed</dt>
-            <dd class="text-2xl font-bold text-green-700"><%= Map.get(job_stats, :completed, 0) %></dd>
-          </div>
-          <div class="p-4 bg-red-50 rounded-lg">
-            <dt class="text-sm text-gray-500">Failed</dt>
-            <dd class="text-2xl font-bold text-red-700"><%= Map.get(job_stats, :failed, 0) %></dd>
-          </div>
-        </div>
-        <div class="p-4 bg-gray-50 rounded-lg">
-          <pre class="text-sm"><%= Jason.encode!(job_stats) %></pre>
-        </div>
-      </div>
-    </div>
-    """
-  end
+  defp upload_error_to_string(reason), do: inspect(reason)
 
-  defp render_unknown_tab(assigns) do
-    ~H"""
-    <div class="p-8 text-center text-gray-500">Unknown tab</div>
-    """
-  end
-
-  defp render_model_info(assigns, model) do
-    ~H"""
-    <dl class="space-y-1 text-sm">
-      <div class="flex justify-between">
-        <dt class="text-gray-500">Loaded</dt>
-        <dd class="font-medium"><%= if model.loaded do %>✓ Yes<% else %>✗ No<% end %></dd>
-      </div>
-      <div class="flex justify-between">
-        <dt class="text-gray-500">Dimensions</dt>
-        <dd class="font-medium"><%= model.dim || "N/A" %></dd>
-      </div>
-      <div class="flex justify-between">
-        <dt class="text-gray-500">Parameters</dt>
-        <dd class="font-medium"><%= model.params || "N/A" %></dd>
-      </div>
-      <div class="flex justify-between">
-        <dt class="text-gray-500">Last Latency</dt>
-        <dd class="font-medium"><%= model.last_latency_ms || "N/A" %>ms</dd>
-      </div>
-    </dl>
-    """
+  defp models_summary(models) do
+    for role <- [:embedding, :llm], Map.has_key?(models, role) do
+      {role, Map.get(models, role, %{})}
+    end
   end
 end

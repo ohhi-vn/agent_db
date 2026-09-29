@@ -1,0 +1,635 @@
+defmodule AgentDb.StorageContract.Helpers do
+  @moduledoc false
+  # Lifecycle the storage contract suite needs: a store of its own to run
+  # against, and no workers racing its assertions.
+
+  def restart_app do
+    :ok = Application.stop(:agent_db)
+    {:ok, _} = Application.ensure_all_started(:agent_db)
+    :ok
+  end
+
+  @doc """
+  Puts the store back the way it was: running, with `child` under its
+  supervisor.
+
+  Two things a test cannot assume. The application may already be stopped, by
+  this test or by an earlier file's teardown, and the supervisor this reaches
+  for only exists while it runs. And a test that started the same child itself
+  holds it under the test's own supervisor, which is torn down asynchronously --
+  so the name may still be taken when this runs, and the restoration deferred
+  until it is not.
+  """
+  def restore_child(child) do
+    case Application.ensure_all_started(:agent_db) do
+      {:ok, _apps} -> restart_when_free(child)
+      {:error, _reason} -> :ok
+    end
+
+    :ok
+  end
+
+  # A name conflict here means the test's own copy of the child is still
+  # shutting down. Retrying briefly is enough; waiting forever would hang the
+  # suite on a process that is already going.
+  defp restart_when_free(child, attempts \\ 20)
+
+  defp restart_when_free(_child, 0), do: :ok
+
+  defp restart_when_free(child, attempts) do
+    case Supervisor.restart_child(AgentDb.Supervisor, child) do
+      {:ok, _pid} -> :ok
+      {:error, :running} -> retry_restart(child, attempts)
+      {:error, :shutdown} -> retry_restart(child, attempts)
+      _other -> :ok
+    end
+  end
+
+  defp retry_restart(child, attempts) do
+    Process.sleep(25)
+    restart_when_free(child, attempts - 1)
+  end
+
+  @doc """
+  Stops the background workers, which would claim the very jobs the queue and
+  storage assertions inspect.
+
+  A worker already gone is not an error: the test that follows may have stopped
+  it itself, and the state these tests need -- no worker -- holds either way.
+  """
+  def stop_workers do
+    for worker <- [AgentDb.Workers.Embedding, AgentDb.Workers.Summarization] do
+      _ = Supervisor.terminate_child(AgentDb.Supervisor, worker)
+    end
+
+    :ok
+  end
+
+  @doc """
+  Makes a job claimable again straight away.
+
+  A failed job is rescheduled with backoff, seconds out. Bringing its schedule
+  forward is what waiting would have done, and keeps the retry assertions about
+  retry rather than about sleeping.
+  """
+  def make_runnable(job_id) do
+    AgentDb.Store.Writer.call(fn conn ->
+      AgentDb.Store.SQLite.exec_write(
+        conn,
+        "UPDATE job_queue SET scheduled_at = ?1 WHERE id = ?2",
+        [System.system_time(:millisecond), job_id]
+      )
+    end)
+  end
+end
+
+defmodule AgentDb.StorageContract do
+  @moduledoc """
+  What every storage provider has to do, expressed once.
+
+  A provider that satisfies this suite can be selected at startup in place of
+  the default and the store keeps the guarantees the rest of the system relies
+  on: a write is durable, a removal is complete and atomic, and work that was
+  already in flight cannot bring a removed URI back.
+
+  The suite drives the port directly rather than the public facade, because the
+  facade's behaviour is verified separately and a provider is only responsible
+  for its own half of it.
+  """
+  use ExUnit.CaseTemplate
+
+  @callback storage() :: module()
+
+  @doc """
+  Breaks the provider's durable state so that a write fails part way through,
+  and returns a function that puts it back.
+
+  The rollback guarantees cannot be observed without a write that fails after it
+  has already done something, and only a provider can arrange that: this is where
+  a store drops a table, a collection loses its connection, or whatever serving
+  it stands in for is taken away.
+  """
+  @callback break_writes() :: (-> :ok)
+
+  using do
+    quote do
+      @behaviour AgentDb.StorageContract
+
+      import AgentDb.StorageContract, only: [storage_contract: 0]
+      import AgentDb.StorageContract.Helpers
+    end
+  end
+
+  setup do
+    alias AgentDb.StorageContract.Helpers
+
+    Application.put_env(:agent_db, :data_dir, AgentDb.Config.test_data_dir())
+    Application.put_env(:agent_db, :storage_adapter, AgentDb.Adapters.SQLite)
+    :ok = Helpers.restart_app()
+    :ok = Helpers.stop_workers()
+
+    on_exit(fn ->
+      Application.delete_env(:agent_db, :data_dir)
+      Application.delete_env(:agent_db, :storage_adapter)
+    end)
+
+    :ok
+  end
+
+  @doc "The expectations every provider is measured against."
+  defmacro storage_contract do
+    quote do
+      describe "documents" do
+        test "a written document reads back identically" do
+          uri = "viking://resources/contract/a.md"
+
+          assert :ok = storage().put_document(uri, "the body", [])
+
+          assert {:ok, node} = storage().get_node(uri)
+          assert node.content == "the body"
+          assert node.kind == :doc
+          assert node.uri == uri
+        end
+
+        test "missing parents are created implicitly" do
+          assert :ok = storage().put_document("viking://resources/contract/deep/a/b.md", "x", [])
+
+          assert {:ok, node} = storage().get_node("viking://resources/contract/deep/a")
+          assert node.kind == :dir
+        end
+
+        test "a URI holding nothing is reported as absent, not as a failure" do
+          assert {:ok, nil} = storage().get_node("viking://resources/contract/nothing.md")
+        end
+
+        test "a caller-supplied layer is stored and an unsupplied one is left alone" do
+          uri = "viking://resources/contract/layers.md"
+          assert :ok = storage().put_document(uri, "body", abstract: "L0", overview: nil)
+
+          assert {:ok, node} = storage().get_node(uri)
+          assert node.abstract == "L0"
+          assert node.overview == nil
+
+          # A re-write that carries no summary must not discard the one it did.
+          assert :ok = storage().put_document(uri, "new body", [])
+          assert {:ok, node} = storage().get_node(uri)
+          assert node.abstract == "L0"
+          assert node.content == "new body"
+        end
+
+        test "children are listed directly and a missing URI is not" do
+          assert :ok = storage().put_document("viking://resources/contract/tree/a.md", "a", [])
+
+          assert :ok =
+                   storage().put_document("viking://resources/contract/tree/nested/b.md", "b", [])
+
+          assert {:ok, ["a.md", "nested"]} =
+                   storage().list_children("viking://resources/contract/tree")
+
+          assert {:error, :not_found} =
+                   storage().list_children("viking://resources/contract/absent")
+        end
+
+        test "a document is not a directory to list" do
+          uri = "viking://resources/contract/leaf.md"
+          assert :ok = storage().put_document(uri, "a", [])
+
+          assert {:error, :not_found} = storage().list_children(uri)
+        end
+      end
+
+      describe "removal" do
+        test "removes a subtree from every store keyed by URI" do
+          parent = "viking://resources/contract/gone"
+          child = parent <> "/deep/a.md"
+          outside = "viking://resources/contract/kept.md"
+
+          assert {:ok, session_id} = storage().create_session()
+
+          assert :ok = storage().put_document(parent <> "/deep/b.md", "b", [])
+          assert :ok = storage().put_document(child, "a", [])
+          assert :ok = storage().put_document(outside, "kept", [])
+          assert {:ok, _} = storage().enqueue_job(:embed, %{uri: child, content: "a"})
+          assert {:ok, _} = storage().enqueue_job(:embed, %{uri: outside, content: "kept"})
+          assert :ok = storage().put_commit(session_id, child, "hash", "committed")
+          assert :ok = storage().put_memory(parent <> "/mem", "a fact", 0.5, nil)
+
+          assert :ok = storage().remove_subtree(parent)
+
+          assert {:ok, nil} = storage().get_node(child)
+          assert {:ok, nil} = storage().get_node(parent)
+          # Nothing outside the subtree moved, including its queued work.
+          assert {:ok, node} = storage().get_node(outside)
+          assert node.content == "kept"
+          assert 1 = storage().count_jobs(outside, ["pending", "running", "done", "failed"])
+          assert 0 = storage().count_jobs(child, ["pending", "running", "done", "failed"])
+          # Commit bookkeeping for the removed destination is gone, so a later
+          # commit of the same session restores the document rather than
+          # reporting it unchanged.
+          assert {:ok, nil} = storage().commit_hash(session_id, child)
+          assert {:ok, []} = storage().recall_memories(parent, nil, [:active, :superseded])
+        end
+
+        test "a rejected removal leaves everything untouched" do
+          uri = "viking://resources/contract/present.md"
+          assert :ok = storage().put_document(uri, "kept", [])
+
+          assert {:error, :not_found} =
+                   storage().remove_subtree("viking://resources/contract/absent")
+
+          assert {:ok, node} = storage().get_node(uri)
+          assert node.content == "kept"
+        end
+
+        test "the tree root is not removable" do
+          assert {:error, :is_root} = storage().remove_subtree("viking://")
+
+          assert :ok =
+                   storage().put_document("viking://resources/after-root.md", "still here", [])
+        end
+
+        test "a URI that is not a viking URI is rejected" do
+          assert {:error, :invalid_uri} = storage().remove_subtree("http://elsewhere/x")
+        end
+      end
+
+      describe "replacing a subtree" do
+        test "each file is stored at the path it was given, with work queued for it" do
+          uri = "viking://user/alice/skills/imported"
+
+          assert {:ok, %{replaced: false, files: 2}} =
+                   storage().replace_skill(uri, [
+                     %{path: ["SKILL.md"], content: "the manifest"},
+                     %{path: ["references", "guide.md"], content: "the guide"}
+                   ])
+
+          assert {:ok, node} = storage().get_node(uri <> "/SKILL.md")
+          assert node.content == "the manifest"
+          assert {:ok, nested} = storage().get_node(uri <> "/references/guide.md")
+          assert nested.content == "the guide"
+          # A directory above them exists, and a file is queued for the work a
+          # write would have queued, so it is searchable on the same terms.
+          assert {:ok, dir} = storage().get_node(uri <> "/references")
+          assert dir.kind == :dir
+          assert storage().count_jobs(uri <> "/SKILL.md", ["pending", "running"]) > 0
+        end
+
+        test "what was there before is gone, from every store keyed by URI" do
+          uri = "viking://user/alice/skills/replaced"
+          outside = "viking://user/alice/skills/kept/SKILL.md"
+
+          assert :ok = storage().put_document(uri <> "/stale.md", "stale", [])
+          assert :ok = storage().put_document(uri <> "/deep/stale.md", "stale", [])
+          assert :ok = storage().put_memory(uri <> "/fact", "a fact", 0.5, nil)
+
+          assert {:ok, _} =
+                   storage().enqueue_job(:embed, %{uri: uri <> "/stale.md", content: "s"})
+
+          assert :ok = storage().put_document(outside, "kept", [])
+
+          assert {:ok, %{replaced: true}} =
+                   storage().replace_skill(uri, [%{path: ["SKILL.md"], content: "the manifest"}])
+
+          assert {:ok, nil} = storage().get_node(uri <> "/stale.md")
+          assert {:ok, nil} = storage().get_node(uri <> "/deep/stale.md")
+          assert {:ok, []} = storage().recall_memories(uri, nil, [:active, :superseded])
+          assert 0 = storage().count_jobs(uri, ["pending", "running", "done", "failed"])
+          # Nothing outside the replaced subtree moved.
+          assert {:ok, node} = storage().get_node(outside)
+          assert node.content == "kept"
+        end
+
+        test "a failed replacement leaves the previous subtree intact" do
+          uri = "viking://user/alice/skills/rolled-back"
+          assert :ok = storage().put_document(uri <> "/SKILL.md", "the old manifest", [])
+          assert :ok = storage().put_document(uri <> "/old.md", "the old file", [])
+          assert {:ok, _} = storage().enqueue_job(:embed, %{uri: uri <> "/old.md", content: "o"})
+
+          # A store that is not there makes a step of the replacement fail, after
+          # the removal has already run. Without a transaction the removal is
+          # committed by then, and the URI is left holding nothing at all.
+          restore = break_writes()
+
+          try do
+            assert {:error, _reason} =
+                     storage().replace_skill(uri, [
+                       %{path: ["SKILL.md"], content: "the new manifest"},
+                       %{path: ["new.md"], content: "the new file"}
+                     ])
+          after
+            restore.()
+          end
+
+          assert {:ok, node} = storage().get_node(uri <> "/SKILL.md")
+          assert node.content == "the old manifest"
+          assert {:ok, kept} = storage().get_node(uri <> "/old.md")
+          assert kept.content == "the old file"
+          assert {:ok, nil} = storage().get_node(uri <> "/new.md")
+          # The work queued for the old subtree is still queued for it.
+          assert storage().count_jobs(uri <> "/old.md", ["pending", "running", "done", "failed"]) ==
+                   1
+        end
+
+        test "a URI that is not a viking URI is rejected" do
+          assert {:error, :invalid_uri} = storage().replace_skill("http://elsewhere/x", [])
+        end
+      end
+
+      describe "results of work that was already in flight" do
+        test "a removed node is not given an embedding" do
+          uri = "viking://resources/contract/vanished.md"
+          assert :ok = storage().put_document(uri, "body", [])
+          assert {:ok, job_id} = storage().enqueue_job(:embed, %{uri: uri, content: "body"})
+          assert {:ok, _job} = storage().dequeue_job([:embed])
+
+          assert :ok = storage().remove_subtree(uri)
+
+          # The job was claimed before the removal, so cancelling queued work
+          # could not have caught it. The write is fenced on the node instead.
+          assert {:ok, :discarded} =
+                   storage().put_embedding_result(
+                     job_id,
+                     uri,
+                     :binary.copy(<<0.0::float-32>>, 384)
+                   )
+
+          assert {:ok, []} = storage().search_keyword("body", nil)
+        end
+
+        test "a removed node is not given a summary" do
+          uri = "viking://resources/contract/vanished-2.md"
+          assert :ok = storage().put_document(uri, "body", [])
+
+          assert {:ok, job_id} =
+                   storage().enqueue_job(:summarize_abstract, %{uri: uri, content: "body"})
+
+          assert {:ok, _job} = storage().dequeue_job([:summarize_abstract])
+
+          assert :ok = storage().remove_subtree(uri)
+
+          assert {:ok, :discarded} =
+                   storage().put_layer_result(job_id, uri, :abstract, "too late")
+
+          assert {:ok, nil} = storage().get_node(uri)
+        end
+
+        test "a node that is still there is given the result, and the job is done" do
+          uri = "viking://resources/contract/still-here.md"
+          assert :ok = storage().put_document(uri, "body", [])
+
+          assert {:ok, job_id} =
+                   storage().enqueue_job(:summarize_abstract, %{uri: uri, content: "body"})
+
+          assert {:ok, _job} = storage().dequeue_job([:summarize_abstract])
+
+          assert {:ok, :stored} = storage().put_layer_result(job_id, uri, :abstract, "one line")
+
+          assert {:ok, node} = storage().get_node(uri)
+          assert node.abstract == "one line"
+          assert {:error, :empty} = storage().dequeue_job([:summarize_abstract])
+        end
+      end
+
+      describe "search" do
+        test "matches a substring regardless of case" do
+          assert :ok =
+                   storage().put_document(
+                     "viking://resources/contract/search/one.md",
+                     "QuicK",
+                     []
+                   )
+
+          assert {:ok, [hit]} = storage().search_keyword("quick", nil)
+          assert hit.uri == "viking://resources/contract/search/one.md"
+        end
+
+        test "a scope limits the result to one subtree" do
+          scope = "viking://resources/contract/scoped"
+          assert :ok = storage().put_document(scope <> "/in.md", "needlehere", [])
+
+          assert :ok =
+                   storage().put_document("viking://resources/contract/out.md", "needlehere", [])
+
+          assert {:ok, [hit]} = storage().search_keyword("needlehere", scope <> "/")
+          assert hit.uri == scope <> "/in.md"
+        end
+      end
+
+      describe "sessions" do
+        test "messages are kept in order" do
+          assert {:ok, session_id} = storage().create_session()
+
+          assert :ok = storage().append_message(session_id, :user, "first")
+          assert :ok = storage().append_message(session_id, :assistant, "second")
+
+          assert {:ok, messages} = storage().get_session(session_id)
+          assert Enum.map(messages, & &1.content) == ["first", "second"]
+          assert Enum.map(messages, & &1.role) == [:user, :assistant]
+        end
+
+        test "a commit records its hash with the document it wrote" do
+          destination = "viking://resources/contract/committed"
+          assert {:ok, first} = storage().create_session()
+          assert {:ok, second} = storage().create_session()
+
+          assert {:ok, nil} = storage().commit_hash(first, destination)
+          assert :ok = storage().put_commit(first, destination, "hash-1", "the transcript")
+
+          assert {:ok, "hash-1"} = storage().commit_hash(first, destination)
+          assert {:ok, node} = storage().get_node(destination)
+          assert node.content == "the transcript"
+
+          # A second session's commit to the same destination is separate.
+          assert {:ok, nil} = storage().commit_hash(second, destination)
+        end
+      end
+
+      describe "memories" do
+        test "a revised memory keeps exactly one active assertion" do
+          uri = "viking://user/memories/preferences/language"
+
+          assert :ok = storage().put_memory(uri, "uses Go", 0.6, "s1")
+          assert :ok = storage().put_memory(uri, "uses Elixir", 0.9, "s2")
+
+          assert {:ok, [active]} = storage().recall_memories(uri, nil, [:active])
+          assert active.value == "uses Elixir"
+          assert active.confidence == 0.9
+          assert active.source == "s2"
+
+          assert {:ok, history} = storage().recall_memories(uri, nil, [:active, :superseded])
+          assert length(history) == 2
+          assert Enum.count(history, &(&1.status == :active)) == 1
+        end
+
+        test "a subtree is recalled most confident first" do
+          assert :ok = storage().put_memory("viking://user/memories/events/low", "low", 0.2, nil)
+
+          assert :ok =
+                   storage().put_memory("viking://user/memories/events/high", "high", 0.9, nil)
+
+          assert {:ok, found} =
+                   storage().recall_memories("viking://user/memories/events", nil, [:active])
+
+          assert Enum.map(found, & &1.confidence) == [0.9, 0.2]
+        end
+
+        test "a term restricts a recall" do
+          assert :ok =
+                   storage().put_memory(
+                     "viking://user/memories/entities/one",
+                     "kubernetes",
+                     0.5,
+                     nil
+                   )
+
+          assert :ok =
+                   storage().put_memory(
+                     "viking://user/memories/entities/two",
+                     "postgres",
+                     0.5,
+                     nil
+                   )
+
+          assert {:ok, [hit]} =
+                   storage().recall_memories("viking://user/memories/entities", "KUBERNETES", [
+                     :active
+                   ])
+
+          assert hit.value == "kubernetes"
+        end
+
+        test "a URI is asked about whether it holds a memory at all" do
+          uri = "viking://user/memories/profile/name"
+          assert :ok = storage().put_memory(uri, "ada", 0.5, nil)
+
+          assert {:ok, true} = storage().memory_recorded?(uri)
+
+          assert {:ok, false} =
+                   storage().memory_recorded?("viking://user/memories/profile/nobody")
+        end
+      end
+
+      describe "durable work" do
+        test "a claimed job leaves the queue and records its attempt" do
+          uri = "viking://resources/contract/j.md"
+          assert {:ok, job_id} = storage().enqueue_job(:embed, %{uri: uri, content: "c"})
+
+          assert {:ok, job} = storage().dequeue_job([:embed])
+          assert job.id == job_id
+          assert job.kind == :embed
+          assert job.payload["uri"] == uri
+          assert job.attempts == 1
+          assert {:error, :empty} = storage().dequeue_job([:embed])
+        end
+
+        test "a worker is handed only the kinds it can run" do
+          assert {:ok, _} =
+                   storage().enqueue_job(:summarize_abstract, %{
+                     uri: "viking://resources/contract/s.md",
+                     content: "c"
+                   })
+
+          # Claiming for a kind that has no work must not consume work of
+          # another kind: a claimed job cannot be handed back.
+          assert {:error, :empty} = storage().dequeue_job([:embed])
+
+          assert {:ok, job} = storage().dequeue_job([:summarize_abstract])
+          assert job.kind == :summarize_abstract
+        end
+
+        test "a job is counted by URI and by status" do
+          uri = "viking://resources/contract/counted.md"
+          assert {:ok, _id} = storage().enqueue_job(:embed, %{uri: uri, content: "c"})
+          assert 1 = storage().count_jobs(uri, ["pending", "running"])
+          assert 0 = storage().count_jobs(uri, ["failed"])
+
+          assert {:ok, _job} = storage().dequeue_job([:embed])
+          assert 1 = storage().count_jobs(uri, ["running"])
+        end
+
+        test "completing a job takes it out of the queue" do
+          uri = "viking://resources/contract/done.md"
+          assert {:ok, job_id} = storage().enqueue_job(:embed, %{uri: uri, content: "c"})
+          assert {:ok, _job} = storage().dequeue_job([:embed])
+
+          assert :ok = storage().complete_job(job_id)
+          assert 0 = storage().count_jobs(uri, ["pending", "running"])
+        end
+
+        test "a failure is retried while attempts remain, then given up on" do
+          uri = "viking://resources/contract/failing.md"
+          assert {:ok, job_id} = storage().enqueue_job(:embed, %{uri: uri, content: "c"})
+
+          for _attempt <- 1..5 do
+            assert {:ok, _job} = storage().dequeue_job([:embed])
+            assert :ok = storage().fail_job(job_id)
+            make_runnable(job_id)
+          end
+
+          assert 0 = storage().count_jobs(uri, ["pending", "running"])
+          assert 1 = storage().count_jobs(uri, ["failed"])
+        end
+
+        test "a deferral does not spend an attempt" do
+          uri = "viking://resources/contract/deferred.md"
+          assert {:ok, job_id} = storage().enqueue_job(:embed, %{uri: uri, content: "c"})
+
+          for _round <- 1..3 do
+            assert {:ok, _job} = storage().dequeue_job([:embed])
+            assert :ok = storage().defer_job(job_id, 0)
+          end
+
+          # Still claimable, and its budget untouched: a job merely waiting for a
+          # model has not failed.
+          assert {:ok, job} = storage().dequeue_job([:embed])
+          assert job.attempts == 1
+          assert 0 = storage().count_jobs(uri, ["failed"])
+        end
+
+        test "queued work is cancelled for a URI and its descendants only" do
+          target = "viking://resources/contract/cancelled"
+          other = "viking://resources/contract/other.md"
+          assert {:ok, _} = storage().enqueue_job(:embed, %{uri: target, content: "c"})
+
+          assert {:ok, _} =
+                   storage().enqueue_job(:embed, %{uri: target <> "/deep.md", content: "c"})
+
+          assert {:ok, _} = storage().enqueue_job(:embed, %{uri: other, content: "see #{target}"})
+
+          assert :ok = storage().cancel_jobs(target)
+
+          all = ["pending", "running", "done", "failed"]
+          assert 0 = storage().count_jobs(target, all)
+          # A bystander job survives even though its content mentions the URI.
+          assert 1 = storage().count_jobs(other, all)
+        end
+
+        test "work left running is recovered after a restart" do
+          uri = "viking://resources/contract/recovered.md"
+          assert {:ok, _id} = storage().enqueue_job(:embed, %{uri: uri, content: "c"})
+          assert {:ok, _job} = storage().dequeue_job([:embed])
+
+          :ok = restart_app()
+          :ok = stop_workers()
+
+          assert {:ok, job} = storage().dequeue_job([:embed])
+          assert job.attempts == 1
+        end
+
+        test "queued work is reported by status" do
+          uri = "viking://resources/contract/stats.md"
+          assert {:ok, _id} = storage().enqueue_job(:embed, %{uri: uri, content: "c"})
+
+          assert {:ok, stats} = storage().queue_stats()
+          assert stats.pending >= 1
+        end
+      end
+
+      describe "reachability" do
+        test "reports a store it can query" do
+          assert storage().healthy?() == true
+        end
+      end
+    end
+  end
+end

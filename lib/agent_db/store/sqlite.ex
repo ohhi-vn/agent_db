@@ -28,15 +28,21 @@ defmodule AgentDb.Store.SQLite do
     # Try to load sqlite-vec extension. This works if the extension is compiled
     # and available in the SQLite extension directory.
     case exec(conn, "SELECT vec_version()") do
-      {:ok, _} -> :ok
+      {:ok, _} ->
+        :ok
+
       {:error, _} ->
         # Extension not loaded, try to load it
         case exec(conn, "SELECT load_extension('vec0')") do
-          {:ok, _} -> :ok
+          {:ok, _} ->
+            :ok
+
           {:error, _} ->
             # Try alternative names
             case exec(conn, "SELECT load_extension('sqlite_vec')") do
-              {:ok, _} -> :ok
+              {:ok, _} ->
+                :ok
+
               {:error, _} ->
                 # If all fail, continue without vec - will error at runtime when used
                 :ok
@@ -312,14 +318,16 @@ defmodule AgentDb.Store.SQLite do
 
   defp try_create_vec_table(conn) do
     vec_ddl = """
-      CREATE VIRTUAL TABLE IF NOT EXISTS vec_nodes USING vec0(
-        embedding float[384],
-        uri TEXT PRIMARY KEY
-      )
-      """
+    CREATE VIRTUAL TABLE IF NOT EXISTS vec_nodes USING vec0(
+      embedding float[384],
+      uri TEXT PRIMARY KEY
+    )
+    """
 
     case exec(conn, vec_ddl) do
-      :ok -> :ok
+      :ok ->
+        :ok
+
       {:error, _} ->
         # sqlite-vec extension not available, continue without vector search
         Logger.info("sqlite-vec extension not available, vector search disabled")

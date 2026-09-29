@@ -42,15 +42,14 @@ defmodule AgentDb.Store.Writer do
     path = Keyword.fetch!(opts, :path)
     schema? = Keyword.get(opts, :ensure_schema, true)
 
-    case SQLite.open(path) do
-      {:ok, conn} ->
-        with :ok <- maybe_schema(conn, schema?) do
-          {:ok, %{conn: conn}}
-        else
-          {:error, reason} -> {:stop, {:schema_failed, reason}}
-        end
-
+    with {:ok, conn} <- SQLite.open(path),
+         :ok <- maybe_schema(conn, schema?) do
+      {:ok, %{conn: conn}}
+    else
       {:error, reason} ->
+        # The store is the whole application: if its one write connection
+        # cannot be opened, or its schema cannot be created, there is nothing
+        # left to start and every later failure would report the wrong cause.
         {:stop, {:open_failed, reason}}
     end
   end

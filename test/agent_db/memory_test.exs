@@ -1,7 +1,7 @@
 defmodule AgentDb.MemoryTest do
   use ExUnit.Case, async: false
 
-  alias AgentDb.Cache.Owner
+  alias AgentDb.Cache
   alias AgentDb.ML.ModelManager
   alias AgentDb.Store.{Reader, SQLite}
 
@@ -9,7 +9,7 @@ defmodule AgentDb.MemoryTest do
   @name "viking://user/memories/profile/name"
 
   setup do
-    Owner.clear()
+    Cache.clear()
     Application.put_env(:agent_db, :data_dir, AgentDb.Config.test_data_dir())
     restart_app()
 

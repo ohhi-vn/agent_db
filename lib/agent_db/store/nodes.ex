@@ -110,18 +110,31 @@ defmodule AgentDb.Store.Nodes do
 
   def rm_subtree(conn, uri) do
     with {:ok, true} <- exists?(conn, uri) do
-      SQLite.transaction(conn, fn c -> purge_uri_state(c, uri) end)
+      SQLite.transaction(conn, fn c -> purge_subtree(c, uri) end)
     else
       {:ok, false} -> {:error, :not_found}
       {:error, _} = err -> err
     end
   end
 
+  @doc """
+  Removes the subtree at `uri` from every store keyed by URI, on a connection the
+  caller already holds.
+
+  Takes the connection rather than opening a transaction of its own, so an
+  operation that has more to do in the same step -- replacing a subtree, for
+  instance -- can make the removal and what follows it one atomic step. Outside a
+  transaction it stands alone, exactly as `rm_subtree/2` does.
+  """
+  @spec purge_subtree(SQLite.conn(), String.t()) :: :ok | {:error, term()}
+  def purge_subtree(_conn, "viking://"), do: {:error, :root}
+  def purge_subtree(conn, uri), do: purge_uri_state(conn, uri)
+
   # Every URI-keyed delete lives here. Adding a store that holds state per URI
   # means adding a line to this function, so a new table cannot be silently
   # left behind holding rows for removed nodes.
   #
-  # All four share one prefix predicate so they cannot disagree about which
+  # All five share one prefix predicate so they cannot disagree about which
   # URIs are "in the subtree". For `nodes` the removal is doubly guaranteed:
   # by this predicate and by the parent_uri ON DELETE CASCADE foreign key.
   defp purge_uri_state(conn, uri) do

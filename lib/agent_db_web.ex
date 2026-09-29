@@ -3,16 +3,18 @@ defmodule AgentDbWeb do
   The main web module for AgentDb.
   """
 
-defmacro __using__(which) when is_atom(which) do
+  defmacro __using__(which) when is_atom(which) do
     quote do
-      unquote(case which do
-        :controller -> controller()
-        :live_view -> live_view()
-        :router -> router()
-        :endpoint -> endpoint()
-        :html_helpers -> html_helpers()
-        :view -> view()
-      end)
+      unquote(
+        case which do
+          :controller -> controller()
+          :live_view -> live_view()
+          :router -> router()
+          :endpoint -> endpoint()
+          :html_helpers -> html_helpers()
+          :view -> view()
+        end
+      )
     end
   end
 

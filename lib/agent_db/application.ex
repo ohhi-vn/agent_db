@@ -3,201 +3,196 @@ defmodule AgentDb.Application do
 
   use Application
 
-  @impl true
+  # Starts the store: which providers serve it, and in what order.
+  #
+  # The order is a dependency chain rather than a preference. The cache exists
+  # to sit in front of the database, so it starts first. Storage comes next
+  # because inference and the workers both reach it. Inference starts before the
+  # workers, so a job is never claimed by a worker whose model process is not
+  # there to answer it. The transport starts last, because it can be asked for
+  # state that nothing else has produced yet.
+  #
+  # A health endpoint that answers before the store is ready is worse than one
+  # that refuses to start: it reports on a store that cannot yet serve.
+  #
+  # Shutdown runs the other way, which the supervisor gets for free: the
+  # transport stops, then the workers drain what is in flight, then inference,
+  # then the connections.
+
+  @impl Application
   def start(_type, _args) do
-    # Set default configuration values
     put_default_config()
 
     data_dir = AgentDb.Config.data_dir()
     File.mkdir_p!(data_dir)
     path = Path.join(data_dir, "agent_db.db")
+    opts = [path: path]
 
-    children = [
-      # Ahead of the endpoint: config names AgentDb.PubSub as the pubsub_server,
-      # and subscribing to a name with no server raises. Declaring a dependency
-      # without starting it is the same class of defect as configuring a
-      # listener without setting `server: true`.
-      {Phoenix.PubSub, name: AgentDb.PubSub},
-      AgentDb.Cache.Owner,
-      {AgentDb.Store.Writer, path: path},
-      {AgentDb.Store.Reader, path: path},
-      AgentDb.ML.ModelManager,
-      {AgentDb.Workers.EmbeddingWorker, worker_id: "embedding_worker_1"},
-      {AgentDb.Workers.SummarizationWorker, worker_id: "summarization_worker_1"}
-    ]
+    # A provider that cannot answer its port is a configuration error, and this
+    # is the last moment it can be corrected.
+    :ok = AgentDb.Runtime.validate!()
 
-    # Conditionally add HTTP gateway (new Phoenix web endpoint with router)
-    http_children =
-      if AgentDb.Config.http_enabled() do
-        [
-          {AgentDbWeb.Endpoint, []}
-        ]
-      else
-        []
-      end
+    children =
+      pubsub_specs() ++
+        cache_specs() ++
+        AgentDb.Runtime.storage().child_specs(opts) ++
+        AgentDb.Runtime.inference().child_specs(opts) ++
+        worker_specs() ++
+        transport_specs(opts)
 
-    all_children = children ++ http_children
+    {:ok, supervisor} =
+      Supervisor.start_link(children, strategy: :one_for_one, name: AgentDb.Supervisor)
 
-    opts = [strategy: :one_for_one, name: AgentDb.Supervisor]
-    {:ok, supervisor} = Supervisor.start_link(all_children, opts)
-
-    # Initialize schema and job queue after supervisor starts
-    initialize_database(path)
+    initialize()
 
     {:ok, supervisor}
   end
 
-  @impl true
+  @impl Application
   def stop(_state) do
-    # Graceful shutdown: drain job queues, wait for workers
-    graceful_shutdown()
+    drain(AgentDb.Config.shutdown_grace_ms())
     :ok
   end
 
-  defp initialize_database(path) do
-    {:ok, conn} = AgentDb.Store.SQLite.open(path)
-    AgentDb.Store.SQLite.ensure_schema(conn)
-    AgentDb.JobQueue.reset_running_jobs()
-    AgentDb.Store.SQLite.close(conn)
+  # Jobs left running by a process that died are not lost and not running:
+  # they go back to pending, so the workers that start next can claim them.
+  defp initialize do
+    AgentDb.Runtime.storage().reset_running_jobs()
   end
 
-  defp graceful_shutdown do
-    # Signal workers to stop processing
-    stop_workers()
-    
-    # Wait for pending jobs to complete (with timeout)
-    wait_for_jobs_completion(5_000)
-    
-    # Shutdown ModelManager
-    GenServer.stop(AgentDb.ML.ModelManager, :shutdown, 2_000)
-    
-    # Close database connections
-    close_connections()
+  # Started ahead of everything that reads through it, and ahead of whichever
+  # storage provider is in use, because the cache belongs to the application
+  # layer rather than to a provider. A provider that is not SQLite serves the
+  # same reads, so it needs the same cache in front of it.
+  defp cache_specs, do: [AgentDb.Cache]
+
+  # The store's own pubsub, started whether or not a transport is serving. The
+  # endpoint's configuration names it, and subscribing to a name with no server
+  # raises -- so a deployment that turns HTTP off must not also break anything
+  # that publishes to it.
+  defp pubsub_specs, do: [{Phoenix.PubSub, name: AgentDb.PubSub}]
+
+  defp worker_specs do
+    [
+      {AgentDb.Workers.Embedding, []},
+      {AgentDb.Workers.Summarization, []}
+    ]
   end
 
-  defp stop_workers do
-    # Stop embedding worker
-    case GenServer.whereis({:via, :global, "embedding_worker_1"}) do
-      nil -> :ok
-      pid -> GenServer.stop(pid, :shutdown, 5_000)
-    end
-    
-    # Stop summarization worker
-    case GenServer.whereis({:via, :global, "summarization_worker_1"}) do
-      nil -> :ok
-      pid -> GenServer.stop(pid, :shutdown, 5_000)
-    end
-  end
-
-  defp wait_for_jobs_completion(timeout) do
-    start_time = System.monotonic_time(:millisecond)
-    
-    loop_until(fn ->
-      {:ok, stats} = AgentDb.JobQueue.stats()
-      pending = Map.get(stats, :pending, 0) + Map.get(stats, :running, 0)
-      pending == 0
-    end, timeout, start_time)
-  end
-
-  defp loop_until(condition_fn, timeout, start_time) do
-    if condition_fn.() do
-      :ok
+  defp transport_specs(opts) do
+    if AgentDb.Runtime.transport().enabled?() do
+      AgentDb.Runtime.transport().child_specs(opts)
     else
-      elapsed = System.monotonic_time(:millisecond) - start_time
-      if elapsed >= timeout do
-        Logger.warn("Timeout waiting for jobs to complete")
-        :ok
-      else
-        :timer.sleep(100)
-        loop_until(condition_fn, timeout, start_time)
-      end
+      []
     end
   end
 
-  defp close_connections do
-    # The Writer and Reader GenServers will be stopped by the supervisor
-    # Their terminate callbacks will close the connections
-    :ok
+  # Work already claimed is allowed to finish, within a bound. The supervisor
+  # has already stopped the workers by the time this runs, so this waits for
+  # the queue to reach a steady state rather than for a process that is gone.
+  @drain_poll_ms 100
+
+  defp drain(grace_ms) do
+    wait_until_idle(System.monotonic_time(:millisecond) + grace_ms)
   end
 
+  defp wait_until_idle(deadline) do
+    if outstanding() > 0 and System.monotonic_time(:millisecond) < deadline do
+      :timer.sleep(@drain_poll_ms)
+      wait_until_idle(deadline)
+    else
+      :ok
+    end
+  end
+
+  defp outstanding do
+    case AgentDb.Runtime.storage().queue_stats() do
+      {:ok, stats} -> Map.get(stats, :pending, 0) + Map.get(stats, :running, 0)
+      {:error, _} -> 0
+    end
+  end
+
+  # Defaults for settings a deployment may have left out. Each is read from the
+  # environment first, so a container can be configured without a config file.
   defp put_default_config do
-    # Model cache directory
-    Application.put_env(:agent_db, :model_cache_dir,
-      System.get_env("AGENT_DB_MODEL_CACHE_DIR") ||
-        Path.join(File.cwd!(), "models"))
+    put_env(:model_cache_dir, System.get_env("AGENT_DB_MODEL_CACHE_DIR") || cwd("models"))
 
-    # Embedding model configuration
-    Application.put_env(:agent_db, :embedding_model,
-      System.get_env("AGENT_DB_EMBEDDING_MODEL") ||
-        "sentence-transformers/all-MiniLM-L6-v2")
+    put_env(
+      :embedding_model,
+      System.get_env("AGENT_DB_EMBEDDING_MODEL") || "sentence-transformers/all-MiniLM-L6-v2"
+    )
 
-    Application.put_env(:agent_db, :embedding_model_url,
+    put_env(
+      :embedding_model_url,
       System.get_env("AGENT_DB_EMBEDDING_MODEL_URL") ||
-        "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/model.safetensors")
+        "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/model.safetensors"
+    )
 
-    # LLM model configuration
-    Application.put_env(:agent_db, :llm_model,
-      System.get_env("AGENT_DB_LLM_MODEL") ||
-        "microsoft/Phi-3-mini-4k-instruct")
+    put_env(:llm_model, System.get_env("AGENT_DB_LLM_MODEL") || "Qwen/Qwen3-0.6B")
 
-    Application.put_env(:agent_db, :llm_model_url,
+    put_env(
+      :llm_model_url,
       System.get_env("AGENT_DB_LLM_MODEL_URL") ||
-        "https://huggingface.co/microsoft/Phi-3-mini-4k-instruct/resolve/main/model-q4_k_m.gguf")
+        "https://huggingface.co/tensorblock/Qwen_Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf"
+    )
 
-    # Write mode: async (default) or sync
-    async_writes =
-      case System.get_env("AGENT_DB_ASYNC_WRITES") do
-        nil -> true
-        value -> String.downcase(value) == "true"
-      end
-    Application.put_env(:agent_db, :async_writes, async_writes)
+    # The prompt format belongs to the model, and no model library returns its
+    # own, so it is configured to match whichever model is selected. Setting
+    # this to a different model's format is what stops a prompt being sent in a
+    # shape that model was never built for.
+    put_env(
+      :llm_chat_template,
+      System.get_env("AGENT_DB_LLM_CHAT_TEMPLATE") ||
+        "<|im_start|>user\n%{prompt}<|im_end|>\n<|im_start|>assistant\n"
+    )
 
-    # Job worker pool size
-    Application.put_env(:agent_db, :job_workers,
-      case System.get_env("AGENT_DB_JOB_WORKERS") do
-        nil -> System.schedulers_online()
-        value -> String.to_integer(value)
-      end)
+    # Descriptive only: reported in model status, never used to load anything.
+    put_env(:llm_model_params, System.get_env("AGENT_DB_LLM_MODEL_PARAMS") || "0.6B")
 
-    # EXLA backend: :cpu, :cuda, :rocm
-    Application.put_env(:agent_db, :exla_backend,
-      case System.get_env("AGENT_DB_EXLA_BACKEND") do
-        "cuda" -> :cuda
-        "rocm" -> :rocm
-        _ -> :cpu
-      end)
+    put_env(:async_writes, boolean_env("AGENT_DB_ASYNC_WRITES", true))
+    put_env(:job_workers, integer_env("AGENT_DB_JOB_WORKERS", System.schedulers_online()))
+    put_env(:exla_backend, backend_env())
 
-    # HTTP API configuration
-    http_enabled =
-      case System.get_env("AGENT_DB_HTTP_ENABLED") do
-        # Off by default under test. The suite restarts the application from
-        # many setup blocks, so a listener would be bound and released that many
-        # times over and could collide with a running development instance --
-        # and a failed bind takes the endpoint's start, and the suite, with it.
-        # The reachability test opts in explicitly.
-        nil -> Mix.env() != :test
-        value -> String.downcase(value) == "true"
-      end
+    # Off by default under test. The suite restarts the application from many
+    # setup blocks, so a listener would be bound and released that many times
+    # and could collide with a running development instance; a failed bind takes
+    # the endpoint's start, and the suite, with it.
+    put_env(:http_enabled, boolean_env("AGENT_DB_HTTP_ENABLED", Mix.env() != :test))
+    put_env(:http_auth, boolean_env("AGENT_DB_HTTP_AUTH", false))
+    put_env(:http_auth_tokens, tokens_env())
+  end
 
-    Application.put_env(:agent_db, :http_enabled, http_enabled)
+  defp put_env(key, value), do: Application.put_env(:agent_db, key, value)
 
-    # The port is not resolved here. It is read in config/runtime.exs, which is
-    # what builds the endpoint's `http:` and `url:` settings -- setting a
-    # :http_port app env that nothing reads would suggest the port is
-    # configurable here, and it is not.
+  defp cwd(name), do: Path.join(File.cwd!(), name)
 
-    http_auth =
-      case System.get_env("AGENT_DB_HTTP_AUTH") do
-        nil -> false
-        value -> String.downcase(value) == "true"
-      end
-    Application.put_env(:agent_db, :http_auth, http_auth)
+  defp boolean_env(name, default) do
+    case System.get_env(name) do
+      nil -> default
+      value -> String.downcase(value) == "true"
+    end
+  end
 
-    Application.put_env(:agent_db, :http_auth_tokens,
-      case System.get_env("AGENT_DB_HTTP_AUTH_TOKENS") do
-        nil -> []
-        "" -> []
-        tokens -> String.split(tokens, ",", trim: true)
-      end)
+  defp integer_env(name, default) do
+    case System.get_env(name) do
+      nil -> default
+      value -> String.to_integer(value)
+    end
+  end
+
+  defp tokens_env do
+    case System.get_env("AGENT_DB_HTTP_AUTH_TOKENS") do
+      nil -> []
+      "" -> []
+      tokens -> String.split(tokens, ",", trim: true)
+    end
+  end
+
+  defp backend_env do
+    case System.get_env("AGENT_DB_EXLA_BACKEND") do
+      "cuda" -> :cuda
+      "rocm" -> :rocm
+      _other -> :cpu
+    end
   end
 end

@@ -62,7 +62,7 @@ The store SHALL provide a hybrid search mode that combines keyword (BM25-like) a
 - **THEN** the fusion uses those weights
 
 ### Requirement: Embedding model management
-The store SHALL download and cache the configured embedding model on first startup if not present locally. Model loading SHALL be lazy (on first embedding request) or eager (at startup, configurable). The model SHALL run entirely locally using EXLA/Bumblebee with CPU or GPU backend. A configured backend SHALL be applied to the loaded model, so that the selection takes effect rather than being read and discarded. A download SHALL be written atomically: partial content SHALL NOT be left at the model's final path, and a file at that path SHALL be treated as complete only if the download finished. A download that fails or is interrupted SHALL leave no file that later requests treat as a usable cached model. Because loading is lazy, an embedding requested while the model is still loading SHALL be reported as loading and SHALL NOT be reported as a failure, and the caller SHALL be able to retry it. A request made while loading SHALL be given a bounded opportunity to complete before it is reported as loading. Loading SHALL NOT block the store from answering questions about its own state.
+The store SHALL download and cache the configured embedding model on first startup if not present locally. Model loading SHALL be lazy (on first embedding request) or eager (at startup, configurable). The model SHALL run entirely locally using EXLA/Bumblebee with CPU or GPU backend. A configured backend SHALL be applied to the loaded model, so that the selection takes effect rather than being read and discarded. A download SHALL be written atomically: partial content SHALL NOT be left at the model's final path, and a file at that path SHALL be treated as complete only if the download finished. A download that fails or is interrupted SHALL leave no file that later requests treat as a usable cached model. Because loading is lazy, an embedding requested while the model is still loading SHALL be reported as loading and SHALL NOT be reported as a failure, and the caller SHALL be able to retry it. A request made while loading SHALL be given a bounded opportunity to complete before it is reported as loading. Loading SHALL NOT block the store from answering questions about its own state. The embedding model SHALL reach a loaded state once its own load completes, including when another model is loading concurrently: beginning a load for one model SHALL NOT leave the embedding model reporting as loading indefinitely.
 
 #### Scenario: Model downloads on first use
 - **WHEN** system starts with no cached model and embedding is requested
@@ -99,6 +99,12 @@ The store SHALL download and cache the configured embedding model on first start
 - **WHEN** a model is being loaded
 - **THEN** a request for the store's model status is answered
 - **AND** it reports that the model is not yet loaded
+
+#### Scenario: The embedding model loads while another model is loading
+- **WHEN** an embedding is requested and a load for another model is already in progress
+- **THEN** the embedding model's own load proceeds independently
+- **AND** the embedding model reaches a loaded state rather than continuing to report as loading
+- **AND** a later embedding request proceeds to inference instead of reporting the model as still loading
 ### Requirement: Vector index persistence and recovery
 The sqlite-vec virtual table and HNSW index SHALL persist across restarts. After restart, vector search SHALL be immediately available without re-embedding all documents.
 

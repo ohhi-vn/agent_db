@@ -4,7 +4,7 @@ defmodule AgentDb.ML.ModelManagerLoadingTest do
   alias AgentDb.ML.{ExitingLoader, FakeLoader, ModelManager, RaisingLoader}
 
   @model_id "sentence-transformers/all-MiniLM-L6-v2"
-  @llm_id "microsoft/Phi-3-mini-4k-instruct"
+  @llm_id "Qwen/Qwen3-0.6B"
 
   setup do
     # ModelManager is a child of the application supervisor. Swap that one child
@@ -27,7 +27,7 @@ defmodule AgentDb.ML.ModelManagerLoadingTest do
       Application.delete_env(:agent_db, :llm_model)
       Application.delete_env(:agent_db, :model_load_grace_ms)
       File.rm_rf(cache)
-      Supervisor.restart_child(AgentDb.Supervisor, ModelManager)
+      AgentDb.StorageContract.Helpers.restore_child(ModelManager)
     end)
 
     %{cache: cache}

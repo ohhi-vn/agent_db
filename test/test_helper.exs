@@ -19,8 +19,11 @@ case File.ls(System.tmp_dir!()) do
     :ok
 end
 
-# Shared model-loading fakes. Required rather than compiled via elixirc_paths so
-# they are available to a single-file `mix test path` run as well as the suite.
+# Shared model-loading fakes and the storage contract suite. Required rather
+# than compiled via elixirc_paths so they are available to a single-file
+# `mix test path` run as well as the suite.
 Code.require_file("support/ml_fakes.ex", __DIR__)
+Code.require_file("support/provider_fakes.ex", __DIR__)
+Code.require_file("support/storage_contract.ex", __DIR__)
 
 ExUnit.start()

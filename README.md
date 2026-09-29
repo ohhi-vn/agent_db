@@ -13,6 +13,7 @@
 - **Async writes** — Immediate acknowledgement, background embedding/summarization jobs
 - **Sessions** — Append-only message lists with commit-to-context-tree
 - **Memory** — Typed, durable facts under `viking://user/memories/` with confidence, provenance, and supersession; recall and forgetting without a model
+- **Agent Skills** — Import a skill folder or tar archive into `viking://user/{id}/skills/`, from the console or a Mix task, replacing a same-named skill as a whole
 - **WebSocket API** — Phoenix Channel at `/api` with `v1.*` events, optional Bearer auth
 - **Fully local** — No external dependencies at runtime (models cached locally)
 
@@ -174,6 +175,110 @@ usable through keyword `search/2` scoped to the memories root.
 Memories are ordinary documents: `read/1`, `list/1`, `tree/2` and
 `search/2` reach them with no memory-specific path.
 
+## Agent Skills
+
+An [Agent Skill](https://code.claude.com/docs/en/skills) is a folder with a
+`SKILL.md` at its root and whatever supporting files it needs. Importing one
+stores it below `viking://user/{user_id}/skills/{skill_name}`, with every file at
+the path it had inside the skill, so an imported skill is an ordinary subtree:
+
+```elixir
+my-skills/code-review/
+├── SKILL.md
+├── references/
+│   └── checklist.md
+└── scripts/
+    └── check.py
+```
+
+```elixir
+{:ok, content} = AgentDb.read("viking://user/alice/skills/code-review/references/checklist.md")
+```
+
+The same import is available from the operations console at `/admin` and from
+the command line, and both go through one workflow: what a bundle may look like,
+what is refused, and where a skill lands are decided once
+(`AgentDb.Skills.Source` and `AgentDb.Application.Skills`).
+
+### What a source may look like
+
+A source is a **folder**, a **tar archive**, or a **gzip-compressed tar
+archive**, and it holds either:
+
+- **one skill** — a folder with a `SKILL.md` at its own root, named after the
+  folder, or
+- **a collection** — a folder of immediate skill folders, each with a
+  `SKILL.md`.
+
+An archive may add **one common wrapper directory** above them, which is what
+`tar -czf skills.tar.gz my-skills/` produces; it is recognised automatically.
+
+A skill's files are stored verbatim, including `SKILL.md` itself: its frontmatter
+is not parsed, so a skill is preserved exactly as its author wrote it. Files are
+read as text, so a file that is not valid UTF-8 is refused rather than mangled.
+
+### From the console
+
+Open `/admin`, fill in the **User ID**, then either
+
+- choose a **Skills folder** — the browser is asked for a whole directory, and
+  every file inside it is uploaded with the path it had there, or
+- choose a **Skills archive** — one `.tar`, `.tgz` or `.tar.gz` file, recognised
+  by its contents rather than its name.
+
+Press **Import skills**. The console reports what happened to every skill
+(`imported`, `replaced`, or the reason it failed) and writes nothing at all when
+the source is refused, so a bundle that is refused whole leaves the store as it
+was.
+
+### From the command line
+
+```bash
+mix agent_db.import_skills ./my-skills --user alice
+mix agent_db.import_skills ./skills.tar.gz --user alice
+```
+
+The task starts the application, imports through the same workflow, prints one
+line per skill, and exits with a failure if the source was refused or any skill
+failed. `mix help agent_db.import_skills` prints the same rules it follows.
+
+### Replacement
+
+A skill whose name is already stored for that user is **replaced whole**: the
+stored subtree and the work queued for it are removed, and the source's files are
+written in their place. A file the new source does not have does not survive the
+replacement, and nothing outside that one skill's subtree is touched.
+
+The replacement of each skill is one atomic step, so a failure leaves the stored
+skill exactly as it was; a multi-skill import then reports the skills that landed
+and the one that did not, rather than losing the rest to it.
+
+### Limits
+
+One import accepts, and the console's upload is configured to match:
+
+| Limit | Value |
+|-------|-------|
+| Files and entries in one source | 500 |
+| Bytes, compressed input and once expanded | 5,000,000 |
+A source that exceeds either is refused before anything is written, and the
+error names the limit. Archive members are read in memory and are never
+extracted to the filesystem, so a compressed archive cannot expand past the byte
+limit.
+
+### What a source is refused for
+
+A reason is always given, and a refused source is never partly written:
+
+- an unsafe path — absolute, containing `..`, a backslash, an empty segment or a
+  control character
+- a symbolic or hard link, or an entry in an archive that is not a regular file
+  or a directory
+- the same path twice, or one path stored both as a file and as a directory
+- a skill directory with no `SKILL.md`
+- a file that is not valid UTF-8 text
+- a file count or byte count over the limits above
+
 ## Configuration
 
 All configuration via `Application.put_env/3` or `config/runtime.exs`:
@@ -249,9 +354,10 @@ The listener is live, and turning it on has made pre-existing breakage in the we
 layer visible for the first time — these routes have never been exercised, because
 until now nothing was listening:
 
-- **`/admin` returns an error.** `AgentDbWeb.AdminLive` has no `render/1` clause,
-  so it cannot render. The operations console is the subject of a separate
-  change. If you can reach `/admin` and see an error, that is why.
+- **`/admin` needs a long enough `secret_key_base`.** The browser pipeline uses
+  a cookie session store, which refuses a secret under 64 bytes with a 500 before
+  a route is reached. `config/config.exs` sets one of that length for
+  development; a deployment that sets its own must be at least as long.
 - **`POST /api/v1/search` returns 500.** The controller passes the search mode as
   a string, `AgentDb.search/2` matches on atoms, and the resulting
   `{:invalid_mode, _}` error is then rendered through `Jason`, which cannot

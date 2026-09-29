@@ -24,7 +24,7 @@ defmodule AgentDb.ML.DownloadTest do
       Application.delete_env(:agent_db, :embedding_model_url)
       Application.delete_env(:agent_db, :model_load_grace_ms)
       File.rm_rf(cache)
-      Supervisor.restart_child(AgentDb.Supervisor, ModelManager)
+      AgentDb.StorageContract.Helpers.restore_child(ModelManager)
     end)
 
     %{cache: cache}
@@ -41,6 +41,7 @@ defmodule AgentDb.ML.DownloadTest do
     Application.put_env(:agent_db, :embedding_model_url, url)
     :ok = AgentDb.ML.FakeCallLog.start()
     start_supervised!({ModelManager, []})
+
     :sys.replace_state(ModelManager, fn state ->
       config = Map.merge(state.config, %{loader: AgentDb.ML.FakeLoader, embedding_model_url: url})
       %{state | config: config}
@@ -51,7 +52,12 @@ defmodule AgentDb.ML.DownloadTest do
 
   defp set_url(url) do
     Application.put_env(:agent_db, :embedding_model_url, url)
-    :sys.replace_state(ModelManager, &%{&1 | config: Map.put(&1.config, :embedding_model_url, url)})
+
+    :sys.replace_state(
+      ModelManager,
+      &%{&1 | config: Map.put(&1.config, :embedding_model_url, url)}
+    )
+
     :ok
   end
 

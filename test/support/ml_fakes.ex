@@ -17,8 +17,28 @@ defmodule AgentDb.ML.FakeServing do
   end
 
   defmodule Generation do
-    def tokenize(_tokenizer, prompt), do: {:ok, [prompt]}
-    def generate(_model, _inputs, _opts), do: {:ok, [%{text: "generated summary"}]}
+    # The text the fake model "generates". Configurable because the summary
+    # tests need to drive reasoning-then-answer, reasoning-only, and plain
+    # output through the same serving. Defaults to the fixed string the
+    # earlier tests assert on, so they are unaffected.
+    @generated_text_key :fake_generated_text
+
+    def put_generated_text(text), do: Application.put_env(:agent_db, @generated_text_key, text)
+
+    def clear_generated_text, do: Application.delete_env(:agent_db, @generated_text_key)
+
+    def generated_text,
+      do: Application.get_env(:agent_db, @generated_text_key, "generated summary")
+
+    # The prompt is recorded here because this is where the formatted prompt
+    # arrives, letting a test assert on the chat format the store built rather
+    # than on a string it constructed itself.
+    def tokenize(_tokenizer, prompt) do
+      AgentDb.ML.FakeCallLog.record(:prompt, prompt, [])
+      {:ok, [prompt]}
+    end
+
+    def generate(_model, _inputs, _opts), do: {:ok, [%{text: generated_text()}]}
   end
 
   def for_role(:embedding), do: Embedding

@@ -1,7 +1,7 @@
 defmodule AgentDb.ML.ModelManager do
   @moduledoc """
   Manages embedding and LLM models for vector search and summarization.
-  
+
   Handles model download, caching, lazy loading, and inference.
   """
 
@@ -28,7 +28,8 @@ defmodule AgentDb.ML.ModelManager do
           tokenizer: Bumblebee.Tokenizer.t(),
           model: Bumblebee.Model.t(),
           config: map(),
-          serving: module()
+          serving: module(),
+          chat_template: String.t()
         }
 
   @type state :: %State{
@@ -140,6 +141,9 @@ defmodule AgentDb.ML.ModelManager do
       llm_model: Config.llm_model(),
       llm_model_url: Config.llm_model_url(),
       exla_backend: Config.exla_backend(),
+      # Read at load time into model_ref, alongside the tokenizer and serving.
+      llm_chat_template: Config.llm_chat_template(),
+      llm_model_params: Config.llm_model_params(),
       # The only route to the model-loading library, so the load path can be
       # exercised without real weights. See AgentDb.ML.BumblebeeLoader.
       loader: AgentDb.ML.BumblebeeLoader
@@ -196,8 +200,11 @@ defmodule AgentDb.ML.ModelManager do
   def handle_cast({:load_result, ref, role, result}, state) do
     # A load runs outside this process and casts its result back by name, so a
     # result can outlive the manager that started it -- after a restart, or
-    # when a new load has already begun. Only the in-flight load may write.
-    if state.loading_ref == ref do
+    # when a new load has already begun. Only the in-flight load for THIS role
+    # may write: state.loading_ref[role] is nil for a role that is not loading,
+    # and for every role in a manager that has just started, so a leftover
+    # result matches nothing and is dropped.
+    if state.loading_ref[role] == ref do
       {:noreply, apply_load_result(role, result, state)}
     else
       {:noreply, state}
@@ -281,9 +288,16 @@ defmodule AgentDb.ML.ModelManager do
     # make_ref/0, not a counter: a counter restarts at zero in each new
     # manager, so a load left over from a previous instance could present the
     # same reference as the current in-flight load and be accepted.
+    #
+    # Recorded under its own role. The two models load independently, so a
+    # single shared reference would mean whichever load started second
+    # invalidated the first, and that role would then report as loading
+    # forever.
     ref = make_ref()
     spawn_load(state.config, role, ref)
-    {:error, :loading, %{state | loading_ref: ref} |> put_load_status(role, :loading)}
+
+    loading_ref = Map.put(state.loading_ref, role, ref)
+    {:error, :loading, %{state | loading_ref: loading_ref} |> put_load_status(role, :loading)}
   end
 
   defp spawn_load(config, role, ref) do
@@ -331,7 +345,17 @@ defmodule AgentDb.ML.ModelManager do
     with {:ok, tokenizer} <- loader.load_tokenizer({:hf, model_id}),
          {:ok, %{model: model, spec: spec}} <-
            loader.load_model({:hf, model_id}, backend: config.exla_backend) do
-      {:ok, %{tokenizer: tokenizer, model: model, spec: spec, serving: loader.serving(role)}}
+      {:ok,
+       %{
+         tokenizer: tokenizer,
+         model: model,
+         spec: spec,
+         serving: loader.serving(role),
+         # Snapshotted with the rest of the model, for the same reason: the
+         # prompt format belongs to the model, and Bumblebee has no API that
+         # returns it. A test overrides it the way it overrides the loader.
+         chat_template: config.llm_chat_template
+       }}
     else
       {:error, reason} ->
         Logger.error("Failed to load #{inspect(role)} model: #{inspect(reason)}")
@@ -435,14 +459,18 @@ defmodule AgentDb.ML.ModelManager do
     {:ok, inputs} = serving.tokenize(tokenizer, texts)
 
     # Generate embeddings
-    {:ok, outputs} = serving.generate(model, inputs, fn embedding -> Nx.to_flat_list(Nx.mean(embedding, axes: [1])) end)
+    {:ok, outputs} =
+      serving.generate(model, inputs, fn embedding ->
+        Nx.to_flat_list(Nx.mean(embedding, axes: [1]))
+      end)
 
-    embeddings = Enum.map(outputs, fn output ->
-      # Convert to tensor and normalize
-      tensor = Nx.tensor(output.embedding)
-      norm = Nx.sqrt(Nx.sum(Nx.pow(tensor, 2)))
-      Nx.divide(tensor, norm)
-    end)
+    embeddings =
+      Enum.map(outputs, fn output ->
+        # Convert to tensor and normalize
+        tensor = Nx.tensor(output.embedding)
+        norm = Nx.sqrt(Nx.sum(Nx.pow(tensor, 2)))
+        Nx.divide(tensor, norm)
+      end)
 
     {:ok, embeddings}
   end
@@ -455,30 +483,73 @@ defmodule AgentDb.ML.ModelManager do
     max_tokens = Keyword.get(opts, :max_tokens, 256)
     temperature = Keyword.get(opts, :temperature, 0.7)
 
-    # Format prompt for Phi-3-mini chat template
-    formatted_prompt = format_prompt(prompt)
+    # Format the prompt with the configured chat format for this model.
+    formatted_prompt = format_prompt(prompt, model_ref.chat_template)
 
     {:ok, inputs} = serving.tokenize(tokenizer, formatted_prompt)
 
-    {:ok, outputs} = serving.generate(model, inputs, %{
-      max_tokens: max_tokens,
-      temperature: temperature,
-      top_p: 0.9,
-      return_probabilities: false
-    })
+    {:ok, outputs} =
+      serving.generate(model, inputs, %{
+        max_tokens: max_tokens,
+        temperature: temperature,
+        top_p: 0.9,
+        return_probabilities: false
+      })
 
     # Extract generated text
-    generated = outputs
-    |> List.first()
-    |> Map.get(:text, "")
-    |> String.trim()
+    generated =
+      outputs
+      |> List.first()
+      |> Map.get(:text, "")
+      |> strip_reasoning()
 
-    {:ok, generated}
+    # An empty result is returned as an error, not as "". That distinction
+    # matters downstream: "" is truthy, so the worker would store it and
+    # node.abstract || first_line(content) would resolve to "" forever,
+    # silently disabling the fallback that keeps a document readable when the
+    # model does not work. run_inference/3 passes this error tuple through.
+    generated
   end
 
-  defp format_prompt(prompt) do
-    # Phi-3-mini chat format
-    "<|user|>\n#{prompt}<|end|>\n<|assistant|>"
+  # A hybrid reasoning model emits its intermediate reasoning before the
+  # answer. The segment from the opening marker through the closing marker is
+  # removed; anything after it is the answer. Text with no marker is returned
+  # unchanged apart from trimming, so a model that does not reason is
+  # unaffected.
+  defp strip_reasoning(text) do
+    text
+    |> remove_reasoning_segment()
+    |> case do
+      "" -> {:error, {:empty_summary, :no_answer}}
+      summary -> {:ok, summary}
+    end
+  end
+
+  # An unterminated block yields no answer at all. That is the
+  # budget-exhausted case -- the model reasoned and never got past it -- and
+  # the reasoning is not something to store as a summary, so the whole
+  # remainder is dropped and the caller sees an empty result.
+  defp remove_reasoning_segment(text) do
+    case String.split(text, "<think>", parts: 2) do
+      [_only_answer] -> text
+      [_reasoning, rest] -> after_think_block(rest)
+    end
+    |> String.trim()
+  end
+
+  defp after_think_block(rest) do
+    case String.split(rest, "</think>", parts: 2) do
+      [_unterminated] -> ""
+      [_reasoning, answer] -> answer
+    end
+  end
+
+  # The format comes from configuration rather than a literal here, because the
+  # prompt format belongs to the model: a hardcoded one silently sends a prompt
+  # in a format the configured model was never trained on, and nothing in the
+  # type, the tests, or the config would connect the two to catch it.
+  defp format_prompt(prompt, chat_template) do
+    String.replace(chat_template, "%{prompt}", prompt)
   end
 
   defp build_model_status(%State{embedding_model: embedding_model, llm_model: llm_model} = state) do
@@ -493,10 +564,14 @@ defmodule AgentDb.ML.ModelManager do
         loaded: llm_model != nil,
         state: state.loading |> Map.get(:llm, :idle) |> load_state_name(),
         model: state.config.llm_model,
-        params: "3.8B"
+        # Configured rather than literal: a hand-written size here describes a
+        # model the store may not be running, and the http-api spec assertion
+        # had to change every time the model did.
+        params: state.config.llm_model_params
       },
       queue: %{
-        pending: 0  # Will be populated by JobQueue
+        # Will be populated by JobQueue
+        pending: 0
       }
     }
   end

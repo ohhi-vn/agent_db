@@ -1,10 +1,10 @@
 defmodule AgentDbTest do
   use ExUnit.Case, async: false
 
-  alias AgentDb.Cache.Owner
+  alias AgentDb.Cache
 
   setup do
-    Owner.clear()
+    Cache.clear()
     Application.put_env(:agent_db, :data_dir, AgentDb.Config.test_data_dir())
     restart_app()
 
@@ -122,6 +122,7 @@ defmodule AgentDbTest do
     # exists when the sqlite-vec extension loaded.
     assert {:ok, [0]} = count_rows("nodes", "uri", "viking://resources/sub")
     assert {:ok, [0]} = count_rows("job_queue", :payload_uri, "viking://resources/sub")
+
     assert {:ok, [0]} =
              count_rows("commit_meta", "destination_uri", "viking://resources/sub")
 
@@ -491,10 +492,9 @@ defmodule AgentDbTest do
   end
 
   # Drives the outcome of the jobs a sync write enqueues, which the write itself
-  # blocks on.
-  # Drives the outcome of the jobs a sync write enqueues. It must keep acting
-  # across rounds: the application's own workers can claim a job first and defer
-  # it back to pending, so a single pass over the queue is not enough.
+  # blocks on. It must keep acting across rounds: the application's own workers
+  # claim jobs and defer them back to pending, so a single pass over the queue
+  # is not enough.
   defp settle_jobs_for(uri, action, timeout_ms) do
     deadline = System.monotonic_time(:millisecond) + timeout_ms
     do_settle_jobs_for(uri, action, deadline, 0, 0)
@@ -523,6 +523,9 @@ defmodule AgentDbTest do
     end
   end
 
+  # Both pending and running jobs are looked for. A job a worker is midway
+  # through is already spent, and acting on it would race the worker to decide
+  # its outcome.
   defp job_ids_for(uri) do
     AgentDb.Store.Reader.read(fn conn ->
       case AgentDb.Store.SQLite.query(
@@ -546,22 +549,25 @@ defmodule AgentDbTest do
     settle_jobs_for(
       uri,
       fn job_id ->
-        AgentDb.Store.Writer.call(fn conn ->
-          AgentDb.Store.SQLite.exec_write(
-            conn,
-            "UPDATE job_queue SET max_attempts = 0 WHERE id = ?1",
-            [job_id]
-          )
-        end)
-
-        AgentDb.JobQueue.fail(job_id, :boom)
+        cap_attempts(job_id, 0)
+        AgentDb.Adapters.SQLite.fail_job(job_id)
       end,
       timeout_ms
     )
   end
 
   defp complete_all_jobs_for(uri, timeout_ms) do
-    settle_jobs_for(uri, &AgentDb.JobQueue.complete/1, timeout_ms)
+    settle_jobs_for(uri, &AgentDb.Adapters.SQLite.complete_job/1, timeout_ms)
+  end
+
+  defp cap_attempts(job_id, max_attempts) do
+    AgentDb.Store.Writer.call(fn conn ->
+      AgentDb.Store.SQLite.exec_write(
+        conn,
+        "UPDATE job_queue SET max_attempts = ?1 WHERE id = ?2",
+        [max_attempts, job_id]
+      )
+    end)
   end
 
   # -- unservable operations --
@@ -698,7 +704,7 @@ defmodule AgentDbTest do
     assert String.contains?(cached_read, "second")
 
     # ...and it matches what a cold cache produces from SQLite.
-    Owner.clear()
+    Cache.clear()
     assert {:ok, cold_read} = AgentDb.read(dest)
     assert cold_read == cached_read
   end
@@ -730,7 +736,9 @@ defmodule AgentDbTest do
     :ok =
       AgentDb.write(
         "viking://resources/project/src/main.ex",
-        "defmodule Main do\n  def run, do: :ok", abstract: "Entry point")
+        "defmodule Main do\n  def run, do: :ok",
+        abstract: "Entry point"
+      )
 
     :ok =
       AgentDb.write("viking://user/alice/memories/pref.md", "Prefers dark mode",

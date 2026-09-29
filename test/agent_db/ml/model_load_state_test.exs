@@ -3,10 +3,17 @@ defmodule AgentDb.ML.ModelLoadStateTest do
 
   alias AgentDb.ML.{FakeCallLog, FakeLoader, ModelManager, RaisingLoader, SlowLoader}
 
-  @llm_id "microsoft/Phi-3-mini-4k-instruct"
+  @llm_id "Qwen/Qwen3-0.6B"
 
   setup do
     :ok = Supervisor.terminate_child(AgentDb.Supervisor, ModelManager)
+
+    # The workers claim jobs and ask whatever manager is registered for a
+    # model. While this test deliberately leaves a manager unconfigured, a
+    # worker asking it would start a load the test never asked for, against a
+    # model id that does not exist.
+    :ok = AgentDb.StorageContract.Helpers.stop_workers()
+
     cache = Path.join(System.tmp_dir!(), "agent_db_ls_#{:erlang.unique_integer([:positive])}")
 
     # A distinct model id per test. The call log is shared and a load from an
@@ -30,7 +37,11 @@ defmodule AgentDb.ML.ModelLoadStateTest do
       end
 
       File.rm_rf(cache)
-      Supervisor.restart_child(AgentDb.Supervisor, ModelManager)
+      AgentDb.StorageContract.Helpers.restore_child(ModelManager)
+
+      for worker <- [AgentDb.Workers.Embedding, AgentDb.Workers.Summarization] do
+        AgentDb.StorageContract.Helpers.restore_child(worker)
+      end
     end)
 
     %{cache: cache, model_id: model_id}
@@ -158,7 +169,10 @@ defmodule AgentDb.ML.ModelLoadStateTest do
       assert [_] = load_calls(model_id)
     end
 
-    test "a short grace reports loading where a long one would not", %{cache: cache, model_id: model_id} do
+    test "a short grace reports loading where a long one would not", %{
+      cache: cache,
+      model_id: model_id
+    } do
       :ok = cache_model(cache, model_id)
       # A loader slow enough that no reasonable grace covers it.
       start_manager(SlowLoader)
@@ -193,6 +207,62 @@ defmodule AgentDb.ML.ModelLoadStateTest do
 
       assert :ready = await_settled(:embedding)
       assert [_] = load_calls(model_id)
+    end
+
+    test "both roles reach ready when they load at the same time", %{
+      cache: cache,
+      model_id: model_id
+    } do
+      # Both roles need cached weights, or one load short-circuits and the two
+      # loads never overlap -- which is the only state this test is about.
+      :ok = cache_model(cache, model_id)
+      :ok = cache_model(cache, @llm_id)
+      start_manager(SlowLoader)
+      set_grace(0)
+
+      # Grace of 0 returns before either load can settle, so the second call
+      # arrives while the first is still in flight. SlowLoader keeps both in
+      # flight long enough for that to hold.
+      assert {:error, :model_loading} = ModelManager.embed(["a"])
+      assert {:error, :model_loading} = ModelManager.summarize("b")
+
+      # Neither role may be left reporting as loading: a load for one must not
+      # discard the result of the other.
+      assert :ready = await_settled(:embedding)
+      assert :ready = await_settled(:llm)
+
+      set_grace(5_000)
+      assert {:ok, [_]} = ModelManager.embed(["a"])
+      assert {:ok, "generated summary"} = ModelManager.summarize("b")
+    end
+  end
+
+  describe "a load that outlives the manager that started it" do
+    test "its result is not adopted by the manager that replaced it", %{
+      cache: cache,
+      model_id: model_id
+    } do
+      :ok = cache_model(cache, model_id)
+      start_manager(SlowLoader)
+      set_grace(0)
+
+      # Starts a load, then the manager goes away while it is still running.
+      assert {:error, :model_loading} = ModelManager.embed(["a"])
+
+      stop_supervised!(ModelManager)
+      start_supervised!({ModelManager, id: :replacement})
+
+      # SlowLoader needs ~3s (tokenizer then model) before the abandoned load
+      # casts its result. Wait past that, so the result is guaranteed to have
+      # been delivered to the manager that replaced it -- otherwise this would
+      # pass on a fresh manager's idle state without the guard ever running.
+      Process.sleep(4_000)
+
+      # A fresh manager has started no load, so it records no reference for
+      # this role. The late result matches nothing and must be discarded
+      # rather than written into a state that never loaded anything.
+      assert :idle = status(:embedding)
+      assert %{embedding: %{loaded: false}} = ModelManager.model_status()
     end
   end
 

@@ -39,7 +39,7 @@ The store SHALL generate a structured overview (L1) for every document using a l
 - **AND** no LLM call is made for overview generation
 
 ### Requirement: LLM model management
-The store SHALL download and cache the configured summarization LLM (e.g., Phi-3-mini-4k-instruct) on first use. The model SHALL run entirely locally via Bumblebee/EXLA. Model loading SHALL be lazy or eager (configurable). Inference SHALL use appropriate quantization (e.g., q4) for memory efficiency. A configured backend SHALL be applied to the loaded model. A cached model SHALL load successfully and be retained for reuse. A download SHALL be written atomically, and a failed or interrupted download SHALL leave no file that later requests treat as a usable cached model. Because loading is lazy, a summary requested while the model is still loading SHALL be reported as loading and SHALL NOT be reported as a failure, and the caller SHALL be able to retry it. A request made while loading SHALL be given a bounded opportunity to complete before it is reported as loading, so that a request against an already-cached model does not have to be retried.
+The store SHALL download and cache the configured summarization LLM (e.g., Qwen3-0.6B) on first use. The model SHALL run entirely locally via Bumblebee/EXLA. Model loading SHALL be lazy or eager (configurable). Inference SHALL use appropriate quantization (e.g., q4) for memory efficiency. A configured backend SHALL be applied to the loaded model. A cached model SHALL load successfully and be retained for reuse. A download SHALL be written atomically, and a failed or interrupted download SHALL leave no file that later requests treat as a usable cached model. Because loading is lazy, a summary requested while the model is still loading SHALL be reported as loading and SHALL NOT be reported as a failure, and the caller SHALL be able to retry it. A request made while loading SHALL be given a bounded opportunity to complete before it is reported as loading, so that a request against an already-cached model does not have to be retried. The summarization model SHALL reach a loaded state once its own load completes, including when another model is loading concurrently: beginning a load for one model SHALL NOT leave the summarization model reporting as loading indefinitely. The format in which prompts are presented to the model SHALL be determined by configuration rather than fixed to one model architecture, so that configuring a different summarization model does not result in prompts being sent in a format that model was not built for. Generated summaries SHALL NOT contain the model's intermediate reasoning. A generation that yields no summary text once reasoning is removed SHALL be reported as an error and SHALL NOT be stored as an empty summary.
 
 #### Scenario: Summarization model downloads on first use
 - **WHEN** system starts with no cached LLM and summarization is needed
@@ -75,6 +75,28 @@ The store SHALL download and cache the configured summarization LLM (e.g., Phi-3
 - **WHEN** a summary is requested, the weights are already cached, and the load completes within the configured wait
 - **THEN** the original request produces a summary
 - **AND** the caller is not told to retry
+
+#### Scenario: The summarization model loads while another model is loading
+- **WHEN** a summary is requested and a load for another model is already in progress
+- **THEN** the summarization model's own load proceeds independently
+- **AND** the summarization model reaches a loaded state rather than continuing to report as loading
+- **AND** a later summary request proceeds to inference instead of reporting the model as still loading
+
+#### Scenario: The prompt format comes from configuration
+- **WHEN** a summarization request is issued
+- **THEN** the prompt is presented in the configured chat format
+- **AND** the format used is not fixed to the architecture of any particular model
+
+#### Scenario: A generated summary excludes the model's reasoning
+- **WHEN** the model emits intermediate reasoning before its answer
+- **THEN** the returned summary contains only the answer
+- **AND** the stored abstract or overview does not contain the reasoning
+
+#### Scenario: A generation with no answer after reasoning is reported as an error
+- **WHEN** a generation produces reasoning but no summary text
+- **THEN** the request reports an error rather than returning an empty summary
+- **AND** no empty value is written to the document
+
 ### Requirement: Summarization idempotency and retry
 If a summarization job fails (model error, timeout, OOM), it SHALL be retried with exponential backoff. Re-processing the same document content SHALL produce deterministic output (same prompt, same model, same parameters = same result). Failed jobs SHALL not block other summarization work. The retry budget SHALL be reserved for failures that can succeed on retry: a job deferred because its model is still loading SHALL NOT consume an attempt, and SHALL be rescheduled rather than counted toward exhaustion.
 

@@ -9,8 +9,9 @@ defmodule AgentDb.ML.ModelManagerTest do
     # Just verify it's running
     pid = GenServer.whereis(ModelManager)
     assert pid != nil
-    
+
     on_exit(fn ->
+      nil
       # Don't stop the shared ModelManager
     end)
 

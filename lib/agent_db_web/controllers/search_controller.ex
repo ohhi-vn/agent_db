@@ -1,36 +1,35 @@
 defmodule AgentDbWeb.Controllers.SearchController do
+  @moduledoc """
+  Search over HTTP.
+
+  A search the store cannot serve -- an unknown mode, a model that is not
+  available -- is a 422 carrying the reason, not a failure of the request
+  itself.
+  """
   use AgentDbWeb, :controller
+
   alias AgentDbWeb.Context
 
   def search(conn, params) do
     term = params["term"]
-    opts = %{
-      "mode" => params["mode"] || "keyword",
-      "top_k" => params["top_k"] || "10"
-    }
 
-    with {:ok, results} <- Context.search_documents(term, opts) do
-      json(conn, %{results: results})
-    else
-      {:error, reason} ->
-        conn
-        |> put_status(422)
-        |> json(%{error: reason})
+    case Context.search_documents(term, %{"mode" => params["mode"], "top_k" => params["top_k"]}) do
+      {:ok, results} -> json(conn, %{results: results})
+      {:error, reason} -> conn |> put_status(422) |> json(%{error: describe(reason)})
     end
   end
 
   def suggest(conn, params) do
-    term = params["term"]
-    
-    # Simple prefix-based suggestions from document list
-    with {:ok, %{data: docs}} <- Context.list_documents(%{"prefix" => term, "per_page" => 10}) do
-      suggestions = Enum.map(docs, & &1)
-      json(conn, %{suggestions: suggestions})
-    else
-      {:error, reason} ->
-        conn
-        |> put_status(500)
-        |> json(%{error: reason})
+    # Suggestions are the names already under a prefix, so this is a listing
+    # rather than a search: what the caller wants to complete is a name, not a
+    # document matched by content.
+    case Context.list_documents(%{"prefix" => params["term"] || "", "per_page" => 10}) do
+      {:ok, %{data: names}} -> json(conn, %{suggestions: names})
+      {:error, _reason} -> conn |> put_status(500) |> json(%{error: "internal_server_error"})
     end
   end
+
+  defp describe(reason) when is_atom(reason) or is_binary(reason), do: reason
+  defp describe({tag, _detail}) when is_atom(tag), do: tag
+  defp describe(reason), do: inspect(reason)
 end

@@ -1,75 +1,41 @@
 defmodule AgentDb.JobQueueTest do
+  @moduledoc """
+  The durable queue's own behaviour: claim, retry, defer, recover, cancel.
+
+  The queue is reached through the storage port rather than its SQL, so what
+  these assert is the behaviour a caller can rely on, not a table layout. The
+  cross-store guarantees that depend on the queue -- removal cancelling work, a
+  removed node not regaining a result -- live in the storage contract.
+  """
   use ExUnit.Case, async: false
 
-  alias AgentDb.JobQueue
+  alias AgentDb.StorageContract.Helpers
   alias AgentDb.Store.SQLite
-  alias AgentDb.Config
-
-  # Generate unique URI per test run to avoid conflicts
-  defp unique_uri(base) do
-    "viking://test/#{base}/#{:erlang.unique_integer([:positive])}"
-  end
-
-  # Read the queue through the writer's connection. Opening a second
-  # connection works but hides the bug this file used to have: it inspected
-  # Config.data_dir(), which is not necessarily the file the app is running
-  # against, so rows written by JobQueue were invisible to these assertions.
-  defp query_job_queue(sql, args) do
-    AgentDb.Store.Reader.read(fn conn -> SQLite.query_one(conn, sql, args) end)
-  end
-
-  defp cancel_for_uri(uri) do
-    AgentDb.Store.Writer.call(fn conn -> JobQueue.cancel_for_uri(conn, uri) end)
-  end
-
-  defp remaining_job_uris do
-    {:ok, set} =
-      AgentDb.Store.Reader.read(fn conn ->
-        SQLite.query(conn, "SELECT json_extract(payload, '$.uri') FROM job_queue")
-      end)
-
-    MapSet.new(set, &hd/1)
-  end
-
-  defp update_job_queue(sql, args) do
-    AgentDb.Store.Writer.call(fn conn -> SQLite.exec_write(conn, sql, args) end)
-  end
-
-  # Clean job queue through the writer connection, and reset auto-increment.
-  defp clean_job_queue do
-    update_job_queue("DELETE FROM job_queue", [])
-    update_job_queue("DELETE FROM sqlite_sequence WHERE name = 'job_queue'", [])
-  end
 
   setup do
-    # The queue lives in the running app's database, so point the app at a
-    # private directory and restart it. Without this the app keeps whatever
-    # data_dir a previously-run test file left behind, and this file's direct
-    # SQL assertions read a different file than the one JobQueue writes to.
-    Application.put_env(:agent_db, :data_dir, Config.test_data_dir())
-    restart_app()
-    clean_job_queue()
+    # The queue lives in the running app's database, so the app needs a private
+    # directory: otherwise it keeps whatever a previously-run test file left
+    # behind and these assertions read a different file than the one being
+    # written to.
+    Application.put_env(:agent_db, :data_dir, AgentDb.Config.test_data_dir())
+    :ok = Helpers.restart_app()
+    :ok = Helpers.stop_workers()
 
-    on_exit(fn ->
-      Application.delete_env(:agent_db, :data_dir)
-    end)
+    on_exit(fn -> Application.delete_env(:agent_db, :data_dir) end)
 
     :ok
   end
 
-  defp restart_app do
-    :ok = Application.stop(:agent_db)
-    {:ok, _} = Application.ensure_all_started(:agent_db)
-    :ok
-  end
+  defp storage, do: AgentDb.Adapters.SQLite
 
-  describe "enqueue/2 and dequeue/1" do
-    test "enqueues and dequeues a job" do
+  defp unique_uri(base), do: "viking://test/#{base}/#{:erlang.unique_integer([:positive])}"
+
+  describe "claiming" do
+    test "a claimed job leaves the queue and records its attempt" do
       uri = unique_uri("doc")
-      assert {:ok, job_id} = JobQueue.enqueue(:embed, %{uri: uri, content: "hello"})
-      assert is_integer(job_id)
+      assert {:ok, job_id} = storage().enqueue_job(:embed, %{uri: uri, content: "hello"})
 
-      assert {:ok, job} = JobQueue.dequeue("test_worker")
+      assert {:ok, job} = storage().dequeue_job([:embed])
       assert job.id == job_id
       assert job.kind == :embed
       assert job.payload["uri"] == uri
@@ -77,143 +43,222 @@ defmodule AgentDb.JobQueueTest do
       assert job.attempts == 1
     end
 
-    test "returns :empty when no jobs pending" do
-      clean_job_queue()
-      assert {:error, :empty} = JobQueue.dequeue("test_worker")
+    test "an empty queue is reported as empty rather than as a failure" do
+      assert {:error, :empty} = storage().dequeue_job([:embed])
+    end
+
+    test "a worker is handed only the kinds it can run" do
+      uri = unique_uri("doc")
+      assert {:ok, _} = storage().enqueue_job(:embed, %{uri: uri, content: "c"})
+
+      # Claiming for another kind must leave this one claimable: a claimed job
+      # cannot be handed back, so a filter that ignored kinds would destroy it.
+      assert {:error, :empty} = storage().dequeue_job([:summarize_abstract])
+
+      assert {:ok, %{kind: :embed}} = storage().dequeue_job([:embed])
+    end
+
+    test "a job that is not yet due stays in the queue" do
+      uri = unique_uri("doc")
+      assert {:ok, _} = storage().enqueue_job(:embed, %{uri: uri, content: "c"})
+
+      # Deferred into the future: due time is what makes it runnable.
+      assert {:ok, job_id} = storage().enqueue_job(:embed, %{uri: uri, content: "c"})
+      {:ok, _} = storage().dequeue_job([:embed])
+      assert :ok = storage().defer_job(job_id, 60_000)
+
+      assert {:error, :empty} = storage().dequeue_job([:embed])
     end
   end
 
-  describe "complete/1" do
-    test "marks job as done" do
+  describe "completing" do
+    test "a completed job is not claimed again" do
       uri = unique_uri("doc")
-      {:ok, job_id} = JobQueue.enqueue(:embed, %{uri: uri, content: "test"})
-      {:ok, job} = JobQueue.dequeue("test_worker")
+      assert {:ok, job_id} = storage().enqueue_job(:embed, %{uri: uri, content: "test"})
+      assert {:ok, _job} = storage().dequeue_job([:embed])
 
-      assert :ok = JobQueue.complete(job_id)
-
-      # Job should not be dequeued again
-      assert {:error, :empty} = JobQueue.dequeue("test_worker")
+      assert :ok = storage().complete_job(job_id)
+      assert {:error, :empty} = storage().dequeue_job([:embed])
     end
   end
 
-  describe "fail/2 with exponential backoff" do
-    test "retries job with backoff on failure" do
+  describe "failing" do
+    test "a failure is retried while attempts remain" do
       uri = unique_uri("doc")
-      {:ok, job_id} = JobQueue.enqueue(:summarize_abstract, %{uri: uri, content: "test"})
-      {:ok, job} = JobQueue.dequeue("test_worker")
 
-      # First failure - should reschedule with backoff
-      assert :ok = JobQueue.fail(job_id, :timeout)
+      assert {:ok, job_id} =
+               storage().enqueue_job(:summarize_abstract, %{uri: uri, content: "test"})
+
+      assert {:ok, _job} = storage().dequeue_job([:summarize_abstract])
+      assert :ok = storage().fail_job(job_id)
+
+      # Rescheduled with backoff, so still counted as outstanding rather than
+      # given up on.
+      assert 1 = storage().count_jobs(uri, ["pending", "running"])
+      assert 0 = storage().count_jobs(uri, ["failed"])
     end
 
-    test "marks job failed after max attempts" do
+    test "a job is given up on once its attempts are exhausted" do
       uri = unique_uri("doc")
-      {:ok, job_id} = JobQueue.enqueue(:embed, %{uri: uri, content: "test"})
+      assert {:ok, job_id} = storage().enqueue_job(:embed, %{uri: uri, content: "test"})
 
-      # Fail it 5 times (max_attempts = 5 by default) by directly updating the database
-      # to avoid scheduling delays
-      for i <- 1..5 do
-        # Dequeue the job
-        {:ok, _job} = JobQueue.dequeue("test_worker")
-        # Fail it
-        assert :ok = JobQueue.fail(job_id, :error)
-
-        # For the next iteration, we need to reset scheduled_at to now
-        # so the job is immediately available for dequeue again
-        if i < 5 do
-          update_job_queue(
-            "UPDATE job_queue SET scheduled_at = ?1 WHERE id = ?2",
-            [System.system_time(:millisecond), job_id]
-          )
-        end
+      for _attempt <- 1..5 do
+        assert {:ok, _job} = storage().dequeue_job([:embed])
+        assert :ok = storage().fail_job(job_id)
+        Helpers.make_runnable(job_id)
       end
 
-      # Verify job is marked as failed
-      assert {:ok, ["failed"]} =
-               query_job_queue("SELECT status FROM job_queue WHERE id = ?1", [job_id])
+      assert 1 = storage().count_jobs(uri, ["failed"])
     end
   end
 
-  describe "reset_running_jobs/0" do
-    test "resets running jobs to pending on startup" do
+  describe "deferring" do
+    test "a deferral gives back the attempt the claim consumed" do
       uri = unique_uri("doc")
-      {:ok, job_id} = JobQueue.enqueue(:embed, %{uri: uri, content: "test"})
-      {:ok, _job} = JobQueue.dequeue("test_worker")
+      assert {:ok, job_id} = storage().enqueue_job(:embed, %{uri: uri, content: "c"})
+      assert {:ok, _job} = storage().dequeue_job([:embed])
 
-      # Verify job is now running
-      assert {:ok, ["running", 1]} =
-               query_job_queue("SELECT status, attempts FROM job_queue WHERE id = ?1", [job_id])
+      # The claim advanced the attempt counter; a deferral is not a failure and
+      # must hand it back, or repeated waiting would exhaust the budget of work
+      # that has not had its chance yet.
+      assert :ok = storage().defer_job(job_id, 0)
 
-      # Simulate crash/restart - job is still "running"
-      # reset_running_jobs should make it pending again
-      assert :ok = JobQueue.reset_running_jobs()
+      assert {:ok, job} = storage().dequeue_job([:embed])
+      assert job.attempts == 1
+    end
 
-      # Verify job was reset
-      assert {:ok, ["pending", 0]} =
-               query_job_queue("SELECT status, attempts FROM job_queue WHERE id = ?1", [job_id])
+    test "a deferred job is a different state from a failed one" do
+      deferred_uri = unique_uri("deferred")
+      failed_uri = unique_uri("failed")
 
-      # Now it should be available for dequeue again
-      {:ok, job2} = JobQueue.dequeue("test_worker2")
-      assert job2.id == job_id
-      assert job2.attempts == 1
+      assert {:ok, deferred} = storage().enqueue_job(:embed, %{uri: deferred_uri, content: "c"})
+      assert {:ok, _} = storage().dequeue_job([:embed])
+      assert :ok = storage().defer_job(deferred, 60_000)
+
+      assert {:ok, failed} = storage().enqueue_job(:embed, %{uri: failed_uri, content: "c"})
+
+      for _attempt <- 1..5 do
+        assert {:ok, _} = storage().dequeue_job([:embed])
+        assert :ok = storage().fail_job(failed)
+        Helpers.make_runnable(failed)
+      end
+
+      # Both were claimed the same number of times; only one is finished with.
+      assert 1 = storage().count_jobs(deferred_uri, ["pending"])
+      assert 0 = storage().count_jobs(deferred_uri, ["failed"])
+      assert 1 = storage().count_jobs(failed_uri, ["failed"])
     end
   end
 
-  describe "cancel_for_uri/2" do
-    test "removes jobs for the exact URI and for descendants" do
-      exact = unique_uri("sub")
-      child = exact <> "/child.md"
-      grandchild = exact <> "/deep/leaf.md"
+  describe "recovering" do
+    test "work left running by a previous run returns to pending" do
+      uri = unique_uri("doc")
+      assert {:ok, job_id} = storage().enqueue_job(:embed, %{uri: uri, content: "test"})
+      assert {:ok, _job} = storage().dequeue_job([:embed])
+
+      # A process that died mid-job leaves the row running. Recovery returns it
+      # to pending with its attempts reset, because the work was never
+      # attempted to completion.
+      assert :ok = storage().reset_running_jobs()
+
+      assert {:ok, job} = storage().dequeue_job([:embed])
+      assert job.id == job_id
+      assert job.attempts == 1
+    end
+
+    test "a deferred job is left alone by recovery" do
+      uri = unique_uri("doc")
+      assert {:ok, job_id} = storage().enqueue_job(:embed, %{uri: uri, content: "c"})
+      assert {:ok, _job} = storage().dequeue_job([:embed])
+      assert :ok = storage().defer_job(job_id, 60_000)
+
+      assert :ok = storage().reset_running_jobs()
+
+      # Still pending, still attempt-free: recovery is about abandoned work, and
+      # a job deliberately waiting is not abandoned.
+      assert 1 = storage().count_jobs(uri, ["pending"])
+      assert {:error, :empty} = storage().dequeue_job([:embed])
+    end
+  end
+
+  describe "cancelling" do
+    test "work for a URI and its descendants is dropped, in any state" do
+      target = unique_uri("sub")
       other = unique_uri("other")
 
-      for uri <- [exact, child, grandchild, other] do
-        {:ok, _} = JobQueue.enqueue(:embed, %{uri: uri, content: "c"})
-      end
+      assert {:ok, _} = storage().enqueue_job(:embed, %{uri: target, content: "c"})
+      assert {:ok, _} = storage().enqueue_job(:embed, %{uri: target <> "/child.md", content: "c"})
+      assert {:ok, _} = storage().enqueue_job(:embed, %{uri: other, content: "c"})
 
-      assert :ok = cancel_for_uri(exact)
+      # One of them is claimed first, so cancellation has to reach a running row
+      # as well as a pending one.
+      assert {:ok, _} = storage().dequeue_job([:embed])
+      assert :ok = storage().cancel_jobs(target)
 
-      assert remaining_job_uris() == MapSet.new([other])
+      every = ["pending", "running", "done", "failed"]
+      assert 0 = storage().count_jobs(target, every)
+      assert 0 = storage().count_jobs(target <> "/child.md", every)
+      assert 1 = storage().count_jobs(other, every)
     end
 
-    test "removes running jobs, not just pending ones" do
-      uri = unique_uri("sub")
-      {:ok, job_id} = JobQueue.enqueue(:embed, %{uri: uri, content: "c"})
-      {:ok, _job} = JobQueue.dequeue("test_worker")
-
-      assert {:ok, ["running"]} =
-               query_job_queue("SELECT status FROM job_queue WHERE id = ?1", [job_id])
-
-      assert :ok = cancel_for_uri(uri)
-      assert remaining_job_uris() == MapSet.new()
-    end
-
-    test "leaves a job whose content mentions the URI but targets another one" do
+    test "work whose content mentions a URI is left alone" do
       target = unique_uri("sub")
       bystander = unique_uri("other")
 
-      {:ok, _} =
-        JobQueue.enqueue(:embed, %{uri: bystander, content: "see #{target} for details"})
+      # Matching the payload's URI rather than its text: a substring match would
+      # drop work outside the removed subtree.
+      assert {:ok, _} =
+               storage().enqueue_job(:embed, %{
+                 uri: bystander,
+                 content: "see #{target} for details"
+               })
 
-      assert :ok = cancel_for_uri(target)
-      assert remaining_job_uris() == MapSet.new([bystander])
+      assert :ok = storage().cancel_jobs(target)
+      assert 1 = storage().count_jobs(bystander, ["pending"])
     end
 
-    test "a cancelled job cannot be dequeued" do
+    test "cancelled work cannot be claimed" do
       uri = unique_uri("sub")
-      {:ok, _} = JobQueue.enqueue(:embed, %{uri: uri, content: "c"})
+      assert {:ok, _} = storage().enqueue_job(:embed, %{uri: uri, content: "c"})
 
-      assert :ok = cancel_for_uri(uri)
-      assert {:error, :empty} = JobQueue.dequeue("test_worker")
+      assert :ok = storage().cancel_jobs(uri)
+      assert {:error, :empty} = storage().dequeue_job([:embed])
     end
   end
 
-  describe "stats/0" do
-    test "returns queue statistics" do
-      JobQueue.enqueue(:embed, %{uri: unique_uri("doc1"), content: "test1"})
-      JobQueue.enqueue(:summarize_abstract, %{uri: unique_uri("doc2"), content: "test2"})
+  describe "reporting" do
+    test "work is reported by status" do
+      assert {:ok, _} = storage().enqueue_job(:embed, %{uri: unique_uri("doc1"), content: "t"})
 
-      assert {:ok, stats} = JobQueue.stats()
+      assert {:ok, _} =
+               storage().enqueue_job(:summarize_abstract, %{uri: unique_uri("doc2"), content: "t"})
+
+      assert {:ok, stats} = storage().queue_stats()
       assert is_map(stats)
+      assert stats.pending >= 2
     end
+  end
+
+  describe "the storage the queue runs on" do
+    test "is reachable" do
+      assert storage().healthy?()
+    end
+
+    test "runs a single writer, so interleaved writes see each other" do
+      tasks = for i <- 1..10, do: Task.async(fn -> store_session("s#{i}") end)
+
+      assert Enum.all?(Task.await_many(tasks, 5_000), &(&1 == :ok))
+
+      assert {:ok, [[10]]} =
+               AgentDb.Store.Reader.read(fn conn ->
+                 SQLite.query(conn, "SELECT COUNT(*) FROM sessions WHERE id LIKE 's%'")
+               end)
+    end
+  end
+
+  defp store_session(id) do
+    AgentDb.Store.Writer.call(fn conn ->
+      SQLite.exec_write(conn, "INSERT INTO sessions (id, created_at) VALUES (?1, ?2)", [id, id])
+    end)
   end
 end
