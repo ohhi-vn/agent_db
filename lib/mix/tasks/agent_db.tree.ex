@@ -41,7 +41,7 @@ defmodule Mix.Tasks.AgentDb.Tree do
         end
 
       {:error, reason} ->
-        Mix.raise("Tree failed: #{inspect(reason)}")
+        Mix.raise("Tree failed: #{AgentDb.Observability.error_message(reason)}")
     end
   end
 end

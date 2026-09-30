@@ -29,22 +29,29 @@ defmodule AgentDb.ML.ModelManagerTest do
     end
   end
 
-  describe "embed/1" do
-    test "returns error when model not available" do
-      # Since we don't have actual models in test env, this should fail gracefully
-      result = ModelManager.embed(["test text"])
+  # These use the shared ModelManager, so whether a model is cached depends on
+  # the host. What is asserted here is the contract either way: a well-formed
+  # answer that never crashes the caller.
 
-      # Should return error tuple (model not loaded)
-      assert match?({:error, _}, result)
+  describe "embed/1" do
+    test "answers with 384-dim embeddings or a classified error" do
+      case ModelManager.embed(["test text"]) do
+        {:ok, embeddings} ->
+          assert [%Nx.Tensor{} = embedding] = embeddings
+          assert Nx.shape(embedding) == {384}
+
+        {:error, reason} ->
+          assert is_tuple(reason) or is_atom(reason)
+      end
     end
   end
 
   describe "summarize/2" do
-    test "returns error when model not available" do
-      result = ModelManager.summarize("test prompt", max_tokens: 100)
-
-      # Should return error tuple (model not loaded)
-      assert match?({:error, _}, result)
+    test "answers with text or a classified error" do
+      case ModelManager.summarize("test prompt", max_tokens: 100) do
+        {:ok, text} -> assert is_binary(text)
+        {:error, reason} -> assert is_tuple(reason) or is_atom(reason)
+      end
     end
   end
 end

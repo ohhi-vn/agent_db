@@ -156,6 +156,43 @@ defmodule AgentDb.ObservabilityTest do
     end
   end
 
+  describe "transport error mapping" do
+    test "http_status distinguishes missing, retryable, caller, and server errors" do
+      assert Observability.http_status(:not_found) == 404
+      assert Observability.http_status(:no_memory) == 404
+      assert Observability.http_status(:model_loading) == 503
+      assert Observability.http_status({:background_jobs_pending, "u"}) == 503
+      assert Observability.http_status({:invalid_mode, "bogus"}) == 422
+      assert Observability.http_status(:invalid_uri) == 422
+      assert Observability.http_status({:invalid_limit, 0}) == 422
+      assert Observability.http_status({:not_a_memory_uri, "viking://x"}) == 422
+      assert Observability.http_status({:too_large, 1}) == 413
+      assert Observability.http_status(:rate_limited) == 429
+      assert Observability.http_status({:inference_failed, "boom"}) == 500
+      assert Observability.http_status(:something_unexpected) == 500
+    end
+
+    test "error_code is the classified tag as a string" do
+      assert Observability.error_code({:invalid_mode, "bogus"}) == "invalid_mode"
+      assert Observability.error_code(:not_found) == "not_found"
+      assert Observability.error_code(:model_loading) == "model_loading"
+      assert Observability.error_code({:hybrid_leg_timeout, :vector}) == "hybrid_leg_timeout"
+      assert Observability.error_code({:not_a_memory_uri, "viking://x"}) == "not_a_memory_uri"
+      assert Observability.error_code(%{weird: true}) == "error"
+    end
+
+    test "error_message is a JSON-safe string without details" do
+      assert Observability.error_message({:invalid_mode, "bogus"}) == "invalid_mode"
+      assert Observability.error_message(:not_found) == "not_found"
+      assert Observability.error_message(:model_loading) == "model_loading"
+      assert Observability.error_message({:not_a_memory_uri, "viking://secret/doc"}) == "not_a_memory_uri"
+
+      for reason <- [{:invalid_mode, "x"}, :not_found, {:hybrid_leg_timeout, :vector}] do
+        assert reason |> Observability.error_message() |> Jason.encode!() |> is_binary()
+      end
+    end
+  end
+
   describe "redacted logs" do
     test "redact_url removes credentials and secret params" do
       assert Observability.redact_url("https://user:pass@huggingface.co/model?token=abc&foo=bar") =~

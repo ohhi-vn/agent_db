@@ -173,13 +173,10 @@ defmodule AgentDb.ML.ModelManager do
   end
 
   @impl true
-  def handle_call({:embed, texts}, _from, state) do
+  def handle_call({:embed, texts}, from, state) do
     case ensure_embedding_model(state) do
       {:ok, model_ref, new_state} ->
-        {reply, new_state} =
-          run_inference(:embedding, &generate_embeddings(model_ref, &1), texts, new_state)
-
-        {:reply, reply, new_state}
+        dispatch_inference(from, :embedding, new_state, &generate_embeddings(model_ref, &1), texts)
 
       # Either an already-running load, or one this call just started.
       {:error, :loading, new_state} ->
@@ -188,13 +185,10 @@ defmodule AgentDb.ML.ModelManager do
   end
 
   @impl true
-  def handle_call({:summarize, prompt, opts}, _from, state) do
+  def handle_call({:summarize, prompt, opts}, from, state) do
     case ensure_llm_model(state) do
       {:ok, model_ref, new_state} ->
-        {reply, new_state} =
-          run_inference(:llm, &generate_summary(model_ref, &1, opts), prompt, new_state)
-
-        {:reply, reply, new_state}
+        dispatch_inference(from, :llm, new_state, &generate_summary(model_ref, &1, opts), prompt)
 
       {:error, :loading, new_state} ->
         {:reply, {:error, :model_loading}, new_state}
@@ -217,6 +211,27 @@ defmodule AgentDb.ML.ModelManager do
   end
 
   @impl true
+  def handle_info({:inference_result, ref, from, role, result}, state) do
+    # A run this manager did not start is dropped: the caller has already
+    # timed out, or the manager that owned the model has been replaced, so
+    # there is nobody left to answer.
+    if MapSet.member?(state.inference_refs, ref) do
+      {reply, new_state} = finish_inference(role, result, state)
+
+      GenServer.reply(from, reply)
+
+      {:noreply,
+       %{
+         new_state
+         | inference_refs: MapSet.delete(new_state.inference_refs, ref),
+           in_flight: max(new_state.in_flight - 1, 0)
+       }}
+    else
+      {:noreply, state}
+    end
+  end
+
+  @impl true
   def handle_cast({:load_result, ref, role, result}, state) do
     # A load runs outside this process and casts its result back by name, so a
     # result can outlive the manager that started it -- after a restart, or
@@ -233,32 +248,69 @@ defmodule AgentDb.ML.ModelManager do
 
   # -- Internal Implementation --
 
-  # Inference failures are reported, never raised: an exception here would kill
-  # the only inference process and discard the loaded model along with it.
-  # Every run stamps its duration for the role, success or failure: it is
-  # still the last inference latency, and status reads it without messaging.
-  defp run_inference(role, fun, input, state) do
+  # Inference runs outside this process, for the same reason a load does: a run
+  # holds the model for as long as the model takes, and doing that in
+  # handle_call/3 would make every other caller -- including one merely asking
+  # for status -- wait behind it. A loaded model is read-only to a run, so
+  # concurrent runs are safe; the bound below is what keeps that from turning
+  # into unbounded memory use.
+  defp dispatch_inference(from, role, state, fun, input) do
     start = System.monotonic_time(:millisecond)
 
+    if state.in_flight < Config.inference_concurrency() do
+      ref = make_ref()
+
+      _ =
+        Task.start(fn ->
+          send(__MODULE__, {:inference_result, ref, from, role, run_inference(role, fun, input, start)})
+        end)
+
+      {:noreply,
+       %{
+         state
+         | inference_refs: MapSet.put(state.inference_refs, ref),
+           in_flight: state.in_flight + 1
+       }}
+    else
+      # At the bound, running inline is the backpressure: this caller waits
+      # rather than starting another process the machine has no room for.
+      {reply, duration} = run_inference(role, fun, input, start)
+      GenServer.reply(from, reply)
+      {:noreply, stamp_latency(state, role, duration)}
+    end
+  end
+
+  defp stamp_latency(state, role, duration) do
+    %{state | last_latency_ms: Map.put(state.last_latency_ms, role, duration)}
+  end
+
+  # Inference failures are reported, never raised: an exception here would
+  # discard the loaded model along with the process that owns it. Every run
+  # stamps its duration for the role, success or failure: it is still the last
+  # inference latency, and status reads it without messaging.
+  defp run_inference(role, fun, input, start) do
     result =
       try do
         case fun.(input) do
-          {:ok, result} -> {{:ok, result}, state}
-          {:error, reason} -> {{:error, reason}, state}
+          {:ok, result} -> {:ok, result}
+          {:error, reason} -> {:error, reason}
         end
       rescue
-        error -> {{:error, {:inference_failed, error}}, state}
+        error -> {:error, {:inference_failed, error}}
       catch
-        :exit, reason -> {{:error, {:inference_failed, {:exit, reason}}}, state}
-        :throw, value -> {{:error, {:inference_failed, {:throw, value}}}, state}
+        :exit, reason -> {:error, {:inference_failed, {:exit, reason}}}
+        :throw, value -> {:error, {:inference_failed, {:throw, value}}}
       end
 
     duration = System.monotonic_time(:millisecond) - start
-    outcome = if match?({{:ok, _}, _}, result), do: :ok, else: :error
-    AgentDb.Observability.emit_model(:inference, outcome, duration)
+    outcome = if match?({:ok, _}, result), do: :ok, else: :error
+    AgentDb.Observability.emit_model(role, outcome, duration)
 
-    {reply, run_state} = result
-    {reply, %{run_state | last_latency_ms: Map.put(run_state.last_latency_ms, role, duration)}}
+    {result, duration}
+  end
+
+  defp finish_inference(role, {result, duration}, state) do
+    {result, stamp_latency(state, role, duration)}
   end
 
   defp apply_load_result(role, result, state) do

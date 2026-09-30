@@ -1,48 +1,42 @@
 defmodule AgentDb.ML.FakeServing do
   @moduledoc false
-  # Stands in for Bumblebee's serving modules so inference can run without real
-  # weights. `for` is a reserved word and cannot name a function.
+  # Stands in for Bumblebee's built servings so inference can run without real
+  # weights. The real loader builds an Nx.Serving and runs it; this builds a
+  # tagged value and answers from it, so the backend code under test is the
+  # same in both cases.
 
-  defmodule Embedding do
-    def tokenize(_tokenizer, texts), do: {:ok, texts}
+  @generated_text_key :fake_generated_text
 
-    # generate_embeddings/2 pools with Nx.mean(axes: [1]), so the tensor handed
-    # to the callback must have a sequence axis: {batch, sequence, dim}.
-    def generate(_model, inputs, fun) do
-      {:ok,
-       Enum.map(inputs, fn text ->
-         %{embedding: fun.(Nx.tensor([[[String.length(text) * 1.0, 2.0]]]))}
-       end)}
-    end
+  def put_generated_text(text), do: Application.put_env(:agent_db, @generated_text_key, text)
+
+  def clear_generated_text, do: Application.delete_env(:agent_db, @generated_text_key)
+
+  def generated_text,
+    do: Application.get_env(:agent_db, @generated_text_key, "generated summary")
+
+  def build(:embedding, _model_info, _tokenizer, _opts),
+    do: {:ok, %{serving: :embedding}}
+
+  def build(:llm, _model_info, _tokenizer, _opts), do: {:ok, %{serving: :llm}}
+
+  def run(%{serving: :embedding}, texts) when is_list(texts) do
+    # The real serving pools and L2-normalizes before returning, so each
+    # embedding here is already a unit vector of the same shape.
+    {:ok,
+     Enum.map(texts, fn text ->
+       tensor = Nx.tensor([String.length(text) * 1.0, 2.0])
+       norm = Nx.sqrt(Nx.sum(Nx.pow(tensor, 2)))
+       Nx.divide(tensor, norm)
+     end)}
   end
 
-  defmodule Generation do
-    # The text the fake model "generates". Configurable because the summary
-    # tests need to drive reasoning-then-answer, reasoning-only, and plain
-    # output through the same serving. Defaults to the fixed string the
-    # earlier tests assert on, so they are unaffected.
-    @generated_text_key :fake_generated_text
-
-    def put_generated_text(text), do: Application.put_env(:agent_db, @generated_text_key, text)
-
-    def clear_generated_text, do: Application.delete_env(:agent_db, @generated_text_key)
-
-    def generated_text,
-      do: Application.get_env(:agent_db, @generated_text_key, "generated summary")
-
+  def run(%{serving: :llm}, prompt) when is_binary(prompt) do
     # The prompt is recorded here because this is where the formatted prompt
     # arrives, letting a test assert on the chat format the store built rather
     # than on a string it constructed itself.
-    def tokenize(_tokenizer, prompt) do
-      AgentDb.ML.FakeCallLog.record(:prompt, prompt, [])
-      {:ok, [prompt]}
-    end
-
-    def generate(_model, _inputs, _opts), do: {:ok, [%{text: generated_text()}]}
+    AgentDb.ML.FakeCallLog.record(:prompt, prompt, [])
+    {:ok, %{results: [%{text: generated_text()}]}}
   end
-
-  def for_role(:embedding), do: Embedding
-  def for_role(:llm), do: Generation
 end
 
 defmodule AgentDb.ML.FakeCallLog do
@@ -96,7 +90,10 @@ defmodule AgentDb.ML.FakeLoader do
     {:ok, %{model: {:model, model_id}, spec: {:spec, model_id}}}
   end
 
-  def serving(role), do: AgentDb.ML.FakeServing.for_role(role)
+  def build_serving(role, model_info, tokenizer, opts),
+    do: AgentDb.ML.FakeServing.build(role, model_info, tokenizer, opts)
+
+  def run(serving, input), do: AgentDb.ML.FakeServing.run(serving, input)
 end
 
 defmodule AgentDb.ML.FakeBumblebee do
@@ -122,7 +119,8 @@ defmodule AgentDb.ML.RaisingLoader do
 
   def load_tokenizer(_), do: raise("tokenizer unavailable")
   def load_model(_, _), do: raise("model unavailable")
-  def serving(role), do: AgentDb.ML.FakeServing.for_role(role)
+  def build_serving(_, _, _, _), do: raise("serving unavailable")
+  def run(_, _), do: raise("serving unavailable")
 end
 
 defmodule AgentDb.ML.ExitingLoader do
@@ -132,7 +130,8 @@ defmodule AgentDb.ML.ExitingLoader do
 
   def load_tokenizer(_), do: exit(:no_such_client)
   def load_model(_, _), do: exit(:no_such_client)
-  def serving(role), do: AgentDb.ML.FakeServing.for_role(role)
+  def build_serving(_, _, _, _), do: exit(:no_such_client)
+  def run(_, _), do: exit(:no_such_client)
 end
 
 defmodule AgentDb.ML.SlowLoader do
@@ -153,5 +152,8 @@ defmodule AgentDb.ML.SlowLoader do
     {:ok, %{model: {:model, model_id}, spec: {:spec, model_id}}}
   end
 
-  def serving(role), do: AgentDb.ML.FakeServing.for_role(role)
+  def build_serving(role, model_info, tokenizer, opts),
+    do: AgentDb.ML.FakeServing.build(role, model_info, tokenizer, opts)
+
+  def run(serving, input), do: AgentDb.ML.FakeServing.run(serving, input)
 end

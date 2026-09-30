@@ -186,6 +186,19 @@ defmodule AgentDb.Config do
   end
 
   @doc """
+  How many inference runs may be in flight at once.
+
+  A run reads a loaded model without changing it, so several can run in
+  parallel; this bounds them, because each holds its inputs and activations in
+  memory and a burst of large batches is a memory cost, not a speedup. Past the
+  bound a caller waits its turn rather than starting another process.
+  """
+  @spec inference_concurrency() :: pos_integer()
+  def inference_concurrency do
+    Application.get_env(:agent_db, :inference_concurrency, System.schedulers_online())
+  end
+
+  @doc """
   How long shutdown waits for work already claimed to finish.
 
   Bounded, so a store whose workers are stuck on an unreachable model still

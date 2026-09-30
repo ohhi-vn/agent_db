@@ -66,19 +66,24 @@ defmodule AgentDbWeb.EndpointTest do
     end
 
     test "a document that is not there is a 404, not a 500" do
-      # The status is what a client acts on; the body is the error page, because
-      # this route renders one rather than JSON.
-      assert {:ok, 404, _body} =
+      # The status is what a client acts on; the body is JSON carrying the
+      # classified reason and its code.
+      assert {:ok, 404, %{"error" => "not_found", "code" => "not_found"}} =
                get("/api/v1/documents/#{document_path("viking://resources/http/absent.md")}")
     end
 
     test "a write the store rejects is a 422 carrying the reason" do
       # An invalid URI is the store's call to make, and the reason it gives is
       # what a client needs to correct the request.
-      assert {:ok, 422, %{"error" => "invalid_uri"}} =
+      assert {:ok, 422, %{"error" => "invalid_uri", "code" => "invalid_uri"}} =
                post("/api/v1/documents", %{
                  "document" => %{"uri" => "http://elsewhere/x", "content" => "c"}
                })
+    end
+
+    test "an unrecognized search mode is a 422 carrying its code, not a 500" do
+      assert {:ok, 422, %{"error" => "invalid_mode", "code" => "invalid_mode"}} =
+               post("/api/v1/search", %{"term" => "x", "mode" => "bogus"})
     end
 
     test "keyword search answers with results" do

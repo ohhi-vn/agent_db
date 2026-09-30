@@ -172,7 +172,13 @@ defmodule AgentDbWeb.Channel do
   end
 
   def handle_in("v1.search_progress", %{"term" => term} = params, socket) do
-    events = ["retrieval_started", "retrieval_progress", "resource_found", "memory_found", "skill_loaded"]
+    events = [
+      "retrieval_started",
+      "retrieval_progress",
+      "resource_found",
+      "memory_found",
+      "skill_loaded"
+    ]
 
     case AgentDb.search(term, search_opts(params)) do
       {:ok, results} ->
@@ -204,17 +210,21 @@ defmodule AgentDbWeb.Channel do
   # -- replies --
 
   # An error is rendered so a client can tell a deferral from a failure: the
-  # first is a bare atom to retry, the second a tagged reason naming a cause.
+  # shared taxonomy message names the cause, and :model_loading stays the
+  # distinct retry signal. Always a plain string, so no error term can break
+  # the channel serializer the way a raw tuple would.
   defp answer(socket, :ok), do: {:reply, {:ok, %{status: "ok"}}, socket}
 
   defp answer(socket, {:ok, payload}), do: {:reply, {:ok, payload}, socket}
 
-  defp answer(socket, {:error, reason}), do: {:reply, {:error, %{reason: render(reason)}}, socket}
-
-  defp render(:model_loading), do: :model_loading
-  defp render(reason) when is_atom(reason) or is_binary(reason), do: reason
-  defp render({tag, detail}) when is_atom(tag), do: {tag, render(detail)}
-  defp render(reason), do: inspect(reason)
+  defp answer(socket, {:error, reason}) do
+    {:reply,
+     {:error,
+      %{
+        reason: Observability.error_message(reason),
+        code: Observability.error_code(reason)
+      }}, socket}
+  end
 
   # -- options from the wire --
 

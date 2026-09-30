@@ -575,11 +575,13 @@ defmodule AgentDbTest do
   test "a search that needs an unavailable model reports an error, not a crash" do
     :ok = AgentDb.write("viking://resources/novm/a.md", "content")
 
-    # No model is cached and remote downloads are skipped under test, so vector
-    # search cannot be served. It must say so rather than terminating the
-    # caller, which is what the WebSocket gateway forwards to clients.
-    assert {:error, {:model_not_found, _path}} =
-             AgentDb.search("content", mode: :vector)
+    # Which leg fails depends on the host: with no cached model (and remote
+    # downloads skipped under test) the embedding cannot be produced, and
+    # without the sqlite-vec extension there is no index to search. Either is
+    # unservable and neither may terminate the caller, which is what the
+    # WebSocket gateway forwards to clients.
+    assert {:error, reason} = AgentDb.search("content", mode: :vector)
+    assert unservable?(reason)
 
     # The caller survives, and unrelated operations still work.
     assert {:ok, _} = AgentDb.read("viking://resources/novm/a.md")
@@ -589,8 +591,13 @@ defmodule AgentDbTest do
   test "a hybrid search that needs an unavailable model reports an error, not a crash" do
     :ok = AgentDb.write("viking://resources/novm2/a.md", "content")
 
-    assert {:error, {:model_not_found, _path}} = AgentDb.search("content", mode: :hybrid)
+    assert {:error, reason} = AgentDb.search("content", mode: :hybrid)
+    assert unservable?(reason)
   end
+
+  defp unservable?({:model_not_found, _path}), do: true
+  defp unservable?(:vector_index_unavailable), do: true
+  defp unservable?(_), do: false
 
   # -- Sessions --
 

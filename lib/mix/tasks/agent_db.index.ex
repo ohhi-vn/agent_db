@@ -42,12 +42,18 @@ defmodule Mix.Tasks.AgentDb.Index do
             Jason.encode!(%{
               project: project,
               indexed: indexed,
-              failed: Enum.map(failed, fn {rel, reason} -> %{file: rel, reason: inspect(reason)} end)
+              failed:
+                Enum.map(failed, fn {rel, reason} ->
+                  %{file: rel, reason: AgentDb.Observability.error_message(reason)}
+                end)
             })
           )
         else
           Mix.shell().info("indexed #{length(indexed)} files for #{project}")
-          for {rel, reason} <- failed, do: Mix.shell().error("failed #{rel}: #{inspect(reason)}")
+
+          for {rel, reason} <- failed,
+              do:
+                Mix.shell().error("failed #{rel}: #{AgentDb.Observability.error_message(reason)}")
         end
 
         Mix.raise("One or more files could not be indexed.")

@@ -76,6 +76,30 @@ defmodule AgentDb.ML.BackendTest do
       assert Exla.model_info() == %{backend: :exla}
     end
 
+    test "concurrent embed calls all answer" do
+      # Runs leave the manager, so a caller is answered by a message rather
+      # than by the process that owns the model. Several at once is the case
+      # that breaks if a run's reply is tied to the wrong caller.
+      config = %{
+        embedding_model: "m",
+        llm_model: "m",
+        exla_backend: :cpu,
+        llm_chat_template: "%{prompt}",
+        loader: AgentDb.ML.FakeLoader
+      }
+
+      assert {:ok, model_ref} = Exla.load_embedding(config)
+
+      results =
+        1..4
+        |> Enum.map(fn i -> Task.async(fn -> {i, Exla.embed(model_ref, ["text #{i}"])} end) end)
+        |> Enum.map(&Task.await(&1, 5_000))
+
+      for {_id, {:ok, [embedding]}} <- results do
+        assert Nx.shape(embedding) == {2}
+      end
+    end
+
     test "embed normalizes through the fake serving" do
       config = %{
         embedding_model: "m",

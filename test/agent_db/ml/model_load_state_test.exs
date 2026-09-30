@@ -281,6 +281,29 @@ defmodule AgentDb.ML.ModelLoadStateTest do
       assert is_map(result)
       assert elapsed < 1_000_000
     end
+
+    test "model status answers while a run is in progress", %{cache: cache, model_id: model_id} do
+      :ok = cache_model(cache, model_id)
+      start_manager(SlowLoader)
+      set_grace(0)
+
+      # The first call starts the load and is told it is loading; later calls
+      # find the model ready and reach a run.
+      assert {:error, :model_loading} = ModelManager.embed(["hello"])
+      assert :ready = await_settled(:embedding)
+
+      task = Task.async(fn -> ModelManager.embed(["hello"]) end)
+      Task.yield(task, 200)
+
+      # A run holds the model for the length of the run. A state read must not
+      # queue behind it, which is what it did when runs happened inside the
+      # manager process.
+      {elapsed, result} = :timer.tc(fn -> model_status() end)
+      assert is_map(result)
+      assert elapsed < 1_000_000
+
+      Task.shutdown(task, :brutal_kill)
+    end
   end
 
   describe "summarization" do

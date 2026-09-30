@@ -39,10 +39,9 @@ defmodule AgentDbWeb.ChannelTest do
       assert {:reply, {:error, %{reason: deferred}}, _} = search("vector")
 
       # Whether this call saw :model_loading or a classified failure depends on
-      # how far the load got inside the grace period. Either way the payload has
-      # to distinguish the two by shape: a bare atom to retry, a tagged reason
-      # naming a cause.
-      assert deferred == :model_loading or match?({_tag, _detail}, deferred)
+      # how far the load got inside the grace period. Either way the payload is
+      # a plain string: "model_loading" to retry, anything else naming a cause.
+      assert deferred == "model_loading" or (is_binary(deferred) and deferred != "")
     end
 
     test "leaves the connection usable" do
@@ -147,7 +146,7 @@ defmodule AgentDbWeb.ChannelTest do
 
   describe "versioning" do
     test "an unknown event is reported, not ignored" do
-      assert {:reply, {:error, %{reason: {:unknown_event, "v9.write"}}}, _} =
+      assert {:reply, {:error, %{reason: "unknown_event", code: "unknown_event"}}, _} =
                event("v9.write", %{})
     end
   end

@@ -393,21 +393,34 @@ intentionally not duplicated here so the two cannot disagree.
 Listener, port, bind interface, and Bearer opt-in: [Setup](docs/SETUP.md#http-listener-and-auth).
 Defaults: port `6060`, bind `127.0.0.1` (loopback). `PORT` is **not** read.
 
-### Known issues on the HTTP surface
+### Error responses
 
-The listener is live, and turning it on has made pre-existing breakage in the web
-layer visible for the first time — these routes have never been exercised, because
-until now nothing was listening:
+Every transport renders a store failure the same way: the status says whether
+the caller can fix it, the body carries a machine-readable `code` from one
+shared taxonomy, and no detail that might hold a URI, content, or credentials
+is echoed.
 
-- **`/admin` needs a long enough `secret_key_base`.** The browser pipeline uses
-  a cookie session store, which refuses a secret under 64 bytes with a 500 before
-  a route is reached. `config/config.exs` sets one of that length for
-  development; a deployment that sets its own must be at least as long.
-- **`POST /api/v1/search` returns 500.** The controller passes the search mode as
-  a string, `AgentDb.search/2` matches on atoms, and the resulting
-  `{:invalid_mode, _}` error is then rendered through `Jason`, which cannot
-  encode a bare tuple — so the intended 422 is itself unreachable. Both defects
-  predate the listener and are not fixed by it.
+| Status | When |
+|--------|------|
+| 400 / 422 | Bad request: `invalid_mode`, `invalid_uri`, `invalid_query`, `invalid_limit`, `not_a_memory_uri`, `is_root`, `missing_argument` |
+| 401 | Auth enabled and the Bearer token is missing or wrong |
+| 404 | `not_found`, `no_memory` |
+| 413 / 429 | `too_large`, `too_many_entries`, `rate_limited` |
+| 503 | `model_loading`, `background_jobs_pending` — retry later |
+| 500 | Server-side: `inference_failed`, `inference_timeout`, `model_load_failed`, `download_failed`, `background_jobs_failed`, `hybrid_leg_timeout` |
+
+```json
+{"error": "invalid_mode", "code": "invalid_mode"}
+```
+
+REST carries `error` and `code`; the WebSocket channel carries `reason` and
+`code`; MCP carries the message plus `data.reason`. `model_loading` stays the
+distinct retry signal on all of them.
+
+`/admin` needs a `secret_key_base` of at least 64 bytes: the browser pipeline
+uses a cookie session store, which refuses a shorter secret with a 500 before a
+route is reached. `config/config.exs` sets one of that length for development;
+a deployment that sets its own must be at least as long.
 
 ### Environment Variables
 

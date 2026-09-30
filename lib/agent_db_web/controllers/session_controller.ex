@@ -4,12 +4,13 @@ defmodule AgentDbWeb.Controllers.SessionController do
   """
   use AgentDbWeb, :controller
 
+  alias AgentDb.Observability
   alias AgentDbWeb.Context
 
   def create(conn, _params) do
     case AgentDb.create_session() do
       {:ok, session_id} -> json(conn, %{session_id: session_id})
-      {:error, _reason} -> conn |> put_status(500) |> json(%{error: "internal_server_error"})
+      {:error, reason} -> transport_error(conn, reason)
     end
   end
 
@@ -18,8 +19,7 @@ defmodule AgentDbWeb.Controllers.SessionController do
   def show(conn, %{"id" => id}) do
     case Context.get_session(id) do
       {:ok, messages} -> json(conn, %{session_id: id, messages: messages})
-      {:error, :not_found} -> conn |> put_status(404) |> json(%{error: "not_found"})
-      {:error, _reason} -> conn |> put_status(500) |> json(%{error: "internal_server_error"})
+      {:error, reason} -> transport_error(conn, reason)
     end
   end
 
@@ -29,14 +29,14 @@ defmodule AgentDbWeb.Controllers.SessionController do
       }) do
     case AgentDb.append_message(id, role(role), content) do
       :ok -> json(conn, %{status: "appended"})
-      {:error, reason} -> conn |> put_status(422) |> json(%{error: describe(reason)})
+      {:error, reason} -> transport_error(conn, reason)
     end
   end
 
   def commit(conn, %{"session_id" => id, "commit" => %{"destination_uri" => destination}}) do
     case AgentDb.commit_session(id, destination) do
       {:ok, result} -> json(conn, %{status: "committed", result: result})
-      {:error, reason} -> conn |> put_status(422) |> json(%{error: describe(reason)})
+      {:error, reason} -> transport_error(conn, reason)
     end
   end
 
@@ -48,7 +48,11 @@ defmodule AgentDbWeb.Controllers.SessionController do
   defp role("system"), do: :system
   defp role(_other), do: :unknown
 
-  defp describe(reason) when is_atom(reason) or is_binary(reason), do: reason
-  defp describe({tag, _detail}) when is_atom(tag), do: tag
-  defp describe(reason), do: inspect(reason)
+  # One rendering for every store error: status from the shared taxonomy, body
+  # always JSON-safe with a machine-readable code, details never echoed.
+  defp transport_error(conn, reason) do
+    conn
+    |> put_status(Observability.http_status(reason))
+    |> json(%{error: Observability.error_message(reason), code: Observability.error_code(reason)})
+  end
 end

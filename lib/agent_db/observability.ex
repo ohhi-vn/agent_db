@@ -213,7 +213,91 @@ defmodule AgentDb.Observability do
   def classify_reason(:not_found), do: :not_found
   def classify_reason(:is_root), do: :is_root
   def classify_reason({:invalid_mode, _}), do: :invalid_mode
+  # Any other tagged reason classifies to its tag, so telemetry and transport
+  # codes stay bounded without enumerating every validation error twice.
+  def classify_reason({tag, _detail}) when is_atom(tag), do: tag
+  def classify_reason(tag) when is_atom(tag), do: tag
   def classify_reason(_), do: :error
+
+  # Caller errors: the request was wrong, so the status is 4xx and the reason
+  # is safe to report verbatim (as its tag). Everything else a transport
+  # serves is either missing (404), temporarily unservable (503), or a
+  # server-side failure (500).
+  @caller_error_tags [
+    :invalid_mode,
+    :invalid_uri,
+    :invalid_query,
+    :invalid_limit,
+    :invalid_document,
+    :invalid_memory,
+    :invalid_memory_type,
+    :invalid_session,
+    :invalid_user_id,
+    :invalid_scope,
+    :invalid_json,
+    :invalid_argument,
+    :not_a_memory_uri,
+    :is_root,
+    :missing_argument,
+    :unknown_event,
+    :unknown_tool,
+    :unsafe_path,
+    :unsupported_entry,
+    :unexpected_entry,
+    :empty
+  ]
+
+  @doc """
+  HTTP status for a store error: 404 for missing, 503 for retryable
+  unavailability, 422/413/429 for caller errors, 401 for authorization, and
+  500 for server-side failures and anything unrecognised.
+  """
+  @spec http_status(term()) :: 400 | 401 | 404 | 413 | 422 | 429 | 500 | 503
+  def http_status(reason) do
+    case error_tag(reason) do
+      tag when tag in [:not_found, :no_memory] -> 404
+      :unauthorized -> 401
+      tag when tag in [:model_loading, :background_jobs_pending] -> 503
+      tag when tag in [:too_large, :too_big, :too_many_entries] -> 413
+      :rate_limited -> 429
+      tag when tag in @caller_error_tags -> 422
+      _ -> 500
+    end
+  end
+
+  @doc """
+  Machine-readable code for a store error: the classified tag as a string,
+  shared by every transport error response and by telemetry/logging.
+
+  The code set is the `classify_reason/1` taxonomy: caller errors
+  (`invalid_mode`, `invalid_uri`, `invalid_query`, `invalid_limit`,
+  `not_a_memory_uri`, `missing_argument`, `unknown_event`, `unknown_tool`,
+  `unsafe_path`, …), missing (`not_found`, `no_memory`), retryable
+  (`model_loading`, `background_jobs_pending`), and server failures
+  (`inference_failed`, `inference_timeout`, `model_load_failed`,
+  `download_failed`, `background_jobs_failed`, `hybrid_leg_timeout`,
+  `hybrid_leg_failed`, …), with anything unrecognised as `"error"`.
+  A new failure mode reuses an existing code or extends the taxonomy;
+  transports never emit free-form text as the only signal.
+  """
+  @spec error_code(term()) :: String.t()
+  def error_code(reason), do: reason |> error_tag() |> Atom.to_string()
+
+  @doc """
+  JSON-safe, detail-free message for a store error, for transport responses.
+
+  Renders the classified tag only, never the detail: details routinely carry
+  URIs, queries, and paths, which must not leak into client-facing payloads.
+  Always encodable (a plain string), so no error term can break an encoder.
+  """
+  @spec error_message(term()) :: String.t()
+  def error_message(:model_loading), do: "model_loading"
+  def error_message(reason) when is_binary(reason), do: reason
+  def error_message(reason), do: Atom.to_string(error_tag(reason))
+
+  defp error_tag({tag, _detail}) when is_atom(tag), do: tag
+  defp error_tag(tag) when is_atom(tag), do: tag
+  defp error_tag(_), do: :error
 
   defp emit_operation(operation, outcome, start, meta) do
     duration = System.monotonic_time(:millisecond) - start

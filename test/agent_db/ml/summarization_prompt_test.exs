@@ -32,7 +32,7 @@ defmodule AgentDb.ML.SummarizationPromptTest do
         Application.delete_env(:agent_db, key)
       end
 
-      FakeServing.Generation.clear_generated_text()
+      FakeServing.clear_generated_text()
       File.rm_rf(cache)
       AgentDb.StorageContract.Helpers.restore_child(ModelManager)
 
@@ -99,7 +99,7 @@ defmodule AgentDb.ML.SummarizationPromptTest do
     test "reasoning is removed and the answer is returned" do
       start_manager(@custom_template)
 
-      FakeServing.Generation.put_generated_text(
+      FakeServing.put_generated_text(
         "<think>The user wants a summary. I will write one.</think>The document is about tests."
       )
 
@@ -109,7 +109,7 @@ defmodule AgentDb.ML.SummarizationPromptTest do
     test "multiline reasoning is removed entirely" do
       start_manager(@custom_template)
 
-      FakeServing.Generation.put_generated_text(
+      FakeServing.put_generated_text(
         "<think>\nfirst thought\nsecond thought\n</think>\n\nThe short answer."
       )
 
@@ -118,7 +118,7 @@ defmodule AgentDb.ML.SummarizationPromptTest do
 
     test "output with no reasoning is returned unchanged" do
       start_manager(@custom_template)
-      FakeServing.Generation.put_generated_text("A plain answer with no reasoning.")
+      FakeServing.put_generated_text("A plain answer with no reasoning.")
 
       assert {:ok, "A plain answer with no reasoning."} = ModelManager.summarize("summarize")
     end
@@ -129,21 +129,21 @@ defmodule AgentDb.ML.SummarizationPromptTest do
       # The model spent its whole token budget reasoning. The reasoning is not
       # a summary, and returning it as one would be worse than failing.
       start_manager(@custom_template)
-      FakeServing.Generation.put_generated_text("<think>still thinking when the budget ran out")
+      FakeServing.put_generated_text("<think>still thinking when the budget ran out")
 
       assert {:error, {:empty_summary, :no_answer}} = ModelManager.summarize("summarize")
     end
 
     test "a closed reasoning block with nothing after it reports an error" do
       start_manager(@custom_template)
-      FakeServing.Generation.put_generated_text("<think>all reasoning, no answer</think>")
+      FakeServing.put_generated_text("<think>all reasoning, no answer</think>")
 
       assert {:error, {:empty_summary, :no_answer}} = ModelManager.summarize("summarize")
     end
 
     test "whitespace alone after reasoning reports an error" do
       start_manager(@custom_template)
-      FakeServing.Generation.put_generated_text("<think>reasoning</think>\n\n   \n")
+      FakeServing.put_generated_text("<think>reasoning</think>\n\n   \n")
 
       assert {:error, {:empty_summary, :no_answer}} = ModelManager.summarize("summarize")
     end
@@ -152,7 +152,7 @@ defmodule AgentDb.ML.SummarizationPromptTest do
       # "" is truthy, so storing it would permanently defeat the first-line
       # fallback in AgentDb.abstract/1.
       start_manager(@custom_template)
-      FakeServing.Generation.put_generated_text("")
+      FakeServing.put_generated_text("")
 
       assert {:error, {:empty_summary, :no_answer}} = ModelManager.summarize("summarize")
     end

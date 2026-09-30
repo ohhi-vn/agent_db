@@ -23,7 +23,7 @@ defmodule AgentDbWeb.Controllers.SearchController do
 
     case Context.search_documents(term, opts) do
       {:ok, results} -> json(conn, %{results: results})
-      {:error, reason} -> conn |> put_status(422) |> json(%{error: describe(reason)})
+      {:error, reason} -> transport_error(conn, reason)
     end
   end
 
@@ -33,11 +33,15 @@ defmodule AgentDbWeb.Controllers.SearchController do
     # document matched by content.
     case Context.list_documents(%{"prefix" => params["term"] || "", "per_page" => 10}) do
       {:ok, %{data: names}} -> json(conn, %{suggestions: names})
-      {:error, _reason} -> conn |> put_status(500) |> json(%{error: "internal_server_error"})
+      {:error, reason} -> transport_error(conn, reason)
     end
   end
 
-  defp describe(reason) when is_atom(reason) or is_binary(reason), do: reason
-  defp describe({tag, _detail}) when is_atom(tag), do: tag
-  defp describe(reason), do: inspect(reason)
+  # One rendering for every store error: status from the shared taxonomy, body
+  # always JSON-safe with a machine-readable code, details never echoed.
+  defp transport_error(conn, reason) do
+    conn
+    |> put_status(Observability.http_status(reason))
+    |> json(%{error: Observability.error_message(reason), code: Observability.error_code(reason)})
+  end
 end

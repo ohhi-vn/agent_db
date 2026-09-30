@@ -8,6 +8,7 @@ defmodule AgentDbWeb.Mcp do
   """
 
   alias AgentDb
+  alias AgentDb.Observability
 
   @protocol_version "2024-11-05"
   @server_name "agent-db"
@@ -17,67 +18,137 @@ defmodule AgentDbWeb.Mcp do
   @spec tools() :: [map()]
   def tools do
     [
-      tool("context_read", "Reads a document's full content (L2).", %{
-        "uri" => %{"type" => "string"}
-      }, ["uri"]),
-      tool("context_write", "Writes a document, creating missing parents.", %{
-        "uri" => %{"type" => "string"},
-        "content" => %{"type" => "string"}
-      }, ["uri", "content"]),
-      tool("context_rm", "Removes the subtree at a URI.", %{
-        "uri" => %{"type" => "string"}
-      }, ["uri"]),
-      tool("context_list", "Lists the direct children of a URI.", %{
-        "uri" => %{"type" => "string"}
-      }, ["uri"]),
-      tool("context_tree", "Depth-limited projection of the tree at a URI.", %{
-        "uri" => %{"type" => "string"},
-        "depth" => %{"type" => "integer"}
-      }, ["uri"]),
-      tool("context_search", "Searches by keyword, vector, or hybrid.", %{
-        "term" => %{"type" => "string"},
-        "mode" => %{"type" => "string"},
-        "scope" => %{"type" => "string"},
-        "top_k" => %{"type" => "integer"}
-      }, ["term"]),
-      tool("context_find", "Discovers paths by literal substring.", %{
-        "term" => %{"type" => "string"},
-        "scope" => %{"type" => "string"},
-        "limit" => %{"type" => "integer"}
-      }, ["term"]),
-      tool("context_grep", "Inspects L2 content lines by literal substring.", %{
-        "term" => %{"type" => "string"},
-        "scope" => %{"type" => "string"},
-        "limit" => %{"type" => "integer"}
-      }, ["term"]),
-      tool("memory_recall", "Reads memories back by URI, type, or term.", %{
-        "uri" => %{"type" => "string"},
-        "type" => %{"type" => "string"},
-        "term" => %{"type" => "string"},
-        "include_superseded" => %{"type" => "boolean"}
-      }, []),
-      tool("memory_remember", "Records a durable fact as a memory.", %{
-        "uri" => %{"type" => "string"},
-        "value" => %{"type" => "string"},
-        "confidence" => %{"type" => "number"},
-        "source" => %{"type" => "string"}
-      }, ["uri", "value"]),
-      tool("memory_forget", "Removes a memory and its provenance.", %{
-        "uri" => %{"type" => "string"}
-      }, ["uri"]),
+      tool(
+        "context_read",
+        "Reads a document's full content (L2).",
+        %{
+          "uri" => %{"type" => "string"}
+        },
+        ["uri"]
+      ),
+      tool(
+        "context_write",
+        "Writes a document, creating missing parents.",
+        %{
+          "uri" => %{"type" => "string"},
+          "content" => %{"type" => "string"}
+        },
+        ["uri", "content"]
+      ),
+      tool(
+        "context_rm",
+        "Removes the subtree at a URI.",
+        %{
+          "uri" => %{"type" => "string"}
+        },
+        ["uri"]
+      ),
+      tool(
+        "context_list",
+        "Lists the direct children of a URI.",
+        %{
+          "uri" => %{"type" => "string"}
+        },
+        ["uri"]
+      ),
+      tool(
+        "context_tree",
+        "Depth-limited projection of the tree at a URI.",
+        %{
+          "uri" => %{"type" => "string"},
+          "depth" => %{"type" => "integer"}
+        },
+        ["uri"]
+      ),
+      tool(
+        "context_search",
+        "Searches by keyword, vector, or hybrid.",
+        %{
+          "term" => %{"type" => "string"},
+          "mode" => %{"type" => "string"},
+          "scope" => %{"type" => "string"},
+          "top_k" => %{"type" => "integer"}
+        },
+        ["term"]
+      ),
+      tool(
+        "context_find",
+        "Discovers paths by literal substring.",
+        %{
+          "term" => %{"type" => "string"},
+          "scope" => %{"type" => "string"},
+          "limit" => %{"type" => "integer"}
+        },
+        ["term"]
+      ),
+      tool(
+        "context_grep",
+        "Inspects L2 content lines by literal substring.",
+        %{
+          "term" => %{"type" => "string"},
+          "scope" => %{"type" => "string"},
+          "limit" => %{"type" => "integer"}
+        },
+        ["term"]
+      ),
+      tool(
+        "memory_recall",
+        "Reads memories back by URI, type, or term.",
+        %{
+          "uri" => %{"type" => "string"},
+          "type" => %{"type" => "string"},
+          "term" => %{"type" => "string"},
+          "include_superseded" => %{"type" => "boolean"}
+        },
+        []
+      ),
+      tool(
+        "memory_remember",
+        "Records a durable fact as a memory.",
+        %{
+          "uri" => %{"type" => "string"},
+          "value" => %{"type" => "string"},
+          "confidence" => %{"type" => "number"},
+          "source" => %{"type" => "string"}
+        },
+        ["uri", "value"]
+      ),
+      tool(
+        "memory_forget",
+        "Removes a memory and its provenance.",
+        %{
+          "uri" => %{"type" => "string"}
+        },
+        ["uri"]
+      ),
       tool("session_create", "Creates a session and returns its id.", %{}, []),
-      tool("session_append", "Appends a message to a session.", %{
-        "session_id" => %{"type" => "string"},
-        "role" => %{"type" => "string"},
-        "content" => %{"type" => "string"}
-      }, ["session_id", "role", "content"]),
-      tool("session_get", "Returns every message of a session, in order.", %{
-        "session_id" => %{"type" => "string"}
-      }, ["session_id"]),
-      tool("session_commit", "Commits a session into the tree at a URI.", %{
-        "session_id" => %{"type" => "string"},
-        "destination_uri" => %{"type" => "string"}
-      }, ["session_id", "destination_uri"]),
+      tool(
+        "session_append",
+        "Appends a message to a session.",
+        %{
+          "session_id" => %{"type" => "string"},
+          "role" => %{"type" => "string"},
+          "content" => %{"type" => "string"}
+        },
+        ["session_id", "role", "content"]
+      ),
+      tool(
+        "session_get",
+        "Returns every message of a session, in order.",
+        %{
+          "session_id" => %{"type" => "string"}
+        },
+        ["session_id"]
+      ),
+      tool(
+        "session_commit",
+        "Commits a session into the tree at a URI.",
+        %{
+          "session_id" => %{"type" => "string"},
+          "destination_uri" => %{"type" => "string"}
+        },
+        ["session_id", "destination_uri"]
+      ),
       tool("store_health", "Store health, model status, and queue depth.", %{}, [])
     ]
   end
@@ -134,7 +205,9 @@ defmodule AgentDbWeb.Mcp do
         error(id, -32_001, "model_loading")
 
       {:error, reason} ->
-        error(id, -32_000, render_message(reason))
+        error(id, -32_000, render_message(reason), %{
+          "reason" => Observability.error_code(reason)
+        })
     end
   end
 
@@ -338,6 +411,13 @@ defmodule AgentDbWeb.Mcp do
   defp error(id, code, message),
     do: %{"jsonrpc" => "2.0", "id" => id, "error" => %{"code" => code, "message" => message}}
 
+  defp error(id, code, message, data),
+    do: %{
+      "jsonrpc" => "2.0",
+      "id" => id,
+      "error" => %{"code" => code, "message" => message, "data" => data}
+    }
+
   defp required(args, key) do
     case args[key] do
       nil -> {:error, {:missing_argument, key}}
@@ -371,9 +451,7 @@ defmodule AgentDbWeb.Mcp do
   defp append_role("system"), do: :system
   defp append_role(_other), do: :unknown
 
-  defp render_message(:model_loading), do: "model_loading"
-  defp render_message(reason) when is_atom(reason), do: Atom.to_string(reason)
-  defp render_message(reason) when is_binary(reason), do: reason
-  defp render_message({tag, detail}) when is_atom(tag), do: "#{tag}: #{render_message(detail)}"
-  defp render_message(reason), do: inspect(reason)
+  # Store errors share the taxonomy message every other transport renders:
+  # the classified tag only, never details that may carry URIs or content.
+  defp render_message(reason), do: Observability.error_message(reason)
 end

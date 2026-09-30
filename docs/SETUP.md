@@ -46,6 +46,7 @@ All values below match `lib/agent_db/application.ex` and
 | `job_workers` | `AGENT_DB_JOB_WORKERS` | CPU cores (`System.schedulers_online()`); must be a positive integer |
 | `exla_backend` | `AGENT_DB_EXLA_BACKEND` | `cpu` (`cpu` \| `cuda` \| `rocm`; anything else → `:cpu`) |
 | `ml_backend` | `AGENT_DB_ML_BACKEND` | `auto` (`auto` \| `exla` \| `emlx`; anything else → `:auto`) |
+| `inference_concurrency` | — (Application env only) | CPU cores; how many inference runs may be in flight at once, past which a caller runs inline |
 | `inference_provider` | — (Application env `:inference_provider`) | `:local` (`:local` \| `:ollama` \| `:openai_compatible` \| custom module) |
 | `ollama_base_url` | `AGENT_DB_OLLAMA_URL` | `http://localhost:11434` |
 | `ollama_embed_model` / `ollama_llm_model` | Application env only | `nomic-embed-text` / `llama3.1` |

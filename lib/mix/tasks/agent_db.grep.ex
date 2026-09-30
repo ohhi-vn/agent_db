@@ -47,7 +47,7 @@ defmodule Mix.Tasks.AgentDb.Grep do
         end
 
       {:error, reason} ->
-        Mix.raise("Grep failed: #{inspect(reason)}")
+        Mix.raise("Grep failed: #{AgentDb.Observability.error_message(reason)}")
     end
   end
 

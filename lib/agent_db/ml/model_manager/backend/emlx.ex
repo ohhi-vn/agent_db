@@ -16,58 +16,33 @@ defmodule AgentDb.ML.ModelManager.Backend.Emlx do
   alias AgentDb.ML.ModelManager.Backend.Exla
 
   @impl true
-  def load_embedding(config) do
-    with :ok <- ensure_available() do
-      loader = config.loader
-
-      with {:ok, tokenizer} <- loader.load_tokenizer({:hf, config.embedding_model}),
-           {:ok, %{model: model, spec: spec}} <-
-             loader.load_model({:hf, config.embedding_model}, backend: emlx_backend_spec()) do
-        {:ok,
-         %{
-           tokenizer: tokenizer,
-           model: model,
-           spec: spec,
-           serving: loader.serving(:embedding),
-           chat_template: config.llm_chat_template,
-           backend: :emlx
-         }}
-      else
-        {:error, reason} ->
-          Logger.warning("EMLX embedding load failed, falling back: #{inspect(reason)}")
-          {:error, reason}
-
-        unexpected ->
-          {:error, {:model_load_failed, unexpected}}
-      end
-    end
-  rescue
-    error -> {:error, {:emlx_unavailable, error}}
-  catch
-    :exit, reason -> {:error, {:emlx_unavailable, {:exit, reason}}}
-    :throw, value -> {:error, {:emlx_unavailable, {:throw, value}}}
-  end
+  def load_embedding(config), do: load(config, :embedding, config.embedding_model)
 
   @impl true
-  def load_llm(config) do
+  def load_llm(config), do: load(config, :llm, config.llm_model)
+
+  # The serving is built from the same model_info EXLA builds it from, so both
+  # backends run identical inference; only the backend the weights were placed
+  # on differs, which the rewrite below applies to.
+  defp load(config, role, model_id) do
     with :ok <- ensure_available() do
       loader = config.loader
 
-      with {:ok, tokenizer} <- loader.load_tokenizer({:hf, config.llm_model}),
-           {:ok, %{model: model, spec: spec}} <-
-             loader.load_model({:hf, config.llm_model}, backend: emlx_backend_spec()) do
+      with {:ok, tokenizer} <- loader.load_tokenizer({:hf, model_id}),
+           {:ok, model_info} <- loader.load_model({:hf, model_id}, backend: emlx_backend_spec()),
+           {:ok, serving} <- build_serving(loader, role, model_info, tokenizer, model_id) do
         {:ok,
          %{
            tokenizer: tokenizer,
-           model: model |> maybe_rewrite(),
-           spec: spec,
-           serving: loader.serving(:llm),
+           model_info: maybe_rewrite(model_info),
+           serving: serving,
+           runner: loader,
            chat_template: config.llm_chat_template,
            backend: :emlx
          }}
       else
         {:error, reason} ->
-          Logger.warning("EMLX LLM load failed, falling back: #{inspect(reason)}")
+          Logger.warning("EMLX #{role} load failed, falling back: #{inspect(reason)}")
           {:error, reason}
 
         unexpected ->
@@ -80,6 +55,13 @@ defmodule AgentDb.ML.ModelManager.Backend.Emlx do
     :exit, reason -> {:error, {:emlx_unavailable, {:exit, reason}}}
     :throw, value -> {:error, {:emlx_unavailable, {:throw, value}}}
   end
+
+  defp build_serving(loader, role, model_info, tokenizer, model_id) do
+    model_info = Map.put(model_info, :repository, {:hf, model_id})
+    loader.build_serving(role, model_info, tokenizer, generation_config())
+  end
+
+  defp generation_config, do: [max_new_tokens: 256, temperature: 0.7, top_p: 0.9, batch_size: 1]
 
   @impl true
   def embed(model_ref, texts), do: Exla.embed(model_ref, texts)
@@ -92,17 +74,19 @@ defmodule AgentDb.ML.ModelManager.Backend.Emlx do
 
   defp emlx_backend_spec, do: :emlx
 
-  defp maybe_rewrite(model) do
+  # The rewrite applies to the Axon model inside the model_info, which is what
+  # the serving is later built from.
+  defp maybe_rewrite(model_info) do
     if Code.ensure_loaded?(EMLXAxon) and function_exported?(EMLXAxon, :rewrite, 1) do
       try do
-        apply(EMLXAxon, :rewrite, [model])
+        Map.update!(model_info, :model, &apply(EMLXAxon, :rewrite, [&1]))
       rescue
-        _ -> model
+        _ -> model_info
       catch
-        _, _ -> model
+        _, _ -> model_info
       end
     else
-      model
+      model_info
     end
   end
 

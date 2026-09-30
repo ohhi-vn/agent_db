@@ -12,18 +12,22 @@ defmodule AgentDbWeb.SubscriptionChannelTest do
     do: Channel.handle_in(name, params, socket)
 
   test "v1.subscribe receives versioned notifications" do
-    assert {:reply, {:ok, _}, _} = event("v1.subscribe", %{"uri" => "viking://resources/chan-sub/project"})
+    assert {:reply, {:ok, _}, _} =
+             event("v1.subscribe", %{"uri" => "viking://resources/chan-sub/project"})
 
     :ok = AgentDb.write("viking://resources/chan-sub/project/a.md", "hello")
 
-    assert_receive {:context_changed, "viking://resources/chan-sub/project/a.md", :written, v}, 1_000
+    assert_receive {:context_changed, "viking://resources/chan-sub/project/a.md", :written, v},
+                   1_000
+
     assert is_integer(v)
 
-    assert {:reply, {:ok, _}, _} = event("v1.unsubscribe", %{"uri" => "viking://resources/chan-sub/project"})
+    assert {:reply, {:ok, _}, _} =
+             event("v1.unsubscribe", %{"uri" => "viking://resources/chan-sub/project"})
   end
 
   test "invalid subscription leaves the channel usable" do
-    assert {:reply, {:error, %{reason: :invalid_uri}}, socket} =
+    assert {:reply, {:error, %{reason: "invalid_uri", code: "invalid_uri"}}, socket} =
              event("v1.subscribe", %{"uri" => "bad"})
 
     assert {:reply, {:ok, _}, _} =
@@ -46,7 +50,12 @@ defmodule AgentDbWeb.SubscriptionChannelTest do
            ]
 
     assert is_list(results)
-    assert Enum.any?(results, &(&1[:uri] == "viking://resources/chan-prog/a.md" or &1.uri == "viking://resources/chan-prog/a.md"))
+
+    assert Enum.any?(
+             results,
+             &(&1[:uri] == "viking://resources/chan-prog/a.md" or
+                 &1.uri == "viking://resources/chan-prog/a.md")
+           )
   end
 
   test "progress failure does not break the call" do

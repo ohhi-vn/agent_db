@@ -93,10 +93,14 @@ defmodule AgentDb.ML.BumblebeeLoaderTest do
     end
   end
 
-  describe "serving/1" do
-    test "maps roles to Bumblebee serving modules" do
-      assert BumblebeeLoader.serving(:embedding) == Bumblebee.Text.TextEmbedding
-      assert BumblebeeLoader.serving(:llm) == Bumblebee.Text.Generation
+  describe "run/2" do
+    # Building a real serving needs real weights, which this suite does not
+    # load; the loader is exercised through the fake in the backend tests and
+    # end-to-end against the cached model outside the suite.
+    test "reports a run failure as an error rather than raising" do
+      # A map that is not a serving: what a loader bug or a bad build would
+      # hand over. The contract is an error tuple, never a raise.
+      assert {:error, {:inference_failed, _}} = BumblebeeLoader.run(%{not: :a_serving}, "hi")
     end
   end
 end

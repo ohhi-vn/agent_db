@@ -38,7 +38,7 @@ defmodule Mix.Tasks.AgentDb.Read do
         end
 
       {:error, reason} ->
-        Mix.raise("Read failed: #{inspect(reason)}")
+        Mix.raise("Read failed: #{AgentDb.Observability.error_message(reason)}")
     end
   end
 end

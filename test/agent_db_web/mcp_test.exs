@@ -28,7 +28,8 @@ defmodule AgentDbWeb.McpTest do
 
   describe "handshake and inventory" do
     test "initialize answers with protocol version and server info" do
-      response = Mcp.handle_request(%{"jsonrpc" => "2.0", "id" => 1, "method" => "initialize"}, [])
+      response =
+        Mcp.handle_request(%{"jsonrpc" => "2.0", "id" => 1, "method" => "initialize"}, [])
 
       assert %{
                "jsonrpc" => "2.0",
@@ -44,7 +45,9 @@ defmodule AgentDbWeb.McpTest do
     end
 
     test "tools/list exposes the full read-write inventory" do
-      response = Mcp.handle_request(%{"jsonrpc" => "2.0", "id" => 1, "method" => "tools/list"}, [])
+      response =
+        Mcp.handle_request(%{"jsonrpc" => "2.0", "id" => 1, "method" => "tools/list"}, [])
+
       names = response["result"]["tools"] |> Enum.map(& &1["name"])
 
       for expected <- ~w(context_read context_write context_rm context_list context_tree
@@ -108,7 +111,9 @@ defmodule AgentDbWeb.McpTest do
 
     test "keyword search answers with results" do
       uri = "viking://resources/mcp/searchable.md"
-      assert %{"result" => _} = call("context_write", %{"uri" => uri, "content" => "mcp-search-token"})
+
+      assert %{"result" => _} =
+               call("context_write", %{"uri" => uri, "content" => "mcp-search-token"})
 
       assert %{"result" => %{"content" => [%{"text" => text}]}} =
                call("context_search", %{"term" => "mcp-search-token", "mode" => "keyword"})
@@ -180,11 +185,14 @@ defmodule AgentDbWeb.McpTest do
 
   describe "errors stay JSON-safe and the session stays usable" do
     test "an unservable call returns a string message and the next call succeeds" do
-      assert %{"error" => %{"code" => code, "message" => message}} =
+      assert %{
+               "error" => %{"code" => code, "message" => message, "data" => %{"reason" => reason}}
+             } =
                call("context_search", %{"term" => "x", "mode" => "bogus-mode"})
 
       assert is_integer(code)
       assert is_binary(message)
+      assert is_binary(reason)
 
       assert %{"result" => %{"tools" => _}} =
                Mcp.handle_request(
@@ -194,7 +202,7 @@ defmodule AgentDbWeb.McpTest do
     end
 
     test "missing arguments and unknown tools are JSON errors with string messages" do
-      assert %{"error" => %{"code" => -32000, "message" => "missing_argument: uri"}} =
+      assert %{"error" => %{"code" => -32000, "message" => "missing_argument"}} =
                call("context_read", %{})
 
       assert %{"error" => %{"code" => code, "message" => message}} =
@@ -243,8 +251,12 @@ defmodule AgentDbWeb.McpTest do
 
   defp call(name, args, id \\ 1) do
     Mcp.handle_request(
-      %{"jsonrpc" => "2.0", "id" => id, "method" => "tools/call",
-        "params" => %{"name" => name, "arguments" => args}},
+      %{
+        "jsonrpc" => "2.0",
+        "id" => id,
+        "method" => "tools/call",
+        "params" => %{"name" => name, "arguments" => args}
+      },
       []
     )
   end
@@ -284,8 +296,8 @@ defmodule AgentDbWeb.McpTest do
         {"content-length", Integer.to_string(byte_size(body))},
         {"connection", "close"}
       ] ++
-        (if token = opts[:token], do: [{"authorization", "Bearer #{token}"}], else: []) ++
-        (if trace = opts[:traceparent], do: [{"traceparent", trace}], else: [])
+        if(token = opts[:token], do: [{"authorization", "Bearer #{token}"}], else: []) ++
+        if trace = opts[:traceparent], do: [{"traceparent", trace}], else: []
 
     head =
       ["POST /mcp HTTP/1.1" | Enum.map(headers, fn {k, v} -> "#{k}: #{v}" end)]

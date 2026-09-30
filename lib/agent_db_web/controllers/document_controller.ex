@@ -15,36 +15,35 @@ defmodule AgentDbWeb.Controllers.DocumentController do
   def index(conn, params) do
     case Context.list_documents(params) do
       {:ok, page} -> json(conn, page)
-      {:error, _reason} -> server_error(conn)
+      {:error, reason} -> transport_error(conn, reason)
     end
   end
 
   def show(conn, %{"id" => uri}) do
     case Context.get_document(uri) do
       {:ok, content} -> json(conn, %{uri: uri, content: content})
-      {:error, :not_found} -> not_found(conn)
-      {:error, _reason} -> server_error(conn)
+      {:error, reason} -> transport_error(conn, reason)
     end
   end
 
   def create(conn, %{"document" => %{"uri" => uri, "content" => content} = params}) do
     case Context.put_document(uri, content, with_trace(document_opts(params), conn)) do
       :ok -> conn |> put_status(201) |> json(%{status: "created", uri: uri})
-      {:error, reason} -> unprocessable(conn, reason)
+      {:error, reason} -> transport_error(conn, reason)
     end
   end
 
   def update(conn, %{"id" => uri, "document" => %{"content" => content} = params}) do
     case Context.put_document(uri, content, with_trace(document_opts(params), conn)) do
       :ok -> json(conn, %{status: "updated", uri: uri})
-      {:error, reason} -> unprocessable(conn, reason)
+      {:error, reason} -> transport_error(conn, reason)
     end
   end
 
   def delete(conn, %{"id" => uri}) do
     case Context.delete_document(uri) do
       :ok -> json(conn, %{status: "deleted", uri: uri})
-      {:error, reason} -> unprocessable(conn, reason)
+      {:error, reason} -> transport_error(conn, reason)
     end
   end
 
@@ -65,17 +64,11 @@ defmodule AgentDbWeb.Controllers.DocumentController do
     end
   end
 
-  defp not_found(conn), do: conn |> put_status(404) |> json(%{error: "not_found"})
-
-  defp unprocessable(conn, reason),
-    do: conn |> put_status(422) |> json(%{error: describe(reason)})
-
-  defp server_error(conn), do: conn |> put_status(500) |> json(%{error: "internal_server_error"})
-
-  # A reason is rendered as something JSON can hold. An atom or string is used
-  # as it is; a tagged reason keeps its tag, which is the part a client acts
-  # on.
-  defp describe(reason) when is_atom(reason) or is_binary(reason), do: reason
-  defp describe({tag, _detail}) when is_atom(tag), do: tag
-  defp describe(reason), do: inspect(reason)
+  # One rendering for every store error: status from the shared taxonomy, body
+  # always JSON-safe with a machine-readable code, details never echoed.
+  defp transport_error(conn, reason) do
+    conn
+    |> put_status(Observability.http_status(reason))
+    |> json(%{error: Observability.error_message(reason), code: Observability.error_code(reason)})
+  end
 end

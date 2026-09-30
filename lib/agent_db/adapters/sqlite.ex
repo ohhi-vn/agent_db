@@ -61,16 +61,10 @@ defmodule AgentDb.Adapters.SQLite do
     end
   end
 
-  defp enqueue_jobs(_conn, []), do: :ok
-
-  defp enqueue_jobs(conn, jobs) do
-    Enum.reduce_while(jobs, :ok, fn {kind, payload}, :ok ->
-      case JobQueue.enqueue(conn, kind, payload) do
-        {:ok, _id} -> {:cont, :ok}
-        {:error, _} = err -> {:halt, err}
-      end
-    end)
-  end
+  # One statement for the whole family a write enqueues: the jobs are inserted
+  # inside the caller's transaction either way, so this changes the number of
+  # statements, not what a successful write guarantees.
+  defp enqueue_jobs(conn, jobs), do: JobQueue.enqueue_many(conn, jobs)
 
   @impl true
   def list_children(uri) do
@@ -167,12 +161,7 @@ defmodule AgentDb.Adapters.SQLite do
   # The same work a write enqueues, so an imported file is searchable and
   # summarized on the same terms as any other document.
   defp enqueue_skill_work(conn, uri, content) do
-    Enum.reduce_while(JobQueue.all_kinds(), :ok, fn kind, :ok ->
-      case JobQueue.enqueue(conn, kind, %{uri: uri, content: content}) do
-        {:ok, _job} -> {:cont, :ok}
-        {:error, _} = err -> {:halt, err}
-      end
-    end)
+    JobQueue.enqueue_many(conn, Enum.map(JobQueue.all_kinds(), &{&1, %{uri: uri, content: content}}))
   end
 
   # -- results of background inference --
@@ -213,7 +202,19 @@ defmodule AgentDb.Adapters.SQLite do
     end
   end
 
+  # Embedding is computed successfully but there may be nowhere to put it: the
+  # vec table exists only with the sqlite-vec extension. The work is finished,
+  # its result is simply not wanted, so the job completes rather than failing
+  # and retrying an outcome that can never differ.
   defp store_embedding(conn, job_id, uri, embedding) do
+    if SQLite.vec_available?(conn) do
+      insert_embedding(conn, job_id, uri, embedding)
+    else
+      discard(conn, job_id)
+    end
+  end
+
+  defp insert_embedding(conn, job_id, uri, embedding) do
     result =
       SQLite.exec_write(
         conn,
@@ -282,7 +283,19 @@ defmodule AgentDb.Adapters.SQLite do
     Reader.read(fn conn -> vector_search(conn, query, top_k, scope_prefix) end)
   end
 
+  # The vec table exists only when the sqlite-vec extension loaded, and a
+  # query against it without the extension fails with the engine's own SQL
+  # error text. That is not a reason a caller can act on, so the leg reports
+  # itself as unservable instead.
   defp vector_search(conn, query, top_k, scope_prefix) do
+    if SQLite.vec_available?(conn) do
+      run_vector_search(conn, query, top_k, scope_prefix)
+    else
+      {:error, :vector_index_unavailable}
+    end
+  end
+
+  defp run_vector_search(conn, query, top_k, scope_prefix) do
     base_query = """
       SELECT n.uri, n.parent_uri, n.name, n.kind, n.content, n.abstract, n.overview,
              vec_distance_cosine(v.embedding, ?1) as distance

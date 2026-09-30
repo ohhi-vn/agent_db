@@ -63,6 +63,38 @@ defmodule AgentDb.JobQueue do
   end
 
   @doc """
+  Enqueues several jobs with one INSERT on a connection the caller holds.
+
+  A write always enqueues its whole family (embed plus summaries) in one
+  transaction, so one statement replaces one per kind. Row ids are not
+  returned; callers that need them keep using `enqueue/3`.
+  """
+  @spec enqueue_many(SQLite.conn(), [{kind(), payload()}]) :: :ok | {:error, term()}
+  def enqueue_many(_conn, []), do: :ok
+
+  def enqueue_many(conn, jobs) do
+    now = System.system_time(:millisecond)
+
+    {placeholders, args} =
+      jobs
+      |> Enum.with_index()
+      |> Enum.map(fn {{kind, payload}, i} ->
+        base = i * 3 + 1
+
+        {"(?#{base}, ?#{base + 1}, 'pending', ?#{base + 2}, ?#{base + 2}, ?#{base + 2})",
+         [to_string(kind), Jason.encode!(payload), now]}
+      end)
+      |> Enum.unzip()
+
+    SQLite.exec_write(
+      conn,
+      "INSERT INTO job_queue (kind, payload, status, scheduled_at, created_at, updated_at) VALUES " <>
+        Enum.join(placeholders, ", "),
+      List.flatten(args)
+    )
+  end
+
+  @doc """
   Claims the next runnable job of one of `kinds` and advances its attempt count.
 
   A worker claims only the work it can run. Without the filter, a worker would

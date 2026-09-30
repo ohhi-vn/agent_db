@@ -276,7 +276,7 @@ defmodule AgentDb.Application.Documents do
     Observability.timed(:tree, %{}, fn ->
       with {:ok, segments} <- VikingURI.parse(uri),
            {:ok, node} <- fetch_entry(segments) do
-        project(node, depth)
+        project(segments, node, depth)
       end
     end)
   end
@@ -286,43 +286,33 @@ defmodule AgentDb.Application.Documents do
 
   # Depth 1 is the node's own direct children, by name. Deeper is one level of
   # entries, each expanded by the depth that remains.
-  defp project(node, depth) do
+  #
+  # The node's parsed segments travel with the projection rather than being
+  # re-parsed from the URI at every level: a projection walks a subtree, so
+  # re-parsing made a per-child cost out of work the caller already did.
+  defp project(segments, node, depth) do
     case list(node.uri) do
-      {:ok, names} -> {:ok, Map.put(entry(node), :children, children(node, names, depth))}
+      {:ok, names} -> {:ok, Map.put(entry(node), :children, children(segments, names, depth))}
       {:error, :not_found} -> {:ok, Map.put(entry(node), :children, [])}
       {:error, _} = err -> err
     end
   end
 
-  defp children(_node, names, 1), do: names
+  defp children(_segments, names, 1), do: names
 
-  defp children(%{uri: uri}, names, depth) do
+  defp children(segments, names, depth) do
     Enum.map(names, fn name ->
-      case descend(uri, name) do
-        {:ok, child_node} ->
-          case project(child_node, depth - 1) do
-            {:ok, projected} -> projected
-            {:error, _} -> entry(child_node)
-          end
-
-        {:error, _} ->
-          %{name: name, uri: child_uri(uri, name), type: :missing}
+      with {:ok, child_segments} <- VikingURI.join(segments, name),
+           {:ok, child_node} <- fetch(child_segments) do
+        case project(child_segments, child_node, depth - 1) do
+          {:ok, projected} -> projected
+          {:error, _} -> entry(child_node)
+        end
+      else
+        # A name listed by a directory that has since lost the node behind it.
+        _unreachable -> %{name: name, uri: nil, type: :missing}
       end
     end)
-  end
-
-  defp descend(parent_uri, name) do
-    with {:ok, segments} <- VikingURI.parse(parent_uri),
-         {:ok, child_segments} <- VikingURI.join(segments, name) do
-      fetch(child_segments)
-    end
-  end
-
-  defp child_uri(parent_uri, name) do
-    case descend(parent_uri, name) do
-      {:ok, node} -> node.uri
-      {:error, _} -> nil
-    end
   end
 
   defp entry(%{kind: :dir} = node), do: %{name: node.name, uri: node.uri, type: :dir}

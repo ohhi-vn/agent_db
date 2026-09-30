@@ -16,19 +16,19 @@ defmodule AgentDb.ML.ModelManager.Backend.Exla do
   @impl true
   def load_llm(config), do: load_model(config, config.llm_model, :llm)
 
+  # The serving L2-normalizes during the run (`embedding_processor` in
+  # `build_serving/4`), so each tensor is already the unit vector the vector
+  # index stores. The serving reports it under `:embedding`; the store's
+  # contract is a bare list of tensors.
   @impl true
   def embed(model_ref, texts) do
-    tokenizer = model_ref.tokenizer
-    model = model_ref.model
-    serving = model_ref.serving
-
-    with {:ok, inputs} <- serving.tokenize(tokenizer, texts),
-         {:ok, outputs} <- serving.generate(model, inputs, &pool/1) do
+    with {:ok, result} <- run(model_ref, texts) do
       embeddings =
-        Enum.map(outputs, fn output ->
-          tensor = Nx.tensor(output.embedding)
-          norm = Nx.sqrt(Nx.sum(Nx.pow(tensor, 2)))
-          Nx.divide(tensor, norm)
+        result
+        |> List.wrap()
+        |> Enum.map(fn
+          %{embedding: embedding} -> embedding
+          tensor -> tensor
         end)
 
       {:ok, embeddings}
@@ -37,45 +37,44 @@ defmodule AgentDb.ML.ModelManager.Backend.Exla do
 
   @impl true
   def summarize(model_ref, prompt, opts) do
-    tokenizer = model_ref.tokenizer
-    model = model_ref.model
-    serving = model_ref.serving
-    max_tokens = Keyword.get(opts, :max_tokens, 256)
-    temperature = Keyword.get(opts, :temperature, 0.7)
     formatted = String.replace(model_ref.chat_template, "%{prompt}", prompt)
 
-    with {:ok, inputs} <- serving.tokenize(tokenizer, formatted),
-         {:ok, outputs} <-
-           serving.generate(model, inputs, %{
-             max_tokens: max_tokens,
-             temperature: temperature,
-             top_p: 0.9,
-             return_probabilities: false
-           }) do
-      outputs
-      |> List.first()
-      |> Map.get(:text, "")
-      |> strip_reasoning()
+    with {:ok, result} <- run(model_ref, formatted),
+         {:ok, text} <- text(result) do
+      strip_reasoning(text)
+    end
+  end
+
+  # A serving built from several inputs answers with the per-input list, one
+  # text from the first result.
+  defp text(%{results: [%{text: text} | _]}), do: {:ok, text}
+  defp text([%{text: text} | _]), do: {:ok, text}
+  defp text(%{text: text}), do: {:ok, text}
+  defp text(_other), do: {:error, {:empty_summary, :no_answer}}
+
+  defp run(model_ref, input) do
+    case model_ref.runner.run(model_ref.serving, input) do
+      {:ok, result} -> {:ok, result}
+      {:error, _} = err -> err
     end
   end
 
   @impl true
   def model_info, do: %{backend: :exla}
 
-  defp pool(embedding), do: Nx.to_flat_list(Nx.mean(embedding, axes: [1]))
-
   defp load_model(config, model_id, role) do
     loader = config.loader
+    repository = {:hf, model_id}
 
-    with {:ok, tokenizer} <- loader.load_tokenizer({:hf, model_id}),
-         {:ok, %{model: model, spec: spec}} <-
-           loader.load_model({:hf, model_id}, backend: config.exla_backend) do
+    with {:ok, tokenizer} <- loader.load_tokenizer(repository),
+         {:ok, model_info} <- loader.load_model(repository, backend: config.exla_backend),
+         {:ok, serving} <- build_serving(loader, role, model_info, tokenizer, model_id) do
       {:ok,
        %{
          tokenizer: tokenizer,
-         model: model,
-         spec: spec,
-         serving: loader.serving(role),
+         model_info: model_info,
+         serving: serving,
+         runner: loader,
          chat_template: config.llm_chat_template,
          backend: :exla
        }}
@@ -101,6 +100,20 @@ defmodule AgentDb.ML.ModelManager.Backend.Exla do
       Logger.error("Threw while loading #{inspect(role)} model: #{inspect(value)}")
       {:error, wrap({:throw, value})}
   end
+
+  # The generation config is read from the same repository as the weights, which
+  # the loader knows and a model_info map does not carry.
+  defp build_serving(loader, role, model_info, tokenizer, model_id) do
+    model_info = Map.put(model_info, :repository, {:hf, model_id})
+
+    loader.build_serving(role, model_info, tokenizer, generation_config())
+  end
+
+  # Generation settings are fixed when the serving is built rather than per call:
+  # Bumblebee bakes them into the serving. The only caller passes the same
+  # values, so nothing is lost and one serving serves every summarization.
+  defp generation_config,
+    do: [max_new_tokens: 256, temperature: 0.7, top_p: 0.9, batch_size: 1]
 
   defp wrap({:download_failed, _} = r), do: r
   defp wrap({:model_not_found, _} = r), do: r

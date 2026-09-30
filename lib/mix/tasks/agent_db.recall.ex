@@ -51,7 +51,7 @@ defmodule Mix.Tasks.AgentDb.Recall do
         end
 
       {:error, reason} ->
-        Mix.raise("Recall failed: #{inspect(reason)}")
+        Mix.raise("Recall failed: #{AgentDb.Observability.error_message(reason)}")
     end
   end
 

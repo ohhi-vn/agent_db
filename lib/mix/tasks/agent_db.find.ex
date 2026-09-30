@@ -45,7 +45,7 @@ defmodule Mix.Tasks.AgentDb.Find do
         end
 
       {:error, reason} ->
-        Mix.raise("Find failed: #{inspect(reason)}")
+        Mix.raise("Find failed: #{AgentDb.Observability.error_message(reason)}")
     end
   end
 
