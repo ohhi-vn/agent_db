@@ -22,6 +22,7 @@ defmodule AgentDb.ML.ModelManager.State do
           llm_model: model_ref() | nil,
           loading: %{optional(:embedding) => load_status(), optional(:llm) => load_status()},
           loading_ref: loading_ref(),
+          last_latency_ms: %{optional(:embedding | :llm) => non_neg_integer()},
           config: map()
         }
 
@@ -29,5 +30,6 @@ defmodule AgentDb.ML.ModelManager.State do
             llm_model: nil,
             loading: %{embedding: :idle, llm: :idle},
             loading_ref: %{},
+            last_latency_ms: %{},
             config: %{}
 end

@@ -8,12 +8,20 @@ defmodule AgentDbWeb.Controllers.SearchController do
   """
   use AgentDbWeb, :controller
 
+  alias AgentDb.Observability
   alias AgentDbWeb.Context
 
   def search(conn, params) do
     term = params["term"]
+    opts = %{"mode" => params["mode"], "top_k" => params["top_k"]}
 
-    case Context.search_documents(term, %{"mode" => params["mode"], "top_k" => params["top_k"]}) do
+    opts =
+      case Observability.from_conn(conn) do
+        nil -> opts
+        ctx -> Map.put(opts, "trace_context", ctx)
+      end
+
+    case Context.search_documents(term, opts) do
       {:ok, results} -> json(conn, %{results: results})
       {:error, reason} -> conn |> put_status(422) |> json(%{error: describe(reason)})
     end

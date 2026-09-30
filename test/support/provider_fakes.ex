@@ -103,9 +103,38 @@ defmodule AgentDb.Test.Fakes.Storage do
   @impl true
   def put_document(uri, content, opts) do
     with {:ok, _segments} <- VikingURI.parse(uri) do
-      record(uri, content, opts)
-      scripted(:put_document, :ok)
+      case scripted(:put_document, :proceed) do
+        {:error, _} = err -> err
+        _ -> do_put_document(uri, content, opts)
+      end
     end
+  end
+
+  defp do_put_document(uri, content, opts) do
+    prior_documents = documents()
+    prior_jobs = jobs()
+    jobs_opt = Keyword.get(opts, :jobs, [])
+
+    with :ok <- record(uri, content, opts),
+         :ok <- enqueue_all(jobs_opt) do
+      :ok
+    else
+      {:error, _} = err ->
+        put(:documents, prior_documents, [])
+        put(:jobs, prior_jobs, [])
+        err
+    end
+  end
+
+  defp enqueue_all([]), do: :ok
+
+  defp enqueue_all(jobs) do
+    Enum.reduce_while(jobs, :ok, fn {kind, payload}, :ok ->
+      case enqueue_job(kind, payload) do
+        {:ok, _id} -> {:cont, :ok}
+        {:error, _} = err -> {:halt, err}
+      end
+    end)
   end
 
   @impl true
@@ -249,6 +278,73 @@ defmodule AgentDb.Test.Fakes.Storage do
   end
 
   @impl true
+  def find_paths(query, scope_uri, limit) do
+    needle = String.downcase(query)
+
+    hits =
+      for {uri, document} <- documents(),
+          uri_matches?(uri, scope_uri),
+          path_contains?(uri, needle) do
+        %{uri: uri, name: document.name, kind: document.kind}
+      end
+      |> Enum.sort_by(& &1.uri)
+      |> Enum.take(limit)
+
+    scripted(:find_paths, {:ok, hits})
+  end
+
+  @impl true
+  def grep_content(query, scope_uri, limit) do
+    needle = String.downcase(query)
+    needle_len = String.length(query)
+
+    hits =
+      for {uri, document} <- documents(),
+          uri_matches?(uri, scope_uri),
+          document.kind == :doc,
+          is_binary(document.content) do
+        {uri, document.content}
+      end
+      |> Enum.sort_by(&elem(&1, 0))
+      |> Enum.flat_map(fn {uri, content} -> fake_line_hits(uri, content, needle, needle_len) end)
+      |> Enum.take(limit)
+
+    scripted(:grep_content, {:ok, hits})
+  end
+
+  defp path_contains?(uri, needle) do
+    path = String.replace_prefix(uri, "viking://", "")
+    String.contains?(String.downcase(path), needle)
+  end
+
+  defp fake_line_hits(uri, content, needle, needle_len) do
+    content
+    |> String.split("\n")
+    |> Enum.with_index(1)
+    |> Enum.filter(fn {line, _n} -> String.contains?(String.downcase(line), needle) end)
+    |> Enum.map(fn {line, n} ->
+      %{uri: uri, line_number: n, excerpt: fake_excerpt(line, needle, needle_len)}
+    end)
+  end
+
+  defp fake_excerpt(line, needle_down, needle_len) do
+    if String.length(line) <= 280 do
+      line
+    else
+      downcased = String.downcase(line)
+
+      index =
+        case String.split(downcased, needle_down, parts: 2) do
+          [before, _rest] -> String.length(before)
+          [_only] -> 0
+        end
+
+      start = max(0, index - div(280 - needle_len, 2))
+      String.slice(line, start, 280)
+    end
+  end
+
+  @impl true
   def search_vector(query, _top_k, scope) do
     # Ranked by nearest neighbour over the vectors themselves, which is what the
     # port hands over: bytes, not text. Exact match is the only similarity a
@@ -319,6 +415,37 @@ defmodule AgentDb.Test.Fakes.Storage do
   end
 
   @impl true
+  def list_session_ids, do: {:ok, messages() |> Map.keys() |> Enum.sort()}
+
+  @impl true
+  def restore_session(session_id, incoming) when is_binary(session_id) and is_list(incoming) do
+    existing = messages()[session_id]
+
+    cond do
+      existing == nil ->
+        ordered =
+          incoming
+          |> Enum.with_index()
+          |> Enum.map(fn {message, seq} -> %{seq: seq, role: message.role, content: message.content} end)
+
+        put(:messages, Map.put(messages(), session_id, Enum.reverse(ordered)), {:ok, :imported})
+
+      same_fake_messages?(existing, incoming) ->
+        {:ok, :skipped}
+
+      true ->
+        {:error, {:session_conflict, session_id}}
+    end
+  end
+
+  defp same_fake_messages?(stored_reversed, incoming) do
+    stored = Enum.reverse(stored_reversed)
+
+    Enum.map(stored, &{&1.role, &1.content}) ==
+      Enum.map(incoming, &{&1.role, &1.content})
+  end
+
+  @impl true
   def commit_hash(session_id, destination), do: {:ok, hashes()[{session_id, destination}]}
 
   @impl true
@@ -368,18 +495,24 @@ defmodule AgentDb.Test.Fakes.Storage do
 
   @impl true
   def enqueue_job(kind, payload) do
-    # Carries the fields a claim reports, so a job read back looks the way a
-    # durable one does rather than a bare record of what was asked for.
-    job = %{
-      id: System.unique_integer([:positive]),
-      kind: kind,
-      payload: serialise(payload),
-      status: :pending,
-      attempts: 0,
-      max_attempts: 5
-    }
+    case scripted(:enqueue_job, :proceed) do
+      {:error, _} = err ->
+        err
 
-    put(:jobs, [job | jobs()], {:ok, job.id})
+      _ ->
+        # Carries the fields a claim reports, so a job read back looks the way a
+        # durable one does rather than a bare record of what was asked for.
+        job = %{
+          id: System.unique_integer([:positive]),
+          kind: kind,
+          payload: serialise(payload),
+          status: :pending,
+          attempts: 0,
+          max_attempts: 5
+        }
+
+        put(:jobs, [job | jobs()], {:ok, job.id})
+    end
   end
 
   # A real queue serialises its payload, so a job read back has string keys

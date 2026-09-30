@@ -293,4 +293,29 @@ defmodule AgentDb.ML.ModelLoadStateTest do
       assert {:ok, "generated summary"} = ModelManager.summarize("hi")
     end
   end
+
+  describe "status measurements" do
+    test "reports last inference latency per role and VM memory", %{
+      cache: cache,
+      model_id: model_id
+    } do
+      :ok = cache_model(cache, model_id)
+      start_manager(FakeLoader)
+
+      # Nothing has run yet: latency is unknown rather than zero.
+      assert model_status().embedding.last_latency_ms == nil
+      assert model_status().llm.last_latency_ms == nil
+
+      assert {:ok, [_]} = ModelManager.embed(["hello"])
+
+      latency = model_status().embedding.last_latency_ms
+      assert is_integer(latency) and latency >= 0
+
+      # The other role never ran, so it stays unknown.
+      assert model_status().llm.last_latency_ms == nil
+
+      memory = model_status().memory_bytes
+      assert is_integer(memory) and memory > 0
+    end
+  end
 end

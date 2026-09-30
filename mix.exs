@@ -35,9 +35,13 @@ defmodule AgentDb.MixProject do
       {:plug_cowboy, "~> 2.6"},
       {:jason, "~> 1.4"},
       {:req, "~> 0.7"},
+      {:telemetry, "~> 1.0"},
+      {:opentelemetry_api, "~> 1.5"},
+      {:benchee, "~> 1.0", only: [:dev, :test], runtime: false},
+      {:opentelemetry, "~> 1.7", only: [:dev, :test], runtime: false},
       {:tailwind, "~> 0.5", runtime: false, manager: :mix},
       {:esbuild, "~> 0.10", runtime: false, manager: :mix},
-      {:emlx, "~> 0.5", runtime: false, manager: :mix, override: true},
+      {:emlx, "~> 0.5", optional: true, runtime: false, manager: :mix, override: true},
       {:emlx_axon, "~> 0.5", optional: true, runtime: false, manager: :mix},
       # LiveView's own test helpers parse the rendered DOM, which is what the
       # console's upload forms and result reports are asserted against.

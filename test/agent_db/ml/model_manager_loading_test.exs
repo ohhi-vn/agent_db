@@ -34,8 +34,7 @@ defmodule AgentDb.ML.ModelManagerLoadingTest do
   end
 
   defp start_manager(loader) do
-    start_supervised!({ModelManager, []})
-    :sys.replace_state(ModelManager, &put_in(&1.config.loader, loader))
+    start_supervised!({ModelManager, [ml_backend: :exla, loader: loader]})
   end
 
   # A cached weights file means the download step is skipped and the load runs.

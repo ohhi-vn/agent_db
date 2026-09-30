@@ -40,21 +40,36 @@ defmodule AgentDb.Adapters.SQLite do
 
   @impl true
   def put_document(uri, content, opts) do
-    with {:ok, segments} <- AgentDb.URI.parse(uri),
-         :ok <- Writer.call(fn conn -> write_document(conn, segments, content, opts) end) do
-      :ok
-    else
-      {:error, _} = err -> err
+    with {:ok, segments} <- AgentDb.URI.parse(uri) do
+      jobs = Keyword.get(opts, :jobs, [])
+
+      Writer.call(fn conn ->
+        SQLite.transaction(conn, fn conn ->
+          write_document(conn, segments, content, opts, jobs)
+        end)
+      end)
     end
   end
 
-  defp write_document(conn, segments, content, opts) do
+  defp write_document(conn, segments, content, opts, jobs) do
     with :ok <- ensure_parents(conn, segments),
          uri = AgentDb.URI.build(segments),
          :ok <-
-           Nodes.upsert_doc(conn, uri, parent_uri(segments), List.last(segments), content, opts) do
+           Nodes.upsert_doc(conn, uri, parent_uri(segments), List.last(segments), content, opts),
+         :ok <- enqueue_jobs(conn, jobs) do
       :ok
     end
+  end
+
+  defp enqueue_jobs(_conn, []), do: :ok
+
+  defp enqueue_jobs(conn, jobs) do
+    Enum.reduce_while(jobs, :ok, fn {kind, payload}, :ok ->
+      case JobQueue.enqueue(conn, kind, payload) do
+        {:ok, _id} -> {:cont, :ok}
+        {:error, _} = err -> {:halt, err}
+      end
+    end)
   end
 
   @impl true
@@ -253,6 +268,16 @@ defmodule AgentDb.Adapters.SQLite do
   end
 
   @impl true
+  def find_paths(query, scope_uri, limit) do
+    Reader.read(fn conn -> Nodes.find_paths(conn, query, scope_uri, limit) end)
+  end
+
+  @impl true
+  def grep_content(query, scope_uri, limit) do
+    Reader.read(fn conn -> Nodes.grep_content(conn, query, scope_uri, limit) end)
+  end
+
+  @impl true
   def search_vector(query, top_k, scope_prefix) do
     Reader.read(fn conn -> vector_search(conn, query, top_k, scope_prefix) end)
   end
@@ -364,6 +389,83 @@ defmodule AgentDb.Adapters.SQLite do
   defp role("assistant"), do: :assistant
   defp role("system"), do: :system
   defp role(other), do: other
+
+  @impl true
+  def list_session_ids do
+    Reader.read(fn conn ->
+      case SQLite.query(conn, "SELECT id FROM sessions ORDER BY id", []) do
+        {:ok, rows} -> {:ok, Enum.map(rows, &hd/1)}
+        {:error, _} = err -> err
+      end
+    end)
+  end
+
+  @impl true
+  def restore_session(session_id, messages) when is_binary(session_id) and is_list(messages) do
+    Writer.call(fn conn ->
+      SQLite.transaction(conn, fn conn -> do_restore_session(conn, session_id, messages) end)
+    end)
+  end
+
+  defp do_restore_session(conn, session_id, messages) do
+    with {:ok, existing} <- read_session_messages(conn, session_id) do
+      cond do
+        same_messages?(existing, messages) -> {:ok, :skipped}
+        existing != [] -> {:error, {:session_conflict, session_id}}
+        true -> insert_restored_session(conn, session_id, messages)
+      end
+    end
+  end
+
+  defp read_session_messages(conn, session_id) do
+    case SQLite.query(
+           conn,
+           "SELECT seq, role, content FROM session_messages WHERE session_id = ?1 ORDER BY seq",
+           [session_id]
+         ) do
+      {:ok, rows} ->
+        {:ok, Enum.map(rows, fn [seq, role, content] -> %{seq: seq, role: role(role), content: content} end)}
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  defp same_messages?(existing, incoming) do
+    Enum.map(existing, &{&1.role, &1.content}) ==
+      Enum.map(incoming, &{normalize_role(&1.role), &1.content})
+  end
+
+  defp normalize_role(role) when is_atom(role), do: role
+  defp normalize_role("user"), do: :user
+  defp normalize_role("assistant"), do: :assistant
+  defp normalize_role("system"), do: :system
+  defp normalize_role(other), do: other
+
+  defp insert_restored_session(conn, session_id, messages) do
+    now = System.system_time(:millisecond)
+
+    with :ok <-
+           SQLite.exec_write(conn, "INSERT OR IGNORE INTO sessions (id, created_at) VALUES (?1, ?2)", [
+             session_id,
+             now
+           ]) do
+      Enum.reduce_while(Enum.with_index(messages), :ok, fn {message, seq}, :ok ->
+        case SQLite.exec_write(
+               conn,
+               "INSERT INTO session_messages (session_id, seq, role, content) VALUES (?1, ?2, ?3, ?4)",
+               [session_id, seq, to_string(normalize_role(message.role)), message.content]
+             ) do
+          :ok -> {:cont, :ok}
+          {:error, _} = err -> {:halt, err}
+        end
+      end)
+      |> case do
+        :ok -> {:ok, :imported}
+        {:error, _} = err -> err
+      end
+    end
+  end
 
   @impl true
   def commit_hash(session_id, destination_uri) do

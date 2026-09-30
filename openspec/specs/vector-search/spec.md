@@ -6,7 +6,7 @@ Provides semantic vector search over stored documents using locally-run embeddin
 ## Requirements
 
 ### Requirement: Vector embeddings generated for all documents
-The store SHALL generate a vector embedding for every document's content (L2) using a configured local embedding model. Embeddings SHALL be stored in a sqlite-vec virtual table with HNSW index for efficient similarity search. When a document is written, its embedding SHALL be generated asynchronously and the vector index updated without blocking the write acknowledgement. Loading the configured model SHALL succeed when its weights are present in the local cache, and a successful load SHALL be observable: the loaded model SHALL be retained and reused for subsequent embedding requests rather than reloaded per request. A load that fails SHALL report an error identifying the failure, and SHALL NOT be reported as a successful load.
+The store SHALL generate a vector embedding for every document's content (L2) using the configured embedding provider (local model by default, see `inference-providers` capability). Embeddings SHALL be stored in a sqlite-vec virtual table with HNSW index for efficient similarity search. When a document is written, its embedding SHALL be generated asynchronously and the vector index updated without blocking the write acknowledgement. Loading the configured model SHALL succeed when its weights are present in the local cache, and a successful load SHALL be observable: the loaded model SHALL be retained and reused for subsequent embedding requests rather than reloaded per request. A load that fails SHALL report an error identifying the failure, and SHALL NOT be reported as a successful load.
 
 #### Scenario: Write triggers async embedding generation
 - **WHEN** a caller writes a document with content
@@ -28,6 +28,11 @@ The store SHALL generate a vector embedding for every document's content (L2) us
 - **WHEN** loading the embedding model fails
 - **THEN** the request reports an error naming the cause
 - **AND** no embedding is written to the vector index for that request
+
+#### Scenario: Configured remote provider serves embeddings
+- **WHEN** the embedder is configured to Ollama with a reachable endpoint
+- **THEN** document writes become vector-searchable through that provider
+- **AND** vector search results keep their existing URI, content, and score shape
 ### Requirement: Vector similarity search
 The store SHALL provide a vector search operation that accepts a query text, generates its embedding, and returns the top-k most similar documents by cosine similarity. Results SHALL include the document URI, content, abstract, overview, and similarity score. A search issued while the embedding model is still loading SHALL report that the model is loading, and SHALL NOT be reported as though the query itself were invalid or the capability permanently unavailable.
 
@@ -62,7 +67,7 @@ The store SHALL provide a hybrid search mode that combines keyword (BM25-like) a
 - **THEN** the fusion uses those weights
 
 ### Requirement: Embedding model management
-The store SHALL download and cache the configured embedding model on first startup if not present locally. Model loading SHALL be lazy (on first embedding request) or eager (at startup, configurable). The model SHALL run entirely locally using EXLA/Bumblebee with CPU or GPU backend. A configured backend SHALL be applied to the loaded model, so that the selection takes effect rather than being read and discarded. A download SHALL be written atomically: partial content SHALL NOT be left at the model's final path, and a file at that path SHALL be treated as complete only if the download finished. A download that fails or is interrupted SHALL leave no file that later requests treat as a usable cached model. Because loading is lazy, an embedding requested while the model is still loading SHALL be reported as loading and SHALL NOT be reported as a failure, and the caller SHALL be able to retry it. A request made while loading SHALL be given a bounded opportunity to complete before it is reported as loading. Loading SHALL NOT block the store from answering questions about its own state. The embedding model SHALL reach a loaded state once its own load completes, including when another model is loading concurrently: beginning a load for one model SHALL NOT leave the embedding model reporting as loading indefinitely.
+The store SHALL download and cache the configured embedding model on first startup if not present locally. Model loading SHALL be lazy (on first embedding request) or eager (at startup, configurable). The model SHALL run entirely locally using the configured ML backend (EXLA or EMLX). The model SHALL run on CPU by default, or on Apple Silicon GPU/Neural Engine via MLX when EMLX backend is selected. A configured backend SHALL be applied to the loaded model, so that the selection takes effect rather than being read and discarded. When the configured backend is unavailable or fails to initialize, the system SHALL fall back to EXLA CPU with a warning logged. A download SHALL be written atomically: partial content SHALL NOT be left at the model's final path, and a file at that path SHALL be treated as complete only if the download finished. A download that fails or is interrupted SHALL leave no file that later requests treat as a usable cached model. Because loading is lazy, an embedding requested while the model is still loading SHALL be reported as loading and SHALL NOT be reported as a failure, and the caller SHALL be able to retry it. A request made while loading SHALL be given a bounded opportunity to complete before it is reported as loading. Loading SHALL NOT block the store from answering questions about its own state. The embedding model SHALL reach a loaded state once its own load completes, including when another model is loading concurrently: beginning a load for one model SHALL NOT leave the embedding model reporting as loading indefinitely.
 
 #### Scenario: Model downloads on first use
 - **WHEN** system starts with no cached model and embedding is requested
@@ -105,6 +110,17 @@ The store SHALL download and cache the configured embedding model on first start
 - **THEN** the embedding model's own load proceeds independently
 - **AND** the embedding model reaches a loaded state rather than continuing to report as loading
 - **AND** a later embedding request proceeds to inference instead of reporting the model as still loading
+
+#### Scenario: Model runs on Apple Silicon via MLX when EMLX backend selected
+- **WHEN** `ml_backend` is `:emlx` or `:auto` on Apple Silicon macOS
+- **THEN** embeddings are generated using MLX backend
+- **AND** generation completes with lower latency than CPU baseline
+
+#### Scenario: Backend falls back to EXLA on EMLX failure
+- **WHEN** `ml_backend` is `:emlx` or `:auto` on macOS but EMLX fails to load
+- **THEN** a warning is logged
+- **AND** the embedding model loads via EXLA CPU backend instead
+- **AND** embedding generation continues to function
 ### Requirement: Vector index persistence and recovery
 The sqlite-vec virtual table and HNSW index SHALL persist across restarts. After restart, vector search SHALL be immediately available without re-embedding all documents.
 

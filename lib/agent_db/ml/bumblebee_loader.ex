@@ -48,8 +48,15 @@ defmodule AgentDb.ML.BumblebeeLoader do
   Returns `:none` to mean "do not pass a `:backend` option", which is how
   Bumblebee is told to use the default backend.
   """
-  @spec backend_spec(:cpu | :cuda | :rocm) :: :none | {module(), keyword()}
+  @spec backend_spec(:cpu | :cuda | :rocm | :emlx | {module(), keyword()}) ::
+          :none | {module(), keyword()}
   def backend_spec(:cpu), do: :none
+
+  def backend_spec(:emlx) do
+    if Code.ensure_loaded?(EMLX.Backend), do: {EMLX.Backend, []}, else: :none
+  end
+
+  def backend_spec({mod, _opts} = spec) when is_atom(mod), do: spec
 
   def backend_spec(name) when name in [:cuda, :rocm] do
     {EXLA.Backend, [client: EXLA.Client.fetch!(name)]}

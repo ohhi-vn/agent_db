@@ -23,14 +23,16 @@ defmodule AgentDb.BoundariesTest do
     test "reach storage and inference through their ports, never by name" do
       # The things a workflow is allowed to name: the runtime that answers which
       # provider is in use, the cache it reads through, the URI grammar its own
-      # inputs are written in, the settings that govern it, and the reader that
-      # turns one kind of input into another before the workflow sees it. What it
-      # may not name is a provider.
+      # inputs are written in, the settings that govern it, the stateless
+      # instrumentation it emits (no process, no backend, fails safe), and the
+      # reader that turns one kind of input into another before the workflow
+      # sees it. What it may not name is a provider.
       allowed = [
         AgentDb.Runtime,
         AgentDb.Cache,
         AgentDb.URI,
         AgentDb.Config,
+        AgentDb.Observability,
         AgentDb.Skills.Source
       ]
 

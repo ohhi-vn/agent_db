@@ -70,12 +70,33 @@ The WebSocket gateway SHALL support optional token-based authentication. When en
 - **THEN** connection is rejected or operations return `:unauthorized`
 
 ### Requirement: Real-time subscriptions (optional)
-Clients SHALL be able to subscribe to document changes (write, rm) and session commits via Phoenix Channels, receiving real-time notifications.
+Clients SHALL be able to subscribe to document changes (write, rm, skill replacement) and session commits via Phoenix Channels, receiving real-time versioned notifications. Each notification SHALL carry the changed URI, a change kind of `written | removed | replaced | committed`, and a monotonic version, and SHALL NOT carry document content. Scope membership SHALL be exact-URI-or-descendant. A subscription to a syntactically valid but missing URI SHALL succeed and fire on creation; an invalid URI SHALL return `{:error, :invalid_uri}` without terminating the channel.
 
 #### Scenario: Subscribe to document changes
 - **WHEN** client subscribes to `viking://resources/project/*`
 - **AND** another client writes to `viking://resources/project/readme.md`
 - **THEN** first client receives notification with changed URI
+
+#### Scenario: Versioned removal notification
+- **WHEN** a client is subscribed to `viking://resources/project` and that subtree is removed
+- **THEN** the client receives a `removed` notification with the URI and its version
+- **AND** the channel remains usable for further events
+
+#### Scenario: Invalid subscription leaves the channel usable
+- **WHEN** a client sends `v1.subscribe` with an invalid URI
+- **THEN** the client receives an `{:error, :invalid_uri}` response
+- **AND** a subsequent valid subscription on the same connection succeeds
+
+### Requirement: Retrieval progress streaming
+The versioned WebSocket API SHALL expose `v1.subscribe` and `v1.unsubscribe` for context scopes plus streaming progress events for retrieval: `retrieval started`, `retrieval progress`, `resource found`, `memory found`, `skill loaded`, and `context assembled`. Progress events SHALL be informational only and SHALL NOT change the final `search` result contract. A client that cannot be served (unavailable provider) SHALL receive an error response without terminating the connection, and a deferred call SHALL remain distinguishable as `:model_loading`.
+
+#### Scenario: Streamed retrieval for debugging
+- **WHEN** a client subscribes to progress and calls `v1.search` with mode hybrid
+- **THEN** the client receives ordered progress events ending in a final result payload matching the existing `v1.search` envelope
+
+#### Scenario: Progress failure does not break the call
+- **WHEN** a progress subscription drops mid-retrieval
+- **THEN** the underlying `search` still returns its final result to the caller
 
 ### Requirement: API versioning and backward compatibility
 The WebSocket API SHALL use versioned function names (e.g., `v1.write`, `v1.search`). Breaking changes SHALL introduce a new version while maintaining old versions for a deprecation period.
@@ -88,7 +109,7 @@ The WebSocket API SHALL use versioned function names (e.g., `v1.write`, `v1.sear
 ### Requirement: HTTP listener lifecycle and binding
 When HTTP is enabled the store SHALL open a listener on the configured port and serve requests on it. Enabling HTTP SHALL be observable as a reachable listening socket, not merely as a started endpoint process; a started endpoint that accepts no connection does not satisfy this requirement. When HTTP is disabled the store SHALL leave no listener open.
 
-The listener SHALL bind the loopback interface by default, and the bind interface SHALL be configurable so that a deployment on a private network can select a specific address. The port SHALL be taken from a single configuration source, so that one configured value determines the port served and no second, competing port setting can silently disagree with it.
+The listener SHALL bind the loopback interface by default, and the bind interface SHALL be configurable so that a deployment on a private network can select a specific address. The port SHALL be taken from a single configuration source (`AGENT_DB_HTTP_PORT` with default `6060`), so that one configured value determines the port served and no second, competing port setting can silently disagree with it. When `AGENT_DB_HTTP_PORT` is unset the listener SHALL open on `6060`.
 
 #### Scenario: Enabled HTTP serves requests
 - **WHEN** the store starts with HTTP enabled and a port configured
@@ -119,3 +140,61 @@ The listener SHALL bind the loopback interface by default, and the bind interfac
 - **WHEN** the store reports that HTTP is enabled
 - **THEN** a connection to the configured port succeeds
 - **AND** reporting HTTP as enabled while refusing connections is a detectable failure
+
+#### Scenario: Default port is 6060 when unconfigured
+- **WHEN** the store starts with HTTP enabled and `AGENT_DB_HTTP_PORT` unset
+- **THEN** a TCP listener accepts a request on `6060`
+- **AND** the generated endpoint URL uses port `6060`
+
+### Requirement: HTTP and WebSocket operations accept trace context
+The HTTP and WebSocket APIs SHALL accept valid W3C trace context at their request or operation boundary and propagate it to the corresponding store operation. An HTTP request SHALL use its `traceparent` header; a WebSocket operation MAY supply `traceparent` metadata with the event. Missing or malformed trace context SHALL result in a new trace and SHALL NOT reject, authorize, or otherwise change the operation. Trace metadata SHALL NOT change existing request or response payload shapes.
+
+#### Scenario: HTTP request continues a caller trace
+- **WHEN** an HTTP API request carries a valid W3C `traceparent` header
+- **THEN** the operation continues that trace through its store work
+- **AND** the existing HTTP status and response body contract is preserved
+
+#### Scenario: WebSocket operation continues a caller trace
+- **WHEN** a WebSocket event carries valid W3C `traceparent` metadata
+- **THEN** the event's store operation continues that trace
+- **AND** the existing event result contract is preserved
+
+#### Scenario: Missing or malformed context starts a trace without rejecting the call
+- **WHEN** an HTTP request or WebSocket event has no trace context or has malformed trace context
+- **THEN** the operation starts a new trace
+- **AND** authentication, authorization, operation results, and connection usability follow their existing contracts
+### Requirement: Remote path discovery and content inspection
+The versioned WebSocket API SHALL expose `v1.find` and `v1.grep`, each accepting a required `term` and optional `opts.scope` and `opts.limit`, and SHALL return their results in the existing success response envelope. The events SHALL preserve the in-process operation's validation, scoping, literal matching, ordering, and result limits. Invalid requests SHALL receive the existing error response shape without terminating the caller or channel connection. Existing `v1` events and authentication behavior SHALL remain unchanged.
+
+#### Scenario: A remote agent discovers paths progressively
+- **WHEN** a client sends `v1.find` with a term and subtree scope
+- **THEN** the response contains the matching URI, name, and node kind entries
+- **AND** the client can use existing `v1.list` and `v1.read` events to continue navigating
+
+#### Scenario: A remote agent retrieves matching source excerpts
+- **WHEN** a client sends `v1.grep` with a term and optional subtree scope
+- **THEN** the response contains matching document URIs, one-based line numbers, and bounded excerpts
+- **AND** the response is limited by the operation's effective result limit
+
+#### Scenario: Invalid navigation request leaves the channel usable
+- **WHEN** a client sends `v1.find` or `v1.grep` with an invalid term, scope, or limit
+- **THEN** the client receives an error using the existing error response envelope
+- **AND** a subsequent valid event succeeds on the same connection
+
+### Requirement: MCP Streamable HTTP endpoint on the configured listener
+The system SHALL expose `POST /mcp` on the existing HTTP listener as an MCP Streamable HTTP endpoint speaking JSON-RPC with the `legacy` `initialize` handshake. The endpoint SHALL serve on the single configured port, bind loopback by default with a configurable interface, enforce the existing optional Bearer auth contract, and propagate W3C `traceparent` without changing request or response shapes. Error responses SHALL be JSON and SHALL NOT terminate the session. Existing WebSocket `v1.*`, REST, and `/admin` behavior SHALL remain unchanged.
+
+#### Scenario: MCP handshake and tool call over HTTP
+- **WHEN** a client posts `initialize` then `tools/call context_search` to `/mcp`
+- **THEN** the handshake succeeds and search results return as JSON
+- **AND** the listener port is the single configured value
+
+#### Scenario: Bearer enforcement on MCP when enabled
+- **WHEN** auth is enabled and a client posts to `/mcp` without a valid token
+- **THEN** the request is rejected as unauthorized
+- **AND** a request with a valid `Authorization` header succeeds
+
+#### Scenario: Trace context preserved on MCP
+- **WHEN** a client posts to `/mcp` with a valid `traceparent` header
+- **THEN** the store operation continues that trace
+- **AND** the JSON-RPC response shape is unchanged

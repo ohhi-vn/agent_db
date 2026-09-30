@@ -76,6 +76,20 @@ defmodule AgentDb.Core.Storage do
           score: float()
         }
 
+  @typedoc "A path-discovery match: URI, name, and node kind, without document content."
+  @type path_match :: %{
+          uri: String.t(),
+          name: String.t(),
+          kind: :doc | :dir
+        }
+
+  @typedoc "A content line match: document URI, one-based line number, and bounded excerpt."
+  @type line_match :: %{
+          uri: String.t(),
+          line_number: pos_integer(),
+          excerpt: String.t()
+        }
+
   @typedoc "The layered summary a background worker produced."
   @type layer :: :abstract | :overview
 
@@ -91,6 +105,12 @@ defmodule AgentDb.Core.Storage do
   `:abstract` and `:overview` in `opts` are the caller's own layers; `nil` for
   either keeps whatever is already stored, so a re-write does not discard a
   layer it did not supply.
+
+  `:jobs` in `opts` is the required background work for the write, as a list
+  of `{kind, payload}` pairs. A provider persists the document and all jobs
+  as one storage outcome: success means both are durable, and a failure to
+  persist or enqueue any job leaves prior document, cache, and queue state
+  unchanged.
   """
   @callback put_document(String.t(), String.t(), keyword()) :: {:ok, :ok} | {:error, term()}
 
@@ -134,6 +154,35 @@ defmodule AgentDb.Core.Storage do
   @callback search_vector(binary(), pos_integer(), String.t() | nil) ::
               {:ok, [hit()]} | {:error, term()}
 
+  @doc """
+  Path-discovery matches for `query` within `scope_uri` or beneath it.
+
+  `query` is a validated literal substring (1 through 256 characters).
+  `scope_uri` is a validated exact URI or `nil` for the whole tree; scope
+  membership is exact-URI-or-descendant, so `scope` never matches a sibling
+  such as `scope-old`. Matching is case-insensitive over the URI path
+  (excluding the `viking://` scheme), `%`, `_`, and `\\` match literally,
+  results are ordered by URI, and at most `limit` entries are returned
+  without document content.
+  """
+  @callback find_paths(String.t(), String.t() | nil, pos_integer()) ::
+              {:ok, [path_match()]} | {:error, term()}
+
+  @doc """
+  Line matches for `query` in full document content (L2) within `scope_uri`
+  or beneath it.
+
+  `query` is a validated literal substring (1 through 256 characters).
+  `scope_uri` is a validated exact URI or `nil` for the whole tree; scope
+  membership is exact-URI-or-descendant. Matching is case-insensitive over
+  L2 content only (abstracts and overviews never match), `%`, `_`, `\\`,
+  and regular-expression metacharacters match literally, results are ordered
+  by URI then one-based line number, each excerpt contains the match and is
+  at most 280 characters, and at most `limit` entries are returned.
+  """
+  @callback grep_content(String.t(), String.t() | nil, pos_integer()) ::
+              {:ok, [line_match()]} | {:error, term()}
+
   @doc "Creates a session and returns its id."
   @callback create_session() :: {:ok, String.t()} | {:error, term()}
 
@@ -142,6 +191,22 @@ defmodule AgentDb.Core.Storage do
 
   @doc "Every message of a session, in order."
   @callback get_session(String.t()) :: {:ok, [message()]} | {:error, term()}
+
+  @doc "Ids of every session, ordered, so an export can enumerate them."
+  @callback list_session_ids() :: {:ok, [String.t()]} | {:error, term()}
+
+  @doc """
+  Restores a session with a specific id and its messages in order.
+
+  Creates the session when absent and appends the messages. When the session
+  already holds exactly these messages (compared as `{role, content}` pairs in
+  order) it reports `{:ok, :skipped}` and writes nothing. When it holds
+  different messages it reports `{:error, {:session_conflict, id}}` and leaves
+  the stored session untouched, so an import never silently overwrites a live
+  conversation.
+  """
+  @callback restore_session(String.t(), [message()]) ::
+              {:ok, :imported | :skipped} | {:error, term()}
 
   @doc "The content hash recorded for a (session, destination) commit, if any."
   @callback commit_hash(String.t(), String.t()) :: {:ok, String.t() | nil} | {:error, term()}

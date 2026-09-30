@@ -9,6 +9,7 @@ defmodule AgentDbWeb.Controllers.DocumentController do
   """
   use AgentDbWeb, :controller
 
+  alias AgentDb.Observability
   alias AgentDbWeb.Context
 
   def index(conn, params) do
@@ -27,14 +28,14 @@ defmodule AgentDbWeb.Controllers.DocumentController do
   end
 
   def create(conn, %{"document" => %{"uri" => uri, "content" => content} = params}) do
-    case Context.put_document(uri, content, document_opts(params)) do
+    case Context.put_document(uri, content, with_trace(document_opts(params), conn)) do
       :ok -> conn |> put_status(201) |> json(%{status: "created", uri: uri})
       {:error, reason} -> unprocessable(conn, reason)
     end
   end
 
   def update(conn, %{"id" => uri, "document" => %{"content" => content} = params}) do
-    case Context.put_document(uri, content, document_opts(params)) do
+    case Context.put_document(uri, content, with_trace(document_opts(params), conn)) do
       :ok -> json(conn, %{status: "updated", uri: uri})
       {:error, reason} -> unprocessable(conn, reason)
     end
@@ -56,6 +57,13 @@ defmodule AgentDbWeb.Controllers.DocumentController do
   end
 
   defp document_opts(_params), do: []
+
+  defp with_trace(opts, conn) do
+    case Observability.from_conn(conn) do
+      nil -> opts
+      ctx -> Keyword.put(opts, :trace_context, ctx)
+    end
+  end
 
   defp not_found(conn), do: conn |> put_status(404) |> json(%{error: "not_found"})
 

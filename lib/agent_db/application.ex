@@ -22,6 +22,7 @@ defmodule AgentDb.Application do
   @impl Application
   def start(_type, _args) do
     put_default_config()
+    maybe_start_emlx()
 
     data_dir = AgentDb.Config.data_dir()
     File.mkdir_p!(data_dir)
@@ -72,11 +73,33 @@ defmodule AgentDb.Application do
   # that publishes to it.
   defp pubsub_specs, do: [{Phoenix.PubSub, name: AgentDb.PubSub}]
 
-  defp worker_specs do
-    [
-      {AgentDb.Workers.Embedding, []},
-      {AgentDb.Workers.Summarization, []}
-    ]
+  @doc false
+  def worker_specs do
+    count = AgentDb.Config.job_workers()
+
+    unless is_integer(count) and count > 0 do
+      raise ArgumentError,
+            "job_workers must be a positive integer, got: #{inspect(count)}"
+    end
+
+    embedding =
+      for n <- 1..count do
+        Supervisor.child_spec(
+          {AgentDb.Workers.Embedding, [worker_id: AgentDb.Workers.Embedding.registration(n)]},
+          id: {AgentDb.Workers.Embedding, n}
+        )
+      end
+
+    summarization =
+      for n <- 1..count do
+        Supervisor.child_spec(
+          {AgentDb.Workers.Summarization,
+           [worker_id: AgentDb.Workers.Summarization.registration(n)]},
+          id: {AgentDb.Workers.Summarization, n}
+        )
+      end
+
+    embedding ++ summarization
   end
 
   defp transport_specs(opts) do
@@ -152,6 +175,7 @@ defmodule AgentDb.Application do
     put_env(:async_writes, boolean_env("AGENT_DB_ASYNC_WRITES", true))
     put_env(:job_workers, integer_env("AGENT_DB_JOB_WORKERS", System.schedulers_online()))
     put_env(:exla_backend, backend_env())
+    put_env(:ml_backend, ml_backend_env())
 
     # Off by default under test. The suite restarts the application from many
     # setup blocks, so a listener would be bound and released that many times
@@ -193,6 +217,38 @@ defmodule AgentDb.Application do
       "cuda" -> :cuda
       "rocm" -> :rocm
       _other -> :cpu
+    end
+  end
+
+  defp ml_backend_env do
+    case System.get_env("AGENT_DB_ML_BACKEND") do
+      "exla" -> :exla
+      "emlx" -> :emlx
+      _other -> :auto
+    end
+  end
+
+  # EMLX ships with `runtime: false` so non-macOS installs never start it.
+  # When the configured backend needs it on Apple Silicon, ensure it is
+  # started; failures are ignored because ModelManager falls back to EXLA.
+  defp maybe_start_emlx do
+    if emlx_needed?() and Code.ensure_loaded?(EMLX) do
+      _ = Application.ensure_all_started(:emlx)
+      :ok
+    else
+      :ok
+    end
+  rescue
+    _ -> :ok
+  catch
+    _, _ -> :ok
+  end
+
+  defp emlx_needed? do
+    case AgentDb.Config.ml_backend() do
+      :emlx -> true
+      :auto -> AgentDb.ML.ModelManager.Backend.apple_silicon?()
+      _ -> false
     end
   end
 end

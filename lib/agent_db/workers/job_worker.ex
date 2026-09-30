@@ -13,6 +13,7 @@ defmodule AgentDb.Workers.JobWorker do
 
   use GenServer
 
+  alias AgentDb.Observability
   alias AgentDb.Runtime
 
   require Logger
@@ -52,8 +53,11 @@ defmodule AgentDb.Workers.JobWorker do
 
   @doc false
   def child_spec(opts) do
+    handler = Keyword.fetch!(opts, :handler)
+    worker_id = Keyword.fetch!(opts, :worker_id)
+
     %{
-      id: Keyword.fetch!(opts, :handler),
+      id: {handler, worker_id},
       start: {__MODULE__, :start_link, [opts]},
       type: :worker,
       restart: :permanent,
@@ -114,12 +118,40 @@ defmodule AgentDb.Workers.JobWorker do
   # work that has not had its chance yet. A failure is recorded. A result goes
   # to storage, which decides whether its node is still there to receive it.
   defp process(storage, handler, job) do
-    case handler.generate(job) do
-      {:ok, result} -> store(storage, handler, job, result)
-      {:error, :model_loading} -> defer(storage, job.id)
-      {:error, reason} -> fail(storage, job.id, reason)
-    end
+    queue_wait = queue_wait_ms(job)
+    start = System.monotonic_time(:millisecond)
+
+    Observability.with_span("agent_db.job", %{kind: job.kind}, fn ->
+      outcome =
+        case handler.generate(job) do
+          {:ok, result} -> store(storage, handler, job, result)
+          {:error, :model_loading} -> defer(storage, job.id)
+          {:error, reason} -> fail(storage, job.id, reason)
+        end
+
+      execution = System.monotonic_time(:millisecond) - start
+      Observability.emit_job(job.kind, outcome, queue_wait, execution)
+
+      Observability.log(:info,
+        component: :worker,
+        kind: job.kind,
+        outcome: outcome,
+        job_id: job.id,
+        trace_id: trace_id(job)
+      )
+
+      :ok
+    end)
   end
+
+  defp queue_wait_ms(%{queued_at: queued, claimed_at: claimed})
+       when is_integer(queued) and is_integer(claimed),
+       do: max(claimed - queued, 0)
+
+  defp queue_wait_ms(_), do: 0
+
+  defp trace_id(%{payload: %{"_trace" => %{"trace_id" => trace_id}}}), do: trace_id
+  defp trace_id(_), do: nil
 
   defp store(storage, handler, job, result) do
     case handler.store(job, result) do
@@ -128,12 +160,20 @@ defmodule AgentDb.Workers.JobWorker do
         # summary that lands behind it would never be seen. Whoever writes has
         # to drop what it made stale.
         AgentDb.Cache.invalidate_write(job.payload["uri"])
-        :ok
+        :stored
 
       # The node was removed while the model was running. The job is already
       # done; its result is simply not wanted.
       {:ok, :discarded} ->
-        Logger.info("Discarded result for removed #{job.payload["uri"]}, job #{job.id}")
+        Observability.log(:info,
+          component: :worker,
+          kind: job.kind,
+          outcome: :discarded,
+          job_id: job.id,
+          trace_id: trace_id(job)
+        )
+
+        :discarded
 
       {:error, reason} ->
         fail(storage, job.id, reason)
@@ -142,18 +182,42 @@ defmodule AgentDb.Workers.JobWorker do
 
   defp defer(storage, job_id) do
     case storage.defer_job(job_id, @model_loading_delay_ms) do
-      :ok -> :ok
-      {:error, reason} -> Logger.error("Could not defer job #{job_id}: #{inspect(reason)}")
+      :ok ->
+        :deferred
+
+      {:error, reason} ->
+        Observability.log(:error,
+          component: :worker,
+          outcome: :error,
+          reason: reason,
+          job_id: job_id
+        )
+
+        :error
     end
   end
 
   defp fail(storage, job_id, reason) do
     case storage.fail_job(job_id) do
       :ok ->
-        Logger.error("Job #{job_id} failed: #{inspect(reason)}")
+        Observability.log(:error,
+          component: :worker,
+          outcome: :failed,
+          reason: reason,
+          job_id: job_id
+        )
+
+        :failed
 
       {:error, error} ->
-        Logger.error("Could not record failure of job #{job_id}: #{inspect(error)}")
+        Observability.log(:error,
+          component: :worker,
+          outcome: :error,
+          reason: error,
+          job_id: job_id
+        )
+
+        :error
     end
   end
 end

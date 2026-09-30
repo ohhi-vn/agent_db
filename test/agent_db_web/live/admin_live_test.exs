@@ -195,6 +195,121 @@ defmodule AgentDbWeb.AdminLiveTest do
     end
   end
 
+  describe "realtime updates" do
+    test "a change event records URI, kind and version in the feed", %{view: view} do
+      send(view.pid, {:context_changed, "viking://resources/realtime-note.md", :written, 7})
+
+      html = render(view)
+      assert html =~ "viking://resources/realtime-note.md"
+      assert html =~ "written"
+      assert html =~ "v7"
+    end
+
+    test "rapid bursts all land in the feed newest-first and converge on reload", %{view: view} do
+      for n <- 1..5 do
+        send(view.pid, {:context_changed, "viking://resources/burst-#{n}.md", :written, n})
+      end
+
+      # The burst coalesces reloads; forcing the deferred reload converges.
+      send(view.pid, :refresh_coalesced)
+
+      html = render(view)
+
+      for n <- 1..5 do
+        assert html =~ "burst-#{n}.md"
+      end
+
+      {later, _} = :binary.match(html, "burst-5.md")
+      {earlier, _} = :binary.match(html, "burst-1.md")
+      assert later < earlier
+    end
+
+    test "a missed event still converges on fallback refresh", %{view: view} do
+      :ok = AgentDb.write("viking://resources/fallback-note.md", "fallback content")
+      send(view.pid, :refresh)
+
+      assert render(view) =~ "viking://resources/fallback-note.md"
+    end
+
+    test "the feed never carries document content", %{view: view} do
+      :ok = AgentDb.write("viking://resources/secret-note.md", "super-secret-content-xyz")
+      send(view.pid, {:context_changed, "viking://resources/secret-note.md", :written, 3})
+      send(view.pid, :refresh_coalesced)
+
+      html = render(view)
+      assert html =~ "viking://resources/secret-note.md"
+      refute html =~ "super-secret-content-xyz"
+    end
+  end
+
+  describe "document search" do
+    test "finds documents and links each to the editor", %{view: view} do
+      :ok =
+        AgentDb.write(
+          "viking://resources/searchable/apple-pie.md",
+          "apple pie recipe with plenty of cinnamon"
+        )
+
+      view
+      |> form("#doc-search", %{"term" => "cinnamon", "scope" => ""})
+      |> render_submit()
+
+      html = render(view)
+      assert html =~ "viking://resources/searchable/apple-pie.md"
+      assert html =~ "/admin/documents/"
+    end
+
+    test "a refused search reports in words and keeps the listing", %{view: view} do
+      :ok = AgentDb.write("viking://resources/searchable/keep-me.md", "keep me visible")
+      send(view.pid, :refresh)
+
+      view
+      |> form("#doc-search", %{"term" => "keep", "scope" => "not-a-uri"})
+      |> render_submit()
+
+      html = render(view)
+      assert html =~ "Search failed"
+      assert html =~ "viking://resources/searchable/keep-me.md"
+    end
+  end
+
+  describe "model, queue and health status" do
+    test "shows roles, queue breakdown and health checks", %{view: view} do
+      html = render(view)
+
+      assert html =~ "Models"
+      assert html =~ "embedding"
+      assert html =~ "llm"
+      assert html =~ "Provider"
+      assert html =~ "Last inference"
+      assert html =~ "Memory (BEAM total)"
+      assert html =~ "Queue"
+
+      for status <- ["pending", "running", "done", "failed"] do
+        assert html =~ status
+      end
+
+      assert html =~ "Health"
+    end
+  end
+
+  describe "session lookup" do
+    test "shows messages for a known session", %{view: view} do
+      {:ok, sid} = AgentDb.create_session()
+      :ok = AgentDb.append_message(sid, :user, "hello session")
+
+      view |> form("#session-lookup", %{"session_id" => sid}) |> render_submit()
+
+      assert render(view) =~ "hello session"
+    end
+
+    test "reports an unknown session id", %{view: view} do
+      view |> form("#session-lookup", %{"session_id" => "no-such-session"}) |> render_submit()
+
+      assert render(view) =~ "No session with that ID"
+    end
+  end
+
   # -- helpers --
 
   # An entry is uploaded by its file name, so a folder of skills -- where two

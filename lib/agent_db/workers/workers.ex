@@ -32,9 +32,14 @@ defmodule AgentDb.Workers.Embedding do
   @spec registration() :: String.t()
   def registration, do: "embedding_worker_1"
 
+  @spec registration(pos_integer()) :: String.t()
+  def registration(n) when is_integer(n) and n > 0, do: "embedding_worker_#{n}"
+
   @doc false
   def child_spec(opts) do
-    JobWorker.child_spec(Keyword.merge(opts, handler: __MODULE__, worker_id: registration()))
+    worker_id = Keyword.get(opts, :worker_id, registration())
+
+    JobWorker.child_spec(Keyword.merge(opts, handler: __MODULE__, worker_id: worker_id))
   end
 end
 
@@ -107,8 +112,13 @@ defmodule AgentDb.Workers.Summarization do
   @spec registration() :: String.t()
   def registration, do: "summarization_worker_1"
 
+  @spec registration(pos_integer()) :: String.t()
+  def registration(n) when is_integer(n) and n > 0, do: "summarization_worker_#{n}"
+
   @doc false
   def child_spec(opts) do
-    JobWorker.child_spec(Keyword.merge(opts, handler: __MODULE__, worker_id: registration()))
+    worker_id = Keyword.get(opts, :worker_id, registration())
+
+    JobWorker.child_spec(Keyword.merge(opts, handler: __MODULE__, worker_id: worker_id))
   end
 end

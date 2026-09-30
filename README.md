@@ -2,20 +2,34 @@
 
 **Embedded offline context store for AI agents** — a persistent URI-addressed tree with vector search, LLM summarization, and optional WebSocket API.
 
+## Guides
+
+- [Quickstart](docs/QUICKSTART.md) — 5 minutes to first write, read, search, and health check.
+- [Setup](docs/SETUP.md) — full install, configuration, backends, and verification.
+- [Usage](docs/USAGE.md) — daily workflows: documents, search, memory, sessions, skills, CLI, MCP, WebSocket.
+- [Agent setup](docs/agents.md) — OpenCode and Zed snippets (canonical).
+
 ## Features
 
 - **Hierarchical context tree** — `viking://` URIs with `resources/`, `user/{id}/memories`, `user/{id}/resources`, `user/{id}/skills`, `peers/`
 - **Layered content** — Full content (L2) with optional caller-supplied or LLM-generated abstract (L0) and overview (L1)
 - **Keyword search** — Case-insensitive substring search over content/abstract/overview with subtree scoping
+- **Path discovery (`find`)** — Literal, case-insensitive URI-path match with subtree scoping and bounded results
+- **Content inspection (`grep`)** — Literal, case-insensitive L2-only line matches with subtree scoping and bounded excerpts
 - **Vector search** — Semantic similarity search via sqlite-vec (HNSW index) with 384-dim embeddings
 - **Hybrid search** — Reciprocal Rank Fusion of keyword + vector results
-- **LLM summarization** — Auto-generates abstract/overview using local Phi-3-mini (configurable)
+- **LLM summarization** — Auto-generates abstract/overview using a local model (Qwen3-0.6B by default, configurable)
 - **Async writes** — Immediate acknowledgement, background embedding/summarization jobs
 - **Sessions** — Append-only message lists with commit-to-context-tree
 - **Memory** — Typed, durable facts under `viking://user/memories/` with confidence, provenance, and supersession; recall and forgetting without a model
 - **Agent Skills** — Import a skill folder or tar archive into `viking://user/{id}/skills/`, from the console or a Mix task, replacing a same-named skill as a whole
 - **WebSocket API** — Phoenix Channel at `/api` with `v1.*` events, optional Bearer auth
 - **Fully local** — No external dependencies at runtime (models cached locally)
+- **Reactive subscriptions** — `AgentDb.subscribe/1` and `v1.subscribe` over `AgentDb.PubSub` with versioned `{:context_changed, uri, kind, version}` events for writes, removals, replacements, and commits; BEAM cluster distribution explicitly deferred
+- **Elixir code index** — Structural `.ex`/`.exs` indexing via `Code.string_to_quoted/2` under `viking://resources/<project>/code/` with OTP-aware caller/callee queries, no model required
+- **Hex docs** — Locked-version-aware docs under `viking://resources/hex/<package>/<version>/` discovered offline from `mix.lock`
+- **BEAM runtime snapshots** — Read-only `AgentDb.RuntimeContext.snapshot/0` (apps, supervisors, processes, ETS, memory) with bounds and redaction; never auto-writes
+- **Pluggable inference** — Local Nx/Bumblebee default plus opt-in Ollama and OpenAI-compatible adapters behind `AgentDb.Core.Inference`; `model_status/0` reports active provider kind
 
 ## Installation
 
@@ -26,6 +40,8 @@ def deps do
   ]
 end
 ```
+
+Full setup (directories, environment, listener, auth, backends): [Setup](docs/SETUP.md).
 
 ## Quick Start
 
@@ -46,6 +62,12 @@ end
 {:ok, results} = AgentDb.search("greeting", mode: :vector)   # Semantic search
 {:ok, results} = AgentDb.search("hello", mode: :hybrid)      # Combined
 
+# Navigate stored context progressively
+{:ok, paths} = AgentDb.find("auth", scope: "viking://resources/my_project", limit: 50)
+#=> [%{uri: "viking://resources/my_project/auth.md", name: "auth.md", kind: :doc}]
+{:ok, lines} = AgentDb.grep("def run", scope: "viking://resources/my_project", limit: 50)
+#=> [%{uri: "viking://resources/my_project/src/main.ex", line_number: 2, excerpt: "  def run, do: :ok"}]
+
 # Sessions
 {:ok, session_id} = AgentDb.create_session()
 :ok = AgentDb.append_message(session_id, :user, "Remember this")
@@ -60,6 +82,9 @@ end
 {:ok, [memory]} = AgentDb.recall("viking://user/memories/preferences/language")
 :ok = AgentDb.forget("viking://user/memories/preferences/language")
 ```
+
+New here? Follow [Quickstart](docs/QUICKSTART.md) instead — same first success
+in 5 minutes with verification. Daily workflows: [Usage](docs/USAGE.md).
 
 ## Memory
 
@@ -242,6 +267,52 @@ The task starts the application, imports through the same workflow, prints one
 line per skill, and exits with a failure if the source was refused or any skill
 failed. `mix help agent_db.import_skills` prints the same rules it follows.
 
+### Data handoff (export_data / import_data)
+
+One agent hands its stored context to another as a single offline tar file:
+
+```elixir
+:ok = AgentDb.write("viking://resources/project/readme.md", "# Project")
+{:ok, _} = AgentDb.export_data("/tmp/backup.tar.gz")
+{:ok, _} = AgentDb.export_data("/tmp/project.tar", scope: "viking://resources/project")
+```
+
+```bash
+mix agent_db.export_data /tmp/backup.tar.gz --json
+mix agent_db.export_data /tmp/project.tar --scope viking://resources/project
+mix agent_db.import_data /tmp/backup.tar.gz --json
+```
+
+`export_data` snapshots documents (full content plus caller-supplied
+abstract/overview), memory provenance, and sessions into a `.tar` or
+`.tar.gz` archive with a manifest. `import_data` validates the whole archive
+before writing anything — a refused archive (traversal, symlink, non-UTF-8,
+oversize, corrupt, newer format) leaves the store exactly as it was — then
+merges by URI: missing URIs are created, present ones revised in place,
+colliding sessions skipped, nothing outside the archive deleted.
+Re-importing an unchanged archive converges without duplication. Embeddings
+and generated summaries regenerate through the existing job queue; they are
+not carried in the archive.
+
+### Context CLI
+
+```bash
+mix agent_db.index --project myapp --dir lib
+mix agent_db.search "authentication" --mode keyword --scope viking://resources/myapp
+mix agent_db.tree viking://resources/myapp --depth 2
+mix agent_db.doctor
+```
+
+All four reuse the `AgentDb` facade, so console, WebSocket, and CLI share one
+workflow.
+
+### Agent setup (OpenCode, Zed)
+
+`POST /mcp` serves the store as MCP tools for remote agents
+(`http://127.0.0.1:6060/mcp` by default, Bearer opt-in). CLI tasks accept
+`--json` for machine-readable output. See `docs/agents.md` for copy-paste
+OpenCode/Zed snippets, WSL notes, and `tools/install.sh --check`.
+
 ### Replacement
 
 A skill whose name is already stored for that user is **replaced whole**: the
@@ -279,74 +350,48 @@ A reason is always given, and a refused source is never partly written:
 - a file that is not valid UTF-8 text
 - a file count or byte count over the limits above
 
-## Configuration
+## Navigating context (find/grep)
 
-All configuration via `Application.put_env/3` or `config/runtime.exs`:
+`find/2` discovers files and directories by URI path; `grep/2` inspects
+matching source lines in full document content (L2). Both are read-only,
+need no model, and are available in-process (`AgentDb.find/2`,
+`AgentDb.grep/2`) and over WebSocket (`v1.find`, `v1.grep`).
 
 ```elixir
-# config/runtime.exs
-import Config
-
-config :agent_db,
-  # Data directory (default: ./data)
-  data_dir: "/path/to/data",
-  
-  # Model cache directory (default: ./models)
-  model_cache_dir: "/path/to/models",
-  
-  # Embedding model (default: all-MiniLM-L6-v2, 384-dim)
-  embedding_model: "sentence-transformers/all-MiniLM-L6-v2",
-  embedding_model_url: "https://huggingface.co/.../model.safetensors",
-  
-  # LLM model (default: Phi-3-mini-4k-instruct, 3.8B)
-  llm_model: "microsoft/Phi-3-mini-4k-instruct",
-  llm_model_url: "https://huggingface.co/.../model-q4_k_m.gguf",
-  
-  # Write mode (default: true = async)
-  async_writes: true,
-  
-  # Job worker pool size (default: CPU cores)
-  job_workers: 4,
-  
-  # EXLA backend: :cpu, :cuda, :rocm
-  exla_backend: :cpu,
-  
-  # HTTP/WebSocket API (default: true; false in :test)
-  http_enabled: true,
-  
-  # Optional Bearer token auth
-  http_auth: false,
-  http_auth_tokens: ["token1", "token2"]
+{:ok, paths} = AgentDb.find("auth", scope: "viking://resources/project", limit: 50)
+{:ok, lines} = AgentDb.grep("TODO", scope: "viking://resources/project", limit: 50)
 ```
 
+- **Matching:** non-empty literal substring, 1 through 256 characters,
+  case-insensitive. `%`, `_`, `\`, and regular-expression metacharacters
+  match literally. `find` matches the URI path excluding the `viking://`
+  scheme and returns `%{uri, name, kind}` without document content;
+  `grep` matches L2 content only (never abstracts or overviews) and
+  returns `%{uri, line_number, excerpt}` with one-based line numbers.
+- **Scoping:** optional `scope` URI; results include the scope node and
+  its descendants only. Scope membership is exact-URI-or-descendant, so
+  `viking://resources/project` never matches a sibling
+  `viking://resources/project-old`. A malformed scope is
+  `{:error, :invalid_uri}`; a missing scope is `{:error, :not_found}`.
+- **Limits and ordering:** default `limit` 50, maximum 200;
+  `{:error, {:invalid_limit, limit}}` outside 1 through 200.
+  `find` is ordered by URI; `grep` by URI then line number. Each `grep`
+  excerpt contains the match and is at most 280 characters; an empty
+  match is `{:ok, []}`.
+- **Storage providers:** custom `AgentDb.Core.Storage` adapters must
+  implement `find_paths/3` and `grep_content/3`; startup validates the
+  complete port and rejects providers missing them. No migration is
+  needed; the operations write nothing.
+
+## Configuration
+
+Full configuration reference (every `AGENT_DB_*` variable with defaults,
+listener, auth, backends): [Setup](docs/SETUP.md). The table below is
+intentionally not duplicated here so the two cannot disagree.
 ### HTTP listener
 
-The listener is opened in every environment where HTTP is enabled. This depends
-on `server: true` being set on the endpoint configuration, which
-`config/runtime.exs` does — without it Phoenix starts the endpoint and binds
-nothing, and reports that only under a release, so the surface is silently
-absent under `mix run` and `iex -S mix`.
-
-| Variable | Default | Meaning |
-|----------|---------|---------|
-| `AGENT_DB_HTTP_ENABLED` | `true` (`false` in `:test`) | Whether the endpoint is started and serves |
-| `AGENT_DB_HTTP_PORT` | `4000` | Port served, and the port used for URL generation |
-| `AGENT_DB_HTTP_IP` | `127.0.0.1` | Interface bound |
-
-The port is resolved once, in `config/runtime.exs`, and used for both the
-listener and the endpoint's `url:` — so the two cannot disagree. `PORT` is **not**
-read; a deployment that sets it must move to `AGENT_DB_HTTP_PORT`.
-
-**The bind defaults to loopback.** The HTTP surface is unauthenticated by design
-— it exposes document and memory content, session identifiers and model state —
-so it does not land on every interface unless you ask for it. To serve a private
-network, set `AGENT_DB_HTTP_IP` to that address and make sure the port is not
-exposed more widely than you intend.
-
-```bash
-# reachable from other machines on the LAN
-AGENT_DB_HTTP_ENABLED=true AGENT_DB_HTTP_IP=0.0.0.0 AGENT_DB_HTTP_PORT=4000 iex -S mix
-```
+Listener, port, bind interface, and Bearer opt-in: [Setup](docs/SETUP.md#http-listener-and-auth).
+Defaults: port `6060`, bind `127.0.0.1` (loopback). `PORT` is **not** read.
 
 ### Known issues on the HTTP surface
 
@@ -366,49 +411,49 @@ until now nothing was listening:
 
 ### Environment Variables
 
-All config can be set via environment variables:
-
-| Config | Env Var | Default |
-|--------|---------|---------|
-| `data_dir` | `AGENT_DB_DATA_DIR` | `./data` |
-| `model_cache_dir` | `AGENT_DB_MODEL_CACHE_DIR` | `./models` |
-| `embedding_model` | `AGENT_DB_EMBEDDING_MODEL` | `all-MiniLM-L6-v2` |
-| `embedding_model_url` | `AGENT_DB_EMBEDDING_MODEL_URL` | HF URL |
-| `llm_model` | `AGENT_DB_LLM_MODEL` | `Phi-3-mini-4k-instruct` |
-| `llm_model_url` | `AGENT_DB_LLM_MODEL_URL` | HF URL |
-| `async_writes` | `AGENT_DB_ASYNC_WRITES` | `true` |
-| `job_workers` | `AGENT_DB_JOB_WORKERS` | CPU cores |
-| `exla_backend` | `AGENT_DB_EXLA_BACKEND` | `cpu` |
-| `http_enabled` | `AGENT_DB_HTTP_ENABLED` | `true` (`false` in `:test`) |
-| `http_ip` | `AGENT_DB_HTTP_IP` | `127.0.0.1` |
-| `http_auth` | `AGENT_DB_HTTP_AUTH` | `false` |
-| `http_auth_tokens` | `AGENT_DB_HTTP_AUTH_TOKENS` | `[]` |
+Full table with defaults and failure recovery: [Setup](docs/SETUP.md#environment-reference).
 
 ## WebSocket API
 
-Connect to `ws://localhost:4000/api` and send messages:
+Full event reference with copy-paste payloads: [Usage](docs/USAGE.md#websocket-v1).
+Connect to `ws://localhost:6060/api`; with auth enabled, include
+`Authorization: Bearer <token>` header on connect.
 
-```json
-// Write
-{"event": "v1.write", "payload": {"uri": "viking://resources/foo.md", "content": "Hello", "opts": {}}}
+## Operations
 
-// Read
-{"event": "v1.read", "payload": {"uri": "viking://resources/foo.md"}}
-
-// Search
-{"event": "v1.search", "payload": {"term": "hello", "opts": {"mode": "hybrid", "top_k": 10}}}
-
-// Session
-{"event": "v1.create_session", "payload": {}}
-{"event": "v1.append_message", "payload": {"session_id": "...", "role": "user", "content": "hi"}}
-{"event": "v1.get_session", "payload": {"session_id": "..."}}
-{"event": "v1.commit_session", "payload": {"session_id": "...", "destination_uri": "viking://user/me/memories/s"}}
-
-// Model status
-{"event": "v1.model_status", "payload": {}}
-```
-
-With auth enabled, include `Authorization: Bearer <token>` header on connect.
+- **Worker count (`job_workers`, `AGENT_DB_JOB_WORKERS`, default CPU cores):**
+  the setting is the worker count *per job family* — N embedding plus N
+  summarization processes (2N total), each with a unique worker ID. Must be a
+  positive integer; startup raises otherwise. More workers drain the queue
+  faster but do not increase model throughput: `ModelManager` is a single
+  GenServer serializing inference.
+- **Write outcomes:** a write persists the document and all required jobs
+  atomically. Enqueue failure returns an error with no partial write and
+  untouched cache/queue. Sync writes (`async: false`) report one of three
+  outcomes: completed (`:ok`), failed (`{:error, {:background_jobs_failed,
+  uri}}`), or still outstanding (`{:error, {:background_jobs_pending,
+  uri}}`) — never success for failed work.
+- **Hybrid search errors:** leg timeouts and task exits return classified
+  errors (`{:hybrid_leg_timeout, leg}`, `{:hybrid_leg_failed, leg, _}`)
+  without terminating the caller or the WebSocket connection.
+- **Telemetry:** `:telemetry` events (`agent_db.operation.stop`,
+  `agent_db.job.stop` with queue-wait vs execution split,
+  `agent_db.model.stop`) are always emitted locally with bounded dimensions
+  (operation/kind/role/outcome) — never URIs, content, prompts, users, or
+  credentials.
+- **Traces (host-owned export):** the store creates OTel spans and propagates
+  W3C context through HTTP/WebSocket operations into durable job payloads
+  (additive `_trace` key, no migration; old jobs start a new trace). Spans
+  are no-ops until the *host* configures an SDK/exporter/sampler — the store
+  ships no exporter and requires none at runtime.
+- **Logs:** operational logs are structured fields (component, operation,
+  kind, outcome, classified reason, trace/job IDs). Document content, model
+  prompts, tokens, and credentials are never logged; configured model URLs
+  are redacted (credentials and secret query params removed).
+- **Benchmarks:** `mix run bench/agent_db_bench.exs` runs deterministic
+  scenarios (reads, tree, keyword/hybrid, writes, queue) on isolated SQLite
+  data; baselines live in `bench/baseline.md`. No absolute latency is
+  asserted in CI; only repeatable measured deltas justify optimization.
 
 ## Architecture
 
@@ -434,9 +479,10 @@ AgentDb.Application
 | Model | Role | Size | Format |
 |-------|------|------|--------|
 | `all-MiniLM-L6-v2` | Embeddings | ~90MB | safetensors |
-| `Phi-3-mini-4k-instruct` | Summarization | ~2.3GB | GGUF (q4) |
+| `Qwen3-0.6B` | Summarization | ~0.6B params | GGUF (Q4_K_M) |
 
 Models auto-download on first use to `model_cache_dir`. Can be pre-placed manually.
+Details: [Setup](docs/SETUP.md#models-pre-placement-and-cache-recovery).
 
 ### Model cache notes
 
@@ -449,6 +495,16 @@ Models auto-download on first use to `model_cache_dir`. Can be pre-placed manual
   It previously had no effect. `:cpu` uses Nx's default backend; `:cuda` and
   `:rocm` require a matching `config :exla, clients` entry, and **loading fails
   with an error if none is configured** rather than quietly falling back to CPU.
+- `ml_backend` (`AGENT_DB_ML_BACKEND`, `auto` | `exla` | `emlx`, default `auto`)
+  selects the ML runtime. `:auto` prefers EMLX on Apple Silicon macOS and EXLA
+  elsewhere; `:emlx` forces EMLX with fallback to EXLA plus a warning when EMLX
+  is unavailable. `AGENT_DB_ML_BACKEND=emlx mix run` forces EMLX;
+  `AGENT_DB_ML_BACKEND=exla` pins EXLA for CI/debugging.
+- EMLX/EMLXAxon (`{:emlx, "~> 0.5"}`, `{:emlx_axon, "~> 0.5"}`, both
+  `optional: true, runtime: false`) are macOS-only acceleration for Apple
+  Silicon (MLX GPU/Neural Engine, Metal shaders for LLM). They are not fetched
+  on Linux CI and never start unless `ml_backend` needs them; when EMLX init
+  fails the store logs a warning and continues on EXLA CPU.
 - If a model cannot be downloaded or loaded, the operation that needed it
   returns `{:error, reason}`. It does not terminate the calling process, and the
   rest of the store keeps working.

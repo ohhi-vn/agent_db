@@ -84,6 +84,27 @@ defmodule AgentDb.Config do
   end
 
   @doc """
+  Which ML runtime loads embedding and summarization models.
+
+  `:auto` (default) prefers EMLX on Apple Silicon macOS and EXLA elsewhere.
+  `:exla` forces EXLA; `:emlx` forces EMLX (falls back to EXLA with a warning
+  when EMLX is unavailable). Configured via `AGENT_DB_ML_BACKEND`
+  (`"auto" | "exla" | "emlx"`).
+  """
+  @spec ml_backend() :: :auto | :exla | :emlx
+  def ml_backend do
+    case Application.get_env(:agent_db, :ml_backend, :auto) do
+      :auto -> :auto
+      :exla -> :exla
+      :emlx -> :emlx
+      "auto" -> :auto
+      "exla" -> :exla
+      "emlx" -> :emlx
+      _ -> :auto
+    end
+  end
+
+  @doc """
   How long a model-dependent call waits for a lazy load to finish before
   reporting that the model is still loading.
 
@@ -96,6 +117,45 @@ defmodule AgentDb.Config do
   @spec model_load_grace_ms() :: pos_integer()
   def model_load_grace_ms do
     Application.get_env(:agent_db, :model_load_grace_ms, 10_000)
+  end
+
+  @doc """
+  Which inference provider serves `embed/1` and `summarize/2`.
+
+  `:local` (default) runs Nx/Bumblebee models in-process. `:ollama`,
+  `:openai_compatible`, or a custom module implementing
+  `AgentDb.Core.Inference` may be configured instead. Switching providers
+  never changes `AgentDb` signatures or search result shapes.
+  """
+  @spec inference_provider() :: :local | :ollama | :openai_compatible | module()
+  def inference_provider do
+    Application.get_env(:agent_db, :inference_provider, :local)
+  end
+
+  @spec ollama_base_url() :: String.t()
+  def ollama_base_url do
+    Application.get_env(:agent_db, :ollama_base_url) ||
+      System.get_env("AGENT_DB_OLLAMA_URL") || "http://localhost:11434"
+  end
+
+  @spec ollama_embed_model() :: String.t()
+  def ollama_embed_model do
+    Application.get_env(:agent_db, :ollama_embed_model) || "nomic-embed-text"
+  end
+
+  @spec ollama_llm_model() :: String.t()
+  def ollama_llm_model do
+    Application.get_env(:agent_db, :ollama_llm_model) || "llama3.1"
+  end
+
+  @spec openai_compatible_base_url() :: String.t() | nil
+  def openai_compatible_base_url do
+    Application.get_env(:agent_db, :openai_base_url) || System.get_env("AGENT_DB_OPENAI_BASE_URL")
+  end
+
+  @spec openai_api_key() :: String.t() | nil
+  def openai_api_key do
+    Application.get_env(:agent_db, :openai_api_key) || System.get_env("AGENT_DB_OPENAI_API_KEY")
   end
 
   @spec http_enabled() :: boolean()

@@ -85,7 +85,24 @@ defmodule AgentDbWeb.Context do
   # number when a caller passed one, so both are read the same way here rather
   # than each reaching the store as something it has to interpret.
   defp search_options(opts) do
-    [mode: opts["mode"] || :keyword, top_k: top_k(opts)]
+    base = [mode: opts["mode"] || :keyword, top_k: top_k(opts)]
+    base = with_scope(base, opts)
+
+    case opts["trace_context"] do
+      %{trace_id: _, span_id: _} = ctx -> Keyword.put(base, :trace_context, ctx)
+      _ -> base
+    end
+  end
+
+  # A scope arrives as the string the console carries. An empty scope is no
+  # scope; anything else is passed through so the store validates it and
+  # reports an invalid one rather than this module substituting for it.
+  defp with_scope(base, opts) do
+    case opts["scope"] do
+      nil -> base
+      "" -> base
+      scope -> Keyword.put(base, :scope, scope)
+    end
   end
 
   defp top_k(opts) do

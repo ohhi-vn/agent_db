@@ -34,6 +34,12 @@ defmodule AgentDbWeb.Router do
     live("/admin/documents/:id/edit", DocumentEditorLive, :edit)
   end
 
+  scope "/", AgentDbWeb.Controllers do
+    pipe_through(:api)
+
+    post("/mcp", McpController, :handle)
+  end
+
   scope "/api/v1", AgentDbWeb.Controllers do
     pipe_through(:api)
 

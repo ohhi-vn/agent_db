@@ -94,6 +94,57 @@ defmodule AgentDbWeb.ChannelTest do
     end
   end
 
+  describe "navigation" do
+    test "v1.find discovers paths with scope and limit" do
+      :ok = AgentDb.write("viking://resources/chan-find/project/auth.md", "a")
+      :ok = AgentDb.write("viking://resources/chan-find/project/nested/other.md", "b")
+
+      assert {:reply, {:ok, %{results: results}}, _} =
+               event("v1.find", %{
+                 "term" => "auth",
+                 "opts" => %{"scope" => "viking://resources/chan-find/project", "limit" => 10}
+               })
+
+      assert [%{uri: "viking://resources/chan-find/project/auth.md"}] = results
+      assert %{name: "auth.md", kind: :doc} = hd(results)
+    end
+
+    test "v1.grep returns lines with numbers and excerpts" do
+      :ok = AgentDb.write("viking://resources/chan-grep/a.md", "first\nsecond needle here\nthird")
+
+      assert {:reply, {:ok, %{results: results}}, _} =
+               event("v1.grep", %{
+                 "term" => "needle",
+                 "opts" => %{"scope" => "viking://resources/chan-grep/a.md"}
+               })
+
+      assert [%{uri: "viking://resources/chan-grep/a.md", line_number: 2}] = results
+      assert String.contains?(hd(results).excerpt, "needle")
+    end
+
+    test "invalid navigation input errors without closing the connection" do
+      assert {:reply, {:error, %{reason: _}}, socket} =
+               event("v1.find", %{"term" => "", "opts" => %{}})
+
+      assert {:reply, {:ok, %{results: _}}, ^socket} =
+               event("v1.find", %{"term" => "auth", "opts" => %{}}, socket)
+
+      assert {:reply, {:error, %{reason: _}}, socket} =
+               event("v1.grep", %{"term" => "x", "opts" => %{"limit" => 0}})
+
+      assert {:reply, {:ok, %{results: _}}, ^socket} =
+               event("v1.grep", %{"term" => "x", "opts" => %{}}, socket)
+    end
+
+    test "navigation drops unrecognised options" do
+      assert {:reply, {:ok, %{results: _}}, _} =
+               event("v1.find", %{"term" => "auth", "opts" => %{"bogus" => "x"}})
+
+      assert {:reply, {:ok, %{results: _}}, _} =
+               event("v1.grep", %{"term" => "x", "opts" => %{"bogus" => "x"}})
+    end
+  end
+
   describe "versioning" do
     test "an unknown event is reported, not ignored" do
       assert {:reply, {:error, %{reason: {:unknown_event, "v9.write"}}}, _} =

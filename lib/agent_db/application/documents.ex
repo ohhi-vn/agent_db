@@ -10,6 +10,7 @@ defmodule AgentDb.Application.Documents do
   # -- and none of how any of it is stored.
 
   alias AgentDb.Cache
+  alias AgentDb.Observability
   alias AgentDb.Runtime
   alias AgentDb.URI, as: VikingURI
 
@@ -41,17 +42,23 @@ defmodule AgentDb.Application.Documents do
   """
   @spec write(uri(), content(), keyword()) :: :ok | {:error, term()}
   def write(uri, content, opts \\ []) when is_binary(content) do
+    Observability.timed(:write, %{}, fn ->
+      Observability.with_span("agent_db.write", %{}, fn -> do_write(uri, content, opts) end)
+    end)
+  end
+
+  defp do_write(uri, content, opts) do
     async = Keyword.get(opts, :async, AgentDb.Config.async_writes())
 
     with {:ok, segments} <- VikingURI.parse(uri),
-         :ok <- persist(segments, content, opts) do
+         jobs = jobs_for(uri, content, opts),
+         :ok <- persist(segments, content, opts, jobs) do
       Cache.invalidate_write(uri)
 
       if async do
-        enqueue(uri, content, kinds_for(opts))
         :ok
       else
-        settle(uri, content, opts)
+        settle(uri, opts)
       end
     else
       :root -> {:error, :is_root}
@@ -59,8 +66,12 @@ defmodule AgentDb.Application.Documents do
     end
   end
 
-  defp persist(segments, content, opts) do
-    Runtime.storage().put_document(VikingURI.build(segments), content, opts)
+  defp persist(segments, content, opts, jobs) do
+    Runtime.storage().put_document(
+      VikingURI.build(segments),
+      content,
+      Keyword.put(opts, :jobs, jobs)
+    )
   end
 
   # A layer the caller supplied is already stored, so regenerating it would
@@ -74,17 +85,25 @@ defmodule AgentDb.Application.Documents do
     [:embed | missing]
   end
 
-  defp enqueue(uri, content, kinds) do
-    storage = Runtime.storage()
-    Enum.each(kinds, &storage.enqueue_job(&1, %{uri: uri, content: content}))
+  defp jobs_for(uri, content, opts) do
+    base = %{uri: uri, content: content}
+
+    payload =
+      case Keyword.get(opts, :trace_context) do
+        %{trace_id: _, span_id: _} = ctx ->
+          Map.put(base, "_trace", %{trace_id: ctx.trace_id, span_id: ctx.span_id})
+
+        _ ->
+          base
+      end
+
+    Enum.map(kinds_for(opts), &{&1, payload})
   end
 
   # A synchronous caller is told which of three things happened. The pending
   # count once excluded failed rows, so a job that died on its first attempt
   # read as an idle queue and the write reported success having done nothing.
-  defp settle(uri, content, opts) do
-    enqueue(uri, content, kinds_for(opts))
-
+  defp settle(uri, opts) do
     deadline =
       System.monotonic_time(:millisecond) + Keyword.get(opts, :sync_timeout_ms, @write_timeout_ms)
 
@@ -115,9 +134,11 @@ defmodule AgentDb.Application.Documents do
   @doc "Reads full document content (L2)."
   @spec read(uri()) :: {:ok, content()} | {:error, term()}
   def read(uri) do
-    with {:ok, segments} <- VikingURI.parse(uri) do
-      layer(segments, & &1.content)
-    end
+    Observability.timed(:read, %{}, fn ->
+      with {:ok, segments} <- VikingURI.parse(uri) do
+        layer(segments, & &1.content)
+      end
+    end)
   end
 
   @doc """
@@ -129,17 +150,21 @@ defmodule AgentDb.Application.Documents do
   """
   @spec abstract(uri()) :: {:ok, content()} | {:error, term()}
   def abstract(uri) do
-    with {:ok, segments} <- VikingURI.parse(uri) do
-      layer(segments, fn node -> node.abstract || first_line(node.content) end)
-    end
+    Observability.timed(:abstract, %{}, fn ->
+      with {:ok, segments} <- VikingURI.parse(uri) do
+        layer(segments, fn node -> node.abstract || first_line(node.content) end)
+      end
+    end)
   end
 
   @doc "Reads the L1 overview, falling back to the first 280 characters of content."
   @spec overview(uri()) :: {:ok, content()} | {:error, term()}
   def overview(uri) do
-    with {:ok, segments} <- VikingURI.parse(uri) do
-      layer(segments, fn node -> node.overview || first_chars(node.content) end)
-    end
+    Observability.timed(:overview, %{}, fn ->
+      with {:ok, segments} <- VikingURI.parse(uri) do
+        layer(segments, fn node -> node.overview || first_chars(node.content) end)
+      end
+    end)
   end
 
   defp layer(segments, select) do
@@ -159,9 +184,87 @@ defmodule AgentDb.Application.Documents do
   @doc "Lists the names of a URI's direct children, and only those."
   @spec list(uri()) :: {:ok, [String.t()]} | {:error, term()}
   def list(uri) do
-    case VikingURI.parse(uri) do
-      {:ok, segments} -> Runtime.storage().list_children(VikingURI.build(segments))
-      {:error, _} = err -> err
+    Observability.timed(:list, %{}, fn ->
+      case VikingURI.parse(uri) do
+        {:ok, segments} -> Runtime.storage().list_children(VikingURI.build(segments))
+        {:error, _} = err -> err
+      end
+    end)
+  end
+
+  @default_find_limit 50
+  @max_find_limit 200
+  @max_query_length 256
+
+  @doc """
+  Discovers files and directories whose URI path contains `query`.
+
+  `query` is a non-empty literal substring of at most 256 characters,
+  matched case-insensitively over the URI path (excluding the `viking://`
+  scheme). SQL wildcards and regular-expression metacharacters match
+  literally.
+
+  Options:
+    - `:scope` - a URI; only the scope node and its descendants match
+    - `:limit` - maximum results (default 50, maximum 200)
+
+  Results are ordered by URI without document content, and an empty match
+  is `{:ok, []}` rather than an error.
+  """
+  @spec find(String.t(), keyword()) :: {:ok, [map()]} | {:error, term()}
+  def find(query, opts \\ []) do
+    Observability.timed(:find, %{}, fn ->
+      with :ok <- validate_query(query),
+           {:ok, limit} <- validate_limit(opts),
+           {:ok, scope_uri} <- validate_scope(opts) do
+        Runtime.storage().find_paths(query, scope_uri, limit)
+      end
+    end)
+  end
+
+  defp validate_query(query) when is_binary(query) do
+    if String.valid?(query) and String.length(query) >= 1 and
+         String.length(query) <= @max_query_length do
+      :ok
+    else
+      {:error, {:invalid_query, query}}
+    end
+  end
+
+  defp validate_query(query), do: {:error, {:invalid_query, query}}
+
+  defp validate_limit(opts) do
+    case Keyword.get(opts, :limit, @default_find_limit) do
+      limit when is_integer(limit) and limit >= 1 and limit <= @max_find_limit -> {:ok, limit}
+      limit -> {:error, {:invalid_limit, limit}}
+    end
+  end
+
+  # A `nil` scope searches the whole tree. The root searches everything as
+  # well, so it needs no existence check. Any other scope must parse and
+  # exist, otherwise a typo would silently answer with nothing.
+  defp validate_scope(opts) do
+    case Keyword.get(opts, :scope) do
+      nil ->
+        {:ok, nil}
+
+      uri when is_binary(uri) ->
+        with {:ok, segments} <- VikingURI.parse(uri) do
+          scope_uri = VikingURI.build(segments)
+
+          if segments == [] do
+            {:ok, nil}
+          else
+            case Runtime.storage().get_node(scope_uri) do
+              {:ok, nil} -> {:error, :not_found}
+              {:ok, _node} -> {:ok, scope_uri}
+              {:error, _} = err -> err
+            end
+          end
+        end
+
+      _other ->
+        {:error, :invalid_uri}
     end
   end
 
@@ -170,10 +273,12 @@ defmodule AgentDb.Application.Documents do
   def tree(uri, depth \\ 2)
 
   def tree(uri, depth) when is_integer(depth) and depth >= 1 do
-    with {:ok, segments} <- VikingURI.parse(uri),
-         {:ok, node} <- fetch_entry(segments) do
-      project(node, depth)
-    end
+    Observability.timed(:tree, %{}, fn ->
+      with {:ok, segments} <- VikingURI.parse(uri),
+           {:ok, node} <- fetch_entry(segments) do
+        project(node, depth)
+      end
+    end)
   end
 
   defp fetch_entry([]), do: {:error, :not_found}
@@ -230,13 +335,15 @@ defmodule AgentDb.Application.Documents do
   @doc "Removes the subtree at `uri`, from every store keyed by URI."
   @spec rm(uri()) :: :ok | {:error, term()}
   def rm(uri) do
-    with {:ok, _segments} <- VikingURI.parse(uri),
-         :ok <- Runtime.storage().remove_subtree(uri) do
-      Cache.invalidate_removal(uri)
-      :ok
-    else
-      {:error, _} = err -> err
-    end
+    Observability.timed(:rm, %{}, fn ->
+      with {:ok, _segments} <- VikingURI.parse(uri),
+           :ok <- Runtime.storage().remove_subtree(uri) do
+        Cache.invalidate_removal(uri)
+        :ok
+      else
+        {:error, _} = err -> err
+      end
+    end)
   end
 
   # -- reading through the cache --

@@ -29,6 +29,7 @@ defmodule AgentDb do
   """
 
   alias AgentDb.Application.{Documents, Memories, Search, Sessions, Skills, Status}
+  alias AgentDb.Subscriptions
   alias AgentDb.URI, as: VikingURI
 
   @type uri :: String.t()
@@ -50,7 +51,16 @@ defmodule AgentDb do
     - `:abstract` / `:overview` - the caller's own L0 / L1 layers
   """
   @spec write(uri(), content(), keyword()) :: :ok | {:error, term()}
-  defdelegate write(uri, content, opts \\ []), to: Documents
+  def write(uri, content, opts \\ []) do
+    case Documents.write(uri, content, opts) do
+      :ok ->
+        notify(uri, :written)
+        :ok
+
+      {:error, _} = err ->
+        err
+    end
+  end
 
   @doc "Reads a document's full content (L2)."
   @spec read(uri()) :: {:ok, content()} | {:error, term()}
@@ -74,7 +84,16 @@ defmodule AgentDb do
 
   @doc "Removes the subtree at `uri`, from every store keyed by URI."
   @spec rm(uri()) :: :ok | {:error, term()}
-  defdelegate rm(uri), to: Documents
+  def rm(uri) do
+    case Documents.rm(uri) do
+      :ok ->
+        notify(uri, :removed)
+        :ok
+
+      {:error, _} = err ->
+        err
+    end
+  end
 
   # -- search --
 
@@ -90,6 +109,26 @@ defmodule AgentDb do
   """
   @spec search(String.t(), keyword()) :: {:ok, [map()]} | {:error, term()}
   defdelegate search(term, opts \\ []), to: Search
+
+  @doc """
+  Discovers files and directories whose URI path contains `query`.
+
+  A literal, case-insensitive substring match over the URI path (excluding
+  the `viking://` scheme). See `AgentDb.Application.Documents.find/2` for
+  scoping, limits, ordering, and errors.
+  """
+  @spec find(String.t(), keyword()) :: {:ok, [map()]} | {:error, term()}
+  defdelegate find(query, opts \\ []), to: Documents
+
+  @doc """
+  Searches full document content (L2) for a literal substring.
+
+  A literal, case-insensitive match that never looks at abstracts or
+  overviews. See `AgentDb.Application.Search.grep/2` for scoping, limits,
+  ordering, and errors.
+  """
+  @spec grep(String.t(), keyword()) :: {:ok, [map()]} | {:error, term()}
+  defdelegate grep(query, opts \\ []), to: Search
 
   # -- sessions --
 
@@ -114,13 +153,31 @@ defmodule AgentDb do
   """
   @spec commit_session(String.t(), String.t(), keyword()) ::
           {:ok, String.t() | :unchanged} | {:error, term()}
-  defdelegate commit_session(session_id, destination_uri, opts \\ []), to: Sessions, as: :commit
+  def commit_session(session_id, destination_uri, opts \\ []) do
+    case Sessions.commit(session_id, destination_uri, opts) do
+      {:ok, dest} when is_binary(dest) ->
+        notify(dest, :committed)
+        {:ok, dest}
+
+      other ->
+        other
+    end
+  end
 
   # -- memory --
 
   @doc "Records a durable fact as a memory. See `AgentDb.Application.Memories.remember/3`."
   @spec remember(uri(), content(), keyword()) :: {:ok, uri()} | {:error, term()}
-  defdelegate remember(uri, value, opts \\ []), to: Memories
+  def remember(uri, value, opts \\ []) do
+    case Memories.remember(uri, value, opts) do
+      {:ok, stored} ->
+        notify(stored, :written)
+        {:ok, stored}
+
+      {:error, _} = err ->
+        err
+    end
+  end
 
   @doc "Reads memories back. See `AgentDb.Application.Memories.recall/1`."
   @spec recall(uri() | keyword()) :: {:ok, [map()]} | {:error, term()}
@@ -128,11 +185,28 @@ defmodule AgentDb do
 
   @doc "Removes a memory and its provenance. See `AgentDb.Application.Memories.forget/1`."
   @spec forget(uri()) :: :ok | {:error, term()}
-  defdelegate forget(uri), to: Memories
+  def forget(uri) do
+    case Memories.forget(uri) do
+      :ok ->
+        notify(uri, :removed)
+        :ok
+
+      {:error, _} = err ->
+        err
+    end
+  end
 
   @doc "The memory types, for callers that need to enumerate the taxonomy."
   @spec memory_types() :: [String.t()]
   defdelegate memory_types(), to: Memories, as: :types
+
+  @doc "Subscribes the caller to changes beneath a `viking://` URI."
+  @spec subscribe(uri()) :: :ok | {:error, term()}
+  defdelegate subscribe(uri), to: Subscriptions
+
+  @doc "Unsubscribes the caller from a `viking://` URI scope."
+  @spec unsubscribe(uri()) :: :ok | {:error, term()}
+  defdelegate unsubscribe(uri), to: Subscriptions
 
   # -- skills --
 
@@ -161,7 +235,19 @@ defmodule AgentDb do
   """
   @spec import_skills(String.t(), AgentDb.Application.Skills.source()) ::
           {:ok, %{skills: [AgentDb.Application.Skills.result()]}} | {:error, term()}
-  defdelegate import_skills(user_id, source), to: Skills, as: :import
+  def import_skills(user_id, source) do
+    case Skills.import(user_id, source) do
+      {:ok, %{skills: skills} = out} ->
+        for %{status: status, name: name} when status in [:imported, :replaced] <- skills do
+          notify("viking://user/#{user_id}/skills/#{name}", :replaced)
+        end
+
+        {:ok, out}
+
+      {:error, _} = err ->
+        err
+    end
+  end
 
   @doc "The bounds one skill import accepts, for a caller that has to bound its own input."
   @spec skill_import_limits() :: %{max_entries: pos_integer(), max_bytes: pos_integer()}
@@ -174,6 +260,52 @@ defmodule AgentDb do
   @doc "The confidence recorded when a caller supplies none."
   @spec default_confidence() :: float()
   defdelegate default_confidence(), to: Memories
+
+  # -- data portability --
+
+  @doc """
+  Exports store data to a tar archive at `path`.
+
+  Snapshots documents (full content plus caller-supplied abstract/overview),
+  memory provenance, and sessions into a single `.tar` or `.tar.gz` file that
+  another store can import with `import_data/1`. With `scope:` the export is
+  limited to one subtree (sessions are included only for a full export).
+
+  Returns `{:ok, %{path:, scope:, documents:, memories:, sessions:, messages:}}`.
+  """
+  @spec export_data(Path.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def export_data(path, opts \\ []) do
+    AgentDb.Application.DataTransfer.export(path, opts)
+  end
+
+  @doc """
+  Imports a transfer archive created by `export_data/1` into the running store.
+
+  Accepts a filesystem path or `{:archive, binary}`. Validates the whole
+  archive before writing anything; a refused archive leaves the store exactly
+  as it was. Import merges by URI and never deletes content outside the
+  archive. Re-importing an unchanged archive converges without duplication.
+  """
+  @spec import_data(Path.t() | {:archive, binary()}, keyword()) :: {:ok, map()} | {:error, term()}
+  def import_data(source, _opts \\ []) do
+    case AgentDb.Application.DataTransfer.import(source) do
+      {:ok, %{uris: uris} = out} ->
+        for uri <- uris, do: notify(uri, :written)
+
+        {:ok, Map.delete(out, :uris)}
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  @doc "The bounds one data transfer accepts, for a caller that has to bound its own input."
+  @spec data_transfer_limits() :: %{max_entries: pos_integer(), max_bytes: pos_integer()}
+  defdelegate data_transfer_limits(), to: AgentDb.Application.DataTransfer, as: :limits
+
+  @doc "Why a data export or import was refused, as a sentence an operator can act on."
+  @spec export_data_error_message(term()) :: String.t()
+  defdelegate export_data_error_message(reason), to: AgentDb.Application.DataTransfer, as: :message
 
   # -- status --
 
@@ -194,4 +326,15 @@ defmodule AgentDb do
   @doc "The segments of a `viking://` URI, or `{:error, :invalid_uri}`."
   @spec parse_uri(uri()) :: {:ok, [String.t()]} | {:error, term()}
   def parse_uri(uri), do: VikingURI.parse(uri)
+
+  # Best-effort fan-out: a crashed or slow subscriber must never change the
+  # write outcome.
+  defp notify(uri, kind) do
+    Subscriptions.broadcast(uri, kind)
+    :ok
+  rescue
+    _ -> :ok
+  catch
+    _, _ -> :ok
+  end
 end

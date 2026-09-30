@@ -201,14 +201,27 @@ The store SHALL perform all core operations locally with no mandatory external d
 - **THEN** later requests that do not require that model are still served normally
 - **AND** a later request retries the load rather than inheriting a permanently broken state
 ### Requirement: Async write acknowledgement
-The store SHALL acknowledge writes (`write/3`) immediately after persisting to SQLite, before embedding generation and LLM summarization complete. Background jobs SHALL process embedding and summarization asynchronously. Readers SHALL see progressively enhanced content: content (L2) immediately, then abstract/overview (L0/L1) once generated, then vector searchability once embedded. A caller that has asked for the work to be completed before the write returns SHALL be told which of the three outcomes occurred: the work completed, the work failed, or the work is still outstanding. A failed job SHALL NOT be reported to a synchronous caller as though the work had completed.
+The store SHALL persist a document and all required durable background jobs for that write as one storage outcome before acknowledging success. The store SHALL acknowledge a successful write (`write/3`) before embedding generation and LLM summarization complete. Background jobs SHALL process embedding and summarization asynchronously. Readers SHALL see progressively enhanced content: content (L2) immediately, then abstract/overview (L0/L1) once generated, then vector searchability once embedded. If persistence or enqueueing any required job fails, the operation SHALL return an error and SHALL leave the prior document state, cache state, and queue state unchanged. A caller that has asked for the work to be completed before the write returns SHALL be told which of the three outcomes occurred: the work completed, the work failed, or the work is still outstanding. A failed job SHALL NOT be reported to a synchronous caller as though the work had completed.
 
 #### Scenario: Write returns before embeddings ready
-- **WHEN** a caller writes a document
-- **THEN** `:ok` is returned immediately
-- **AND** `read/1` returns content immediately
+- **WHEN** a caller writes a document with asynchronous writes enabled
+- **THEN** `:ok` is returned after the document and all required jobs are durably stored, before inference completes
+- **AND** `read/1` returns the content immediately
 - **AND** `abstract/1` and `overview/1` return fallback or generated content when ready
-- **AND** `search/2` with `mode: :vector` includes the document once embedding is indexed
+- **AND** `search/2` with `mode: :vector` includes the document once its embedding is indexed
+
+#### Scenario: Caller-supplied layers omit unnecessary jobs
+- **WHEN** a caller writes a document with a caller-supplied abstract or overview
+- **THEN** the supplied layer is stored verbatim
+- **AND** no job is enqueued to generate that supplied layer
+- **AND** all other required jobs are durably stored before successful acknowledgement
+
+#### Scenario: Enqueue failure rolls back the write outcome
+- **WHEN** the store cannot enqueue any required job for a document write
+- **THEN** `write/3` returns an error identifying the enqueue failure
+- **AND** no partial job set remains
+- **AND** a new document is absent, or an existing document retains its prior content and layers
+- **AND** cached reads continue to agree with the durable document state
 
 #### Scenario: Synchronous write reports completion honestly
 - **WHEN** a caller writes with `async: false` and the background jobs complete
@@ -265,3 +278,49 @@ The store SHALL be configurable for: embedding model name/URL, LLM model name/UR
 - **WHEN** a wait is configured for model-dependent requests
 - **THEN** a request made while the model is loading waits no longer than that
 - **AND** a longer or shorter wait changes how long the caller is held, not whether the model eventually loads
+### Requirement: Bounded path discovery
+The store SHALL provide `find/2` to discover files and directories whose URI path (excluding the `viking://` scheme) contains a non-empty literal query of at most 256 characters, case-insensitively. A caller MAY scope the search to a valid URI; results SHALL include the scope node and its descendants, match only complete URI segment boundaries for scope membership, and be returned in deterministic URI order without document content. The operation SHALL return at most the requested `limit` (default 50, maximum 200), reject invalid limits and query lengths, and return an empty list when nothing matches. Query text SHALL be treated literally, including SQL wildcard characters.
+
+#### Scenario: Find paths by name within a subtree
+- **WHEN** a caller finds `auth` within `viking://resources/project` and matching files or directories exist both inside and outside that subtree
+- **THEN** only entries at the scope URI or beneath it whose URI contains `auth` are returned
+- **AND** each result identifies its URI, name, and node kind without returning document content
+- **AND** results are ordered by URI
+
+#### Scenario: Find treats query characters literally
+- **WHEN** a caller searches for a query containing `%`, `_`, or `\`
+- **THEN** those characters match only the same literal characters in stored URIs
+- **AND** they do not act as wildcards or alter the query
+
+#### Scenario: Find enforces its result bound
+- **WHEN** more entries match than the default or caller-supplied limit
+- **THEN** no more than the effective limit is returned
+- **AND** a limit outside the range 1 through 200 returns an invalid-limit error
+
+#### Scenario: Find validates its query and scope
+- **WHEN** the query is empty or longer than 256 characters, the scope URI is malformed, or the scope does not exist
+- **THEN** the operation returns a classified error and performs no writes
+
+### Requirement: Scoped literal content inspection
+The store SHALL provide `grep/2` to search full document content (L2) for a non-empty literal query of at most 256 characters, case-insensitively, optionally scoped to a valid URI. Each result SHALL identify the document URI, the one-based line number, and a bounded excerpt containing the match. Results SHALL be ordered by URI and then line number and limited to the requested `limit` (default 50, maximum 200). Abstracts and overviews SHALL NOT count as content matches; existing ranked `search/2` behavior SHALL remain unchanged. Query text SHALL be treated literally rather than as a regular expression or SQL pattern.
+
+#### Scenario: Grep returns matching source lines
+- **WHEN** a document contains the query on one or more lines and the caller greps within its subtree
+- **THEN** each matching line is returned with the document URI and one-based line number
+- **AND** each excerpt contains the match and is no longer than 280 characters
+- **AND** only results at the scope URI or beneath it are returned
+
+#### Scenario: Grep searches full content, not summaries
+- **WHEN** a query occurs only in a document's abstract or overview
+- **THEN** `grep/2` does not return that document
+- **AND** `search/2` retains its existing content-and-summary matching behavior
+
+#### Scenario: Grep treats special characters literally and is bounded
+- **WHEN** a caller greps for text containing `%`, `_`, `\`, or regular-expression metacharacters
+- **THEN** the text is matched literally
+- **AND** no more than the effective result limit is returned
+- **AND** an invalid limit returns an invalid-limit error
+
+#### Scenario: Grep validates its query and scope
+- **WHEN** the query is empty or longer than 256 characters, the scope URI is malformed, or the scope does not exist
+- **THEN** the operation returns a classified error and performs no writes

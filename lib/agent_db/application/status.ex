@@ -25,7 +25,10 @@ defmodule AgentDb.Application.Status do
 
   @doc "How the store's models are doing, including a load in progress."
   @spec models() :: map()
-  def models, do: Runtime.inference().model_status()
+  def models do
+    Runtime.inference().model_status()
+    |> with_provider()
+  end
 
   @doc "How much work is outstanding, by status."
   @spec queue() :: map()
@@ -42,5 +45,27 @@ defmodule AgentDb.Application.Status do
   defp embedding_ready? do
     %{embedding: %{loaded: loaded}} = models()
     loaded == true
+  end
+
+  # The active provider kind, so a deployment on Ollama or OpenAI-compatible
+  # reports what it runs rather than a fixed local value. Existing keys are
+  # preserved; only the provider annotation is added.
+  defp with_provider(status) when is_map(status) do
+    provider = provider_kind()
+
+    status
+    |> Map.put_new(:provider, provider)
+    |> Map.update(:embedding, %{provider: provider}, &Map.put_new(&1, :provider, provider))
+    |> Map.update(:llm, %{provider: provider}, &Map.put_new(&1, :provider, provider))
+  end
+
+  defp provider_kind do
+    case AgentDb.Config.inference_provider() do
+      :local -> :local
+      :ollama -> :ollama
+      :openai_compatible -> :openai_compatible
+      mod when is_atom(mod) -> :custom
+      _ -> :local
+    end
   end
 end

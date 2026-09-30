@@ -6,7 +6,7 @@ Automatically generates caller-independent L0 abstracts and L1 overviews for doc
 ## Requirements
 
 ### Requirement: Automatic L0 abstract generation
-The store SHALL generate a concise abstract (L0) for every document using a local LLM when the caller does not supply one. The generated abstract SHALL be a single sentence or short paragraph capturing the document's core point. Generated abstracts SHALL be stored alongside caller-supplied ones and returned by `abstract/1` calls.
+The store SHALL generate a concise abstract (L0) for every document using the configured summarization provider (local LLM by default, see `inference-providers` capability) when the caller does not supply one. The generated abstract SHALL be a single sentence or short paragraph capturing the document's core point. Generated abstracts SHALL be stored alongside caller-supplied ones and returned by `abstract/1` calls.
 
 #### Scenario: Auto-abstract generated when caller omits L0
 - **WHEN** a document is written with content but no `:abstract` option
@@ -25,7 +25,7 @@ The store SHALL generate a concise abstract (L0) for every document using a loca
 - **AND** the stored abstract is replaced with the new version
 
 ### Requirement: Automatic L1 overview generation
-The store SHALL generate a structured overview (L1) for every document using a local LLM when the caller does not supply one. The overview SHALL be a multi-sentence summary covering key points, suitable for quick scanning. Generated overviews SHALL be stored and returned by `overview/1` calls.
+The store SHALL generate a structured overview (L1) for every document using the configured summarization provider (local LLM by default, see `inference-providers` capability) when the caller does not supply one. The overview SHALL be a multi-sentence summary covering key points, suitable for quick scanning. Generated overviews SHALL be stored and returned by `overview/1` calls.
 
 #### Scenario: Auto-overview generated when caller omits L1
 - **WHEN** a document is written with content but no `:overview` option
@@ -39,7 +39,7 @@ The store SHALL generate a structured overview (L1) for every document using a l
 - **AND** no LLM call is made for overview generation
 
 ### Requirement: LLM model management
-The store SHALL download and cache the configured summarization LLM (e.g., Qwen3-0.6B) on first use. The model SHALL run entirely locally via Bumblebee/EXLA. Model loading SHALL be lazy or eager (configurable). Inference SHALL use appropriate quantization (e.g., q4) for memory efficiency. A configured backend SHALL be applied to the loaded model. A cached model SHALL load successfully and be retained for reuse. A download SHALL be written atomically, and a failed or interrupted download SHALL leave no file that later requests treat as a usable cached model. Because loading is lazy, a summary requested while the model is still loading SHALL be reported as loading and SHALL NOT be reported as a failure, and the caller SHALL be able to retry it. A request made while loading SHALL be given a bounded opportunity to complete before it is reported as loading, so that a request against an already-cached model does not have to be retried. The summarization model SHALL reach a loaded state once its own load completes, including when another model is loading concurrently: beginning a load for one model SHALL NOT leave the summarization model reporting as loading indefinitely. The format in which prompts are presented to the model SHALL be determined by configuration rather than fixed to one model architecture, so that configuring a different summarization model does not result in prompts being sent in a format that model was not built for. Generated summaries SHALL NOT contain the model's intermediate reasoning. A generation that yields no summary text once reasoning is removed SHALL be reported as an error and SHALL NOT be stored as an empty summary.
+The store SHALL download and cache the configured summarization LLM (e.g., Qwen3-0.6B) on first use. The model SHALL run entirely locally via the configured ML backend (EXLA or EMLX/EMLXAxon). Model loading SHALL be lazy or eager (configurable). Inference SHALL use appropriate quantization (e.g., q4) for memory efficiency. A configured backend SHALL be applied to the loaded model. When the configured backend is unavailable or fails to initialize, the system SHALL fall back to EXLA CPU with a warning logged. A cached model SHALL load successfully and be retained for reuse. A download SHALL be written atomically, and a failed or interrupted download SHALL leave no file that later requests treat as a usable cached model. Because loading is lazy, a summary requested while the model is still loading SHALL be reported as loading and SHALL NOT be reported as a failure, and the caller SHALL be able to retry it. A request made while loading SHALL be given a bounded opportunity to complete before it is reported as loading, so that a request against an already-cached model does not have to be retried. The summarization model SHALL reach a loaded state once its own load completes, including when another model is loading concurrently: beginning a load for one model SHALL NOT leave the summarization model reporting as loading indefinitely. The format in which prompts are presented to the model SHALL be determined by configuration rather than fixed to one model architecture, so that configuring a different summarization model does not result in prompts being sent in a format that model was not built for. Generated summaries SHALL NOT contain the model's intermediate reasoning. A generation that yields no summary text once reasoning is removed SHALL be reported as an error and SHALL NOT be stored as an empty summary.
 
 #### Scenario: Summarization model downloads on first use
 - **WHEN** system starts with no cached LLM and summarization is needed
@@ -96,6 +96,12 @@ The store SHALL download and cache the configured summarization LLM (e.g., Qwen3
 - **WHEN** a generation produces reasoning but no summary text
 - **THEN** the request reports an error rather than returning an empty summary
 - **AND** no empty value is written to the document
+
+#### Scenario: Backend falls back to EXLA on EMLX failure
+- **WHEN** `ml_backend` is `:emlx` or `:auto` on macOS but EMLX/EMLXAxon fails to load
+- **THEN** a warning is logged
+- **AND** the LLM loads via EXLA CPU backend instead
+- **AND** summarization continues to function
 
 ### Requirement: Summarization idempotency and retry
 If a summarization job fails (model error, timeout, OOM), it SHALL be retried with exponential backoff. Re-processing the same document content SHALL produce deterministic output (same prompt, same model, same parameters = same result). Failed jobs SHALL not block other summarization work. The retry budget SHALL be reserved for failures that can succeed on retry: a job deferred because its model is still loading SHALL NOT consume an attempt, and SHALL be rescheduled rather than counted toward exhaustion.

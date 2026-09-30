@@ -22,6 +22,7 @@ defmodule Mix.Tasks.AgentDb.ImportSkills do
 
     * `--user` - the user whose skills subtree the skills are imported into
       (required).
+    * `--json` - print per-skill outcomes as JSON instead of human text.
     * `--no-compile` - do not compile the project before running.
 
   ## What it refuses
@@ -37,7 +38,7 @@ defmodule Mix.Tasks.AgentDb.ImportSkills do
 
   @requirements ["app.config"]
 
-  @switches [user: :string, no_compile: :boolean]
+  @switches [user: :string, json: :boolean, no_compile: :boolean]
 
   @impl Mix.Task
   def run(argv) do
@@ -46,7 +47,7 @@ defmodule Mix.Tasks.AgentDb.ImportSkills do
 
     with {:ok, path} <- source(args),
          {:ok, user} <- user(opts) do
-      import_skills(user, path)
+      import_skills(user, path, opts[:json] || false)
     end
   end
 
@@ -60,16 +61,38 @@ defmodule Mix.Tasks.AgentDb.ImportSkills do
     end
   end
 
-  defp import_skills(user, path) do
+  defp import_skills(user, path, json?) do
     case AgentDb.import_skills(user, {:path, path}) do
       {:ok, %{skills: skills}} ->
-        Enum.each(skills, &report(&1, user))
+        if json? do
+          Mix.shell().info(Jason.encode!(Enum.map(skills, &skill_json(&1, user))))
+        else
+          Enum.each(skills, &report(&1, user))
+        end
+
         if Enum.any?(skills, &(&1.status == :failed)), do: Mix.raise(failed(user))
 
       {:error, reason} ->
         Mix.raise("Refused: " <> AgentDb.skill_import_error_message(reason))
     end
   end
+
+  defp skill_json(skill, user) do
+    base = %{user: user, name: skill.name, status: to_string(skill.status)}
+
+    base
+    |> put_json(:files, Map.get(skill, :files))
+    |> put_json(
+      :reason,
+      case Map.get(skill, :reason) do
+        nil -> nil
+        reason -> AgentDb.skill_import_error_message(reason)
+      end
+    )
+  end
+
+  defp put_json(map, _key, nil), do: map
+  defp put_json(map, key, value), do: Map.put(map, key, value)
 
   defp report(%{status: :failed} = skill, user) do
     Mix.shell().error([

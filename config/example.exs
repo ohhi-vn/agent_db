@@ -64,7 +64,7 @@ config :agent_db,
   # HTTP/WebSocket API
   http_enabled:
     System.get_env("AGENT_DB_HTTP_ENABLED") |> String.downcase() |> Kernel.==("true") || true,
-  http_port: System.get_env("AGENT_DB_HTTP_PORT") |> String.to_integer() || 4000,
+  http_port: System.get_env("AGENT_DB_HTTP_PORT") |> String.to_integer() || 6060,
   http_auth:
     System.get_env("AGENT_DB_HTTP_AUTH") |> String.downcase() |> Kernel.==("true") || false,
   http_auth_tokens: http_auth_tokens

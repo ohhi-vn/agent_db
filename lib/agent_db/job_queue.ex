@@ -83,23 +83,24 @@ defmodule AgentDb.JobQueue do
 
   defp claim(conn, kinds, attempts_left) do
     marks = Enum.map_join(kinds, ", ", fn kind -> "'#{kind}'" end)
+    now = System.system_time(:millisecond)
 
     case SQLite.query_one(
            conn,
            """
-           SELECT id, kind, payload, attempts, max_attempts
+           SELECT id, kind, payload, attempts, max_attempts, scheduled_at
            FROM job_queue
            WHERE status = 'pending' AND scheduled_at <= ?1
              AND kind IN (#{marks})
            ORDER BY scheduled_at ASC
            LIMIT 1
            """,
-           [System.system_time(:millisecond)]
+           [now]
          ) do
       {:ok, nil} ->
         {:error, :empty}
 
-      {:ok, [job_id, kind, payload_json, attempts, max_attempts]} ->
+      {:ok, [job_id, kind, payload_json, attempts, max_attempts, scheduled_at]} ->
         case claim_row(conn, job_id, attempts + 1) do
           :claimed ->
             {:ok,
@@ -108,7 +109,9 @@ defmodule AgentDb.JobQueue do
                kind: kind(kind),
                payload: Jason.decode!(payload_json),
                attempts: attempts + 1,
-               max_attempts: max_attempts
+               max_attempts: max_attempts,
+               queued_at: scheduled_at,
+               claimed_at: now
              }}
 
           :lost when attempts_left > 1 ->

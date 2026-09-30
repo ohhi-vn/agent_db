@@ -36,6 +36,8 @@ defmodule AgentDb.Core.ContractsTest do
             :put_embedding_result,
             :search_keyword,
             :search_vector,
+            :find_paths,
+            :grep_content,
             :create_session,
             :append_message,
             :get_session,

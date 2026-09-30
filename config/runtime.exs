@@ -13,7 +13,7 @@ import Config
 # The bind defaults to loopback: the HTTP surface is unauthenticated by design,
 # and it exposes document and memory content, so it should not land on every
 # interface unless an operator asks for it.
-http_port = String.to_integer(System.get_env("AGENT_DB_HTTP_PORT") || "4000")
+http_port = String.to_integer(System.get_env("AGENT_DB_HTTP_PORT") || "6060")
 
 http_ip =
   case System.get_env("AGENT_DB_HTTP_IP") do

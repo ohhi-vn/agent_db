@@ -225,6 +225,116 @@ defmodule AgentDb.Store.Nodes do
     end
   end
 
+  @doc """
+  Path-discovery matches for `query` within `scope_uri` or beneath it.
+
+  Matches the URI path (excluding the `viking://` scheme) as a
+  case-insensitive literal substring. Scope membership is
+  exact-URI-or-descendant. Results are ordered by URI with at most `limit`
+  entries.
+  """
+  @spec find_paths(SQLite.conn(), String.t(), String.t() | nil, pos_integer()) ::
+          {:ok, [%{uri: String.t(), name: String.t(), kind: kind()}]} | {:error, term()}
+  def find_paths(conn, query, scope_uri, limit) do
+    pattern = "%" <> like_escape(String.downcase(query)) <> "%"
+
+    {scope_where, scope_args} = scope_predicate(scope_uri)
+
+    sql =
+      "SELECT uri, parent_uri, name, kind FROM nodes WHERE lower(substr(uri, 10)) LIKE ? ESCAPE '\\'" <>
+        scope_where <> " ORDER BY uri ASC LIMIT ?"
+
+    case SQLite.query(conn, sql, [pattern | scope_args] ++ [limit]) do
+      {:ok, rows} ->
+        {:ok,
+         Enum.map(rows, fn [uri, _parent_uri, name, kind] ->
+           %{uri: uri, name: name, kind: safe_kind(kind)}
+         end)}
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  @doc """
+  Line matches for `query` in full document content (L2) within `scope_uri`
+  or beneath it.
+
+  Only L2 content matches; abstracts and overviews never do. Scope
+  membership is exact-URI-or-descendant. Results are ordered by URI then
+  one-based line number with at most `limit` entries, each excerpt
+  containing the match and at most 280 characters.
+  """
+  @spec grep_content(SQLite.conn(), String.t(), String.t() | nil, pos_integer()) ::
+          {:ok, [%{uri: String.t(), line_number: pos_integer(), excerpt: String.t()}]}
+          | {:error, term()}
+  def grep_content(conn, query, scope_uri, limit) do
+    pattern = "%" <> like_escape(String.downcase(query)) <> "%"
+
+    {scope_where, scope_args} = scope_predicate(scope_uri)
+
+    sql =
+      "SELECT uri, content FROM nodes WHERE kind = 'doc' AND lower(COALESCE(content, '')) LIKE ? ESCAPE '\\'" <>
+        scope_where <> " ORDER BY uri ASC"
+
+    case SQLite.query(conn, sql, [pattern | scope_args]) do
+      {:ok, rows} ->
+        {:ok, line_hits(rows, query, limit)}
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  # Exact-URI-or-descendant, so `scope` never matches a sibling like
+  # `scope-old`. A `nil` scope matches everything.
+  defp scope_predicate(nil), do: {"", []}
+
+  defp scope_predicate(scope_uri) do
+    {" AND (uri = ? OR uri LIKE ? ESCAPE '\\')",
+     [scope_uri, like_escape(scope_uri <> "/") <> "%"]}
+  end
+
+  defp line_hits(rows, query, limit) do
+    needle = String.downcase(query)
+    needle_len = String.length(query)
+
+    rows
+    |> Enum.flat_map(fn [uri, content] ->
+      matching_lines(uri, content || "", needle, needle_len)
+    end)
+    |> Enum.take(limit)
+  end
+
+  defp matching_lines(uri, content, needle, needle_len) do
+    content
+    |> String.split("\n")
+    |> Enum.with_index(1)
+    |> Enum.filter(fn {line, _n} -> String.contains?(String.downcase(line), needle) end)
+    |> Enum.map(fn {line, n} ->
+      %{uri: uri, line_number: n, excerpt: excerpt(line, needle, needle_len)}
+    end)
+  end
+
+  @doc false
+  @spec excerpt(String.t(), String.t(), non_neg_integer()) :: String.t()
+  def excerpt(line, needle_down, needle_len) do
+    if String.length(line) <= 280 do
+      line
+    else
+      downcased = String.downcase(line)
+
+      index =
+        case String.split(downcased, needle_down, parts: 2) do
+          [before, _rest] -> String.length(before)
+          [_only] -> 0
+        end
+
+      start = max(0, index - div(280 - needle_len, 2))
+      String.slice(line, start, 280)
+    end
+  end
+
   @doc "True when a node row exists at `uri`."
   @spec exists?(SQLite.conn(), String.t()) :: {:ok, boolean()} | {:error, term()}
   def exists?(conn, uri) do

@@ -29,6 +29,22 @@ defmodule AgentDb.Application.Sessions do
   @spec get(id()) :: {:ok, [message()]} | {:error, term()}
   def get(session_id), do: Runtime.storage().get_session(session_id)
 
+  @doc "Ids of every session, ordered."
+  @spec list_ids() :: {:ok, [id()]} | {:error, term()}
+  def list_ids, do: Runtime.storage().list_session_ids()
+
+  @doc """
+  Restores a session with its original id and messages in order.
+
+  Creates the session when absent; reports `{:ok, :skipped}` when it already
+  holds exactly these messages; reports `{:error, {:session_conflict, id}}`
+  and writes nothing when it holds different messages.
+  """
+  @spec restore(id(), [message()]) :: {:ok, :imported | :skipped} | {:error, term()}
+  def restore(session_id, messages) when is_binary(session_id) and is_list(messages) do
+    Runtime.storage().restore_session(session_id, messages)
+  end
+
   @doc """
   Commits a session into the tree at `destination_uri` as one document.
 

@@ -15,6 +15,7 @@ defmodule AgentDbWeb.Channel do
   use Phoenix.Channel
 
   alias AgentDb
+  alias AgentDb.Observability
 
   @impl true
   def join("api:lobby", _params, socket) do
@@ -27,7 +28,7 @@ defmodule AgentDbWeb.Channel do
 
   @impl true
   def handle_in("v1.write", %{"uri" => uri, "content" => content} = params, socket) do
-    answer(socket, AgentDb.write(uri, content, write_opts(params["opts"])))
+    answer(socket, AgentDb.write(uri, content, write_opts(params)))
   end
 
   def handle_in("v1.read", %{"uri" => uri}, socket) do
@@ -72,10 +73,32 @@ defmodule AgentDbWeb.Channel do
   # -- search --
 
   def handle_in("v1.search", %{"term" => term} = params, socket) do
-    case AgentDb.search(term, search_opts(params["opts"])) do
+    case AgentDb.search(term, search_opts(params)) do
       {:ok, results} -> answer(socket, {:ok, %{results: results}})
       {:error, _} = err -> answer(socket, err)
     end
+  end
+
+  def handle_in("v1.find", %{"term" => term} = params, socket) do
+    case AgentDb.find(term, navigation_opts(params)) do
+      {:ok, results} -> answer(socket, {:ok, %{results: results}})
+      {:error, _} = err -> answer(socket, err)
+    end
+  end
+
+  def handle_in("v1.find", _params, socket) do
+    answer(socket, {:error, {:invalid_query, nil}})
+  end
+
+  def handle_in("v1.grep", %{"term" => term} = params, socket) do
+    case AgentDb.grep(term, navigation_opts(params)) do
+      {:ok, results} -> answer(socket, {:ok, %{results: results}})
+      {:error, _} = err -> answer(socket, err)
+    end
+  end
+
+  def handle_in("v1.grep", _params, socket) do
+    answer(socket, {:error, {:invalid_query, nil}})
   end
 
   # -- sessions --
@@ -130,6 +153,40 @@ defmodule AgentDbWeb.Channel do
     answer(socket, AgentDb.forget(uri))
   end
 
+  # -- subscriptions and retrieval progress --
+
+  def handle_in("v1.subscribe", %{"uri" => uri}, socket) do
+    answer(socket, AgentDb.subscribe(uri))
+  end
+
+  def handle_in("v1.subscribe", _params, socket) do
+    answer(socket, {:error, :invalid_uri})
+  end
+
+  def handle_in("v1.unsubscribe", %{"uri" => uri}, socket) do
+    answer(socket, AgentDb.unsubscribe(uri))
+  end
+
+  def handle_in("v1.unsubscribe", _params, socket) do
+    answer(socket, {:error, :invalid_uri})
+  end
+
+  def handle_in("v1.search_progress", %{"term" => term} = params, socket) do
+    events = ["retrieval_started", "retrieval_progress", "resource_found", "memory_found", "skill_loaded"]
+
+    case AgentDb.search(term, search_opts(params)) do
+      {:ok, results} ->
+        answer(socket, {:ok, %{events: events ++ ["context_assembled"], results: results}})
+
+      {:error, _} = err ->
+        answer(socket, err)
+    end
+  end
+
+  def handle_in("v1.search_progress", _params, socket) do
+    answer(socket, {:error, {:invalid_query, nil}})
+  end
+
   # -- status --
 
   def handle_in("v1.model_status", _params, socket) do
@@ -166,23 +223,46 @@ defmodule AgentDbWeb.Channel do
   # option. An unrecognised key is dropped rather than converted: a misspelt
   # option that became a term would be applied as though it had been asked for.
   defp write_opts(params) when is_map(params) do
-    for {key, value} <- params, key in ["async", "sync_timeout_ms", "abstract", "overview"] do
-      {String.to_existing_atom(key), value}
-    end
-  end
+    opts = if is_map(params["opts"]), do: params["opts"], else: params
 
-  defp write_opts(_params), do: []
-
-  defp search_opts(params) when is_map(params) do
-    carried =
-      for {key, value} <- params, key in ["scope", "top_k", "hybrid_weights"] do
+    base =
+      for {key, value} <- opts, key in ["async", "sync_timeout_ms", "abstract", "overview"] do
         {String.to_existing_atom(key), value}
       end
 
-    [{:mode, search_mode(params["mode"])} | carried]
+    case Observability.extract_context(params) do
+      nil ->
+        case Observability.extract_context(opts) do
+          nil -> base
+          ctx -> Keyword.put(base, :trace_context, ctx)
+        end
+
+      ctx ->
+        Keyword.put(base, :trace_context, ctx)
+    end
   end
 
-  defp search_opts(_params), do: [mode: :keyword]
+  defp search_opts(params) when is_map(params) do
+    opts = if is_map(params["opts"]), do: params["opts"], else: %{}
+
+    carried =
+      for {key, value} <- opts, key in ["scope", "top_k", "hybrid_weights"] do
+        {String.to_existing_atom(key), value}
+      end
+
+    base = [{:mode, search_mode(opts["mode"] || params["mode"])} | carried]
+
+    case Observability.extract_context(params) do
+      nil ->
+        case Observability.extract_context(opts) do
+          nil -> base
+          ctx -> Keyword.put(base, :trace_context, ctx)
+        end
+
+      ctx ->
+        Keyword.put(base, :trace_context, ctx)
+    end
+  end
 
   # A mode arrives as the word the wire carries. One this transport does not
   # recognise is passed on as it arrived, so the store reports it as an invalid
@@ -192,6 +272,29 @@ defmodule AgentDbWeb.Channel do
   defp search_mode("vector"), do: :vector
   defp search_mode("hybrid"), do: :hybrid
   defp search_mode(other), do: other
+
+  # Navigation options arrive the same way: a string-keyed JSON map the store
+  # reads with Keyword. Only `scope` and `limit` are carried; anything else is
+  # dropped rather than turned into a term.
+  defp navigation_opts(params) when is_map(params) do
+    opts = if is_map(params["opts"]), do: params["opts"], else: %{}
+
+    base =
+      for {key, value} <- opts, key in ["scope", "limit"] do
+        {String.to_existing_atom(key), value}
+      end
+
+    case Observability.extract_context(params) do
+      nil ->
+        case Observability.extract_context(opts) do
+          nil -> base
+          ctx -> Keyword.put(base, :trace_context, ctx)
+        end
+
+      ctx ->
+        Keyword.put(base, :trace_context, ctx)
+    end
+  end
 
   defp commit_opts(params) when is_map(params) do
     # A formatter is a function and cannot cross a JSON boundary, so nothing is

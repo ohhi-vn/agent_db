@@ -8,6 +8,7 @@ defmodule AgentDb.ML.ModelManager do
   use GenServer
 
   alias AgentDb.Config
+  alias AgentDb.ML.ModelManager.Backend
   alias AgentDb.ML.ModelManager.State
 
   require Logger
@@ -133,7 +134,10 @@ defmodule AgentDb.ML.ModelManager do
   # -- Server Callbacks --
 
   @impl true
-  def init(_opts) do
+  def init(opts) do
+    requested = Keyword.get(opts, :ml_backend, Config.ml_backend())
+    resolved = Backend.resolve(requested)
+
     config = %{
       model_cache_dir: Config.model_cache_dir(),
       embedding_model: Config.embedding_model(),
@@ -141,12 +145,15 @@ defmodule AgentDb.ML.ModelManager do
       llm_model: Config.llm_model(),
       llm_model_url: Config.llm_model_url(),
       exla_backend: Config.exla_backend(),
+      ml_backend_requested: requested,
+      ml_backend: resolved,
+      backend: Backend.module_for(resolved),
       # Read at load time into model_ref, alongside the tokenizer and serving.
       llm_chat_template: Config.llm_chat_template(),
       llm_model_params: Config.llm_model_params(),
       # The only route to the model-loading library, so the load path can be
       # exercised without real weights. See AgentDb.ML.BumblebeeLoader.
-      loader: AgentDb.ML.BumblebeeLoader
+      loader: Keyword.get(opts, :loader, AgentDb.ML.BumblebeeLoader)
     }
 
     state = %State{
@@ -159,11 +166,19 @@ defmodule AgentDb.ML.ModelManager do
     {:ok, state}
   end
 
+  @doc "The resolved ML backend (`:exla` or `:emlx`)."
+  @spec backend() :: :exla | :emlx
+  def backend do
+    GenServer.call(__MODULE__, :backend)
+  end
+
   @impl true
   def handle_call({:embed, texts}, _from, state) do
     case ensure_embedding_model(state) do
       {:ok, model_ref, new_state} ->
-        {reply, new_state} = run_inference(&generate_embeddings(model_ref, &1), texts, new_state)
+        {reply, new_state} =
+          run_inference(:embedding, &generate_embeddings(model_ref, &1), texts, new_state)
+
         {:reply, reply, new_state}
 
       # Either an already-running load, or one this call just started.
@@ -177,7 +192,7 @@ defmodule AgentDb.ML.ModelManager do
     case ensure_llm_model(state) do
       {:ok, model_ref, new_state} ->
         {reply, new_state} =
-          run_inference(&generate_summary(model_ref, &1, opts), prompt, new_state)
+          run_inference(:llm, &generate_summary(model_ref, &1, opts), prompt, new_state)
 
         {:reply, reply, new_state}
 
@@ -189,6 +204,11 @@ defmodule AgentDb.ML.ModelManager do
   @impl true
   def handle_call(:model_status, _from, state) do
     {:reply, build_model_status(state), state}
+  end
+
+  @impl true
+  def handle_call(:backend, _from, state) do
+    {:reply, state.config.ml_backend, state}
   end
 
   @impl true
@@ -215,16 +235,30 @@ defmodule AgentDb.ML.ModelManager do
 
   # Inference failures are reported, never raised: an exception here would kill
   # the only inference process and discard the loaded model along with it.
-  defp run_inference(fun, input, state) do
-    case fun.(input) do
-      {:ok, result} -> {{:ok, result}, state}
-      {:error, reason} -> {{:error, reason}, state}
-    end
-  rescue
-    error -> {{:error, {:inference_failed, error}}, state}
-  catch
-    :exit, reason -> {{:error, {:inference_failed, {:exit, reason}}}, state}
-    :throw, value -> {{:error, {:inference_failed, {:throw, value}}}, state}
+  # Every run stamps its duration for the role, success or failure: it is
+  # still the last inference latency, and status reads it without messaging.
+  defp run_inference(role, fun, input, state) do
+    start = System.monotonic_time(:millisecond)
+
+    result =
+      try do
+        case fun.(input) do
+          {:ok, result} -> {{:ok, result}, state}
+          {:error, reason} -> {{:error, reason}, state}
+        end
+      rescue
+        error -> {{:error, {:inference_failed, error}}, state}
+      catch
+        :exit, reason -> {{:error, {:inference_failed, {:exit, reason}}}, state}
+        :throw, value -> {{:error, {:inference_failed, {:throw, value}}}, state}
+      end
+
+    duration = System.monotonic_time(:millisecond) - start
+    outcome = if match?({{:ok, _}, _}, result), do: :ok, else: :error
+    AgentDb.Observability.emit_model(:inference, outcome, duration)
+
+    {reply, run_state} = result
+    {reply, %{run_state | last_latency_ms: Map.put(run_state.last_latency_ms, role, duration)}}
   end
 
   defp apply_load_result(role, result, state) do
@@ -309,84 +343,69 @@ defmodule AgentDb.ML.ModelManager do
     :ok
   end
 
-  defp perform_load(config, :embedding), do: load_embedding_model(config)
-  defp perform_load(config, :llm), do: load_llm_model(config)
+  defp perform_load(config, role) when role in [:embedding, :llm] do
+    start = System.monotonic_time(:millisecond)
+
+    result =
+      case role do
+        :embedding -> load_embedding_model(config)
+        :llm -> load_llm_model(config)
+      end
+
+    duration = System.monotonic_time(:millisecond) - start
+    outcome = if match?({:ok, _}, result), do: :ok, else: :error
+    AgentDb.Observability.emit_model(role, outcome, duration)
+    result
+  end
 
   defp load_embedding_model(config) do
     model_id = config.embedding_model
 
-    # ensure_model_files/3 performs network I/O, so it is deliberately inside
-    # the rescue: it used to be the scrutinee of the case and therefore outside
-    # the try, which let a transport failure terminate this GenServer.
-    with :ok <- ensure_model_files(model_id, config.embedding_model_url, config.model_cache_dir),
-         {:ok, model_ref} <- build_model_ref(config, model_id, :embedding) do
-      {:ok, model_ref}
+    with :ok <- ensure_model_files(model_id, config.embedding_model_url, config.model_cache_dir) do
+      load_with_fallback(config, :embedding)
     end
   end
 
   defp load_llm_model(config) do
     model_id = config.llm_model
 
-    with :ok <- ensure_model_files(model_id, config.llm_model_url, config.model_cache_dir),
-         {:ok, model_ref} <- build_model_ref(config, model_id, :llm) do
-      {:ok, model_ref}
+    with :ok <- ensure_model_files(model_id, config.llm_model_url, config.model_cache_dir) do
+      load_with_fallback(config, :llm)
     end
   end
 
-  # Bumblebee.load_model/2 already returns the loaded model as
-  # {:ok, %{model: model, spec: spec}} -- it is a single call, not two phases.
-  # Calling it a second time with that map used to raise ArgumentError, because
-  # normalize_repository!/1 accepts only {:hf, id} or {:local, dir}.
-  #
-  # :backend is applied here so Config.exla_backend/0 stops being discarded.
-  defp build_model_ref(config, model_id, role) do
-    loader = config.loader
+  defp load_with_fallback(%{ml_backend: :emlx, backend: backend} = config, role) do
+    case apply(backend, load_fun(role), [config]) do
+      {:ok, _} = ok ->
+        ok
 
-    with {:ok, tokenizer} <- loader.load_tokenizer({:hf, model_id}),
-         {:ok, %{model: model, spec: spec}} <-
-           loader.load_model({:hf, model_id}, backend: config.exla_backend) do
-      {:ok,
-       %{
-         tokenizer: tokenizer,
-         model: model,
-         spec: spec,
-         serving: loader.serving(role),
-         # Snapshotted with the rest of the model, for the same reason: the
-         # prompt format belongs to the model, and Bumblebee has no API that
-         # returns it. A test overrides it the way it overrides the loader.
-         chat_template: config.llm_chat_template
-       }}
-    else
       {:error, reason} ->
-        Logger.error("Failed to load #{inspect(role)} model: #{inspect(reason)}")
-        {:error, wrap_load_error(reason)}
+        Logger.warning(
+          "EMLX backend failed for #{inspect(role)}, falling back to EXLA: #{inspect(reason)}"
+        )
 
-      unexpected ->
-        Logger.error("Unexpected #{inspect(role)} load result: #{inspect(unexpected)}")
-        {:error, wrap_load_error(unexpected)}
+        apply(Backend.module_for(:exla), load_fun(role), [config])
     end
   rescue
-    error ->
-      Logger.error("Raised while loading #{inspect(role)} model: #{inspect(error)}")
-      {:error, wrap_load_error(error)}
+    _error ->
+      Logger.warning("EMLX backend raised for #{inspect(role)}, falling back to EXLA")
+      apply(Backend.module_for(:exla), load_fun(role), [config])
   catch
-    # An accelerator backend resolves through EXLA.Client, which reports a
-    # missing platform by exiting rather than raising, so rescue alone would
-    # let it terminate this process.
-    :exit, reason ->
-      Logger.error("Exited while loading #{inspect(role)} model: #{inspect(reason)}")
-      {:error, wrap_load_error({:exit, reason})}
+    :exit, _ ->
+      Logger.warning("EMLX backend exited for #{inspect(role)}, falling back to EXLA")
+      apply(Backend.module_for(:exla), load_fun(role), [config])
 
-    :throw, value ->
-      Logger.error("Threw while loading #{inspect(role)} model: #{inspect(value)}")
-      {:error, wrap_load_error({:throw, value})}
+    :throw, _ ->
+      Logger.warning("EMLX backend threw for #{inspect(role)}, falling back to EXLA")
+      apply(Backend.module_for(:exla), load_fun(role), [config])
   end
 
-  # Already-classified errors pass through so callers can tell "could not be
-  # obtained" from "could not be loaded".
-  defp wrap_load_error({:download_failed, _} = reason), do: reason
-  defp wrap_load_error({:model_not_found, _} = reason), do: reason
-  defp wrap_load_error(reason), do: {:model_load_failed, reason}
+  defp load_with_fallback(%{backend: backend} = config, role) do
+    apply(backend, load_fun(role), [config])
+  end
+
+  defp load_fun(:embedding), do: :load_embedding
+  defp load_fun(:llm), do: :load_llm
 
   defp ensure_model_files(model_id, model_url, cache_dir) do
     model_dir = Path.join(cache_dir, model_id)
@@ -422,21 +441,33 @@ defmodule AgentDb.ML.ModelManager do
     partial = model_file <> ".part"
     File.mkdir_p!(model_dir)
 
-    Logger.info("Downloading model from #{url} to #{model_file}")
+    AgentDb.Observability.log(:info, component: :model, operation: :download, outcome: :started)
 
     case Req.get(url, receive_timeout: @download_receive_timeout) do
       {:ok, %Req.Response{status: 200, body: body}} ->
         File.write!(partial, body)
         File.rename!(partial, model_file)
-        Logger.info("Model downloaded successfully")
+        AgentDb.Observability.log(:info, component: :model, operation: :download, outcome: :ok)
         :ok
 
       {:ok, %Req.Response{status: status}} ->
-        Logger.error("Failed to download model: HTTP #{status}")
+        AgentDb.Observability.log(:error,
+          component: :model,
+          operation: :download,
+          outcome: :error,
+          reason: {:download_failed, status}
+        )
+
         {:error, {:download_failed, status}}
 
       {:error, reason} ->
-        Logger.error("Failed to download model: #{inspect(reason)}")
+        AgentDb.Observability.log(:error,
+          component: :model,
+          operation: :download,
+          outcome: :error,
+          reason: {:download_failed, :transport}
+        )
+
         {:error, {:download_failed, reason}}
     end
     |> case do
@@ -451,106 +482,15 @@ defmodule AgentDb.ML.ModelManager do
   end
 
   defp generate_embeddings(model_ref, texts) do
-    tokenizer = model_ref.tokenizer
-    model = model_ref.model
-    serving = model_ref.serving
-
-    # Tokenize inputs
-    {:ok, inputs} = serving.tokenize(tokenizer, texts)
-
-    # Generate embeddings
-    {:ok, outputs} =
-      serving.generate(model, inputs, fn embedding ->
-        Nx.to_flat_list(Nx.mean(embedding, axes: [1]))
-      end)
-
-    embeddings =
-      Enum.map(outputs, fn output ->
-        # Convert to tensor and normalize
-        tensor = Nx.tensor(output.embedding)
-        norm = Nx.sqrt(Nx.sum(Nx.pow(tensor, 2)))
-        Nx.divide(tensor, norm)
-      end)
-
-    {:ok, embeddings}
+    backend_for(model_ref).embed(model_ref, texts)
   end
 
   defp generate_summary(model_ref, prompt, opts) do
-    tokenizer = model_ref.tokenizer
-    model = model_ref.model
-    serving = model_ref.serving
-
-    max_tokens = Keyword.get(opts, :max_tokens, 256)
-    temperature = Keyword.get(opts, :temperature, 0.7)
-
-    # Format the prompt with the configured chat format for this model.
-    formatted_prompt = format_prompt(prompt, model_ref.chat_template)
-
-    {:ok, inputs} = serving.tokenize(tokenizer, formatted_prompt)
-
-    {:ok, outputs} =
-      serving.generate(model, inputs, %{
-        max_tokens: max_tokens,
-        temperature: temperature,
-        top_p: 0.9,
-        return_probabilities: false
-      })
-
-    # Extract generated text
-    generated =
-      outputs
-      |> List.first()
-      |> Map.get(:text, "")
-      |> strip_reasoning()
-
-    # An empty result is returned as an error, not as "". That distinction
-    # matters downstream: "" is truthy, so the worker would store it and
-    # node.abstract || first_line(content) would resolve to "" forever,
-    # silently disabling the fallback that keeps a document readable when the
-    # model does not work. run_inference/3 passes this error tuple through.
-    generated
+    backend_for(model_ref).summarize(model_ref, prompt, opts)
   end
 
-  # A hybrid reasoning model emits its intermediate reasoning before the
-  # answer. The segment from the opening marker through the closing marker is
-  # removed; anything after it is the answer. Text with no marker is returned
-  # unchanged apart from trimming, so a model that does not reason is
-  # unaffected.
-  defp strip_reasoning(text) do
-    text
-    |> remove_reasoning_segment()
-    |> case do
-      "" -> {:error, {:empty_summary, :no_answer}}
-      summary -> {:ok, summary}
-    end
-  end
-
-  # An unterminated block yields no answer at all. That is the
-  # budget-exhausted case -- the model reasoned and never got past it -- and
-  # the reasoning is not something to store as a summary, so the whole
-  # remainder is dropped and the caller sees an empty result.
-  defp remove_reasoning_segment(text) do
-    case String.split(text, "<think>", parts: 2) do
-      [_only_answer] -> text
-      [_reasoning, rest] -> after_think_block(rest)
-    end
-    |> String.trim()
-  end
-
-  defp after_think_block(rest) do
-    case String.split(rest, "</think>", parts: 2) do
-      [_unterminated] -> ""
-      [_reasoning, answer] -> answer
-    end
-  end
-
-  # The format comes from configuration rather than a literal here, because the
-  # prompt format belongs to the model: a hardcoded one silently sends a prompt
-  # in a format the configured model was never trained on, and nothing in the
-  # type, the tests, or the config would connect the two to catch it.
-  defp format_prompt(prompt, chat_template) do
-    String.replace(chat_template, "%{prompt}", prompt)
-  end
+  defp backend_for(%{backend: :emlx}), do: Backend.module_for(:emlx)
+  defp backend_for(_), do: Backend.module_for(:exla)
 
   defp build_model_status(%State{embedding_model: embedding_model, llm_model: llm_model} = state) do
     %{
@@ -558,7 +498,8 @@ defmodule AgentDb.ML.ModelManager do
         loaded: embedding_model != nil,
         state: state.loading |> Map.get(:embedding, :idle) |> load_state_name(),
         model: state.config.embedding_model,
-        dim: 384
+        dim: 384,
+        last_latency_ms: Map.get(state.last_latency_ms, :embedding)
       },
       llm: %{
         loaded: llm_model != nil,
@@ -567,12 +508,26 @@ defmodule AgentDb.ML.ModelManager do
         # Configured rather than literal: a hand-written size here describes a
         # model the store may not be running, and the http-api spec assertion
         # had to change every time the model did.
-        params: state.config.llm_model_params
+        params: state.config.llm_model_params,
+        last_latency_ms: Map.get(state.last_latency_ms, :llm)
       },
       queue: %{
         # Will be populated by JobQueue
         pending: 0
-      }
+      },
+      backend: state.config.ml_backend,
+      memory_bytes: vm_memory()
     }
+  end
+
+  # The BEAM total, not a per-model figure: per-role memory is not measurable
+  # from here, and a split would be invented. Same source as the runtime
+  # snapshots, so the two never disagree about what "memory" means.
+  defp vm_memory do
+    :erlang.memory(:total)
+  rescue
+    _ -> nil
+  catch
+    _, _ -> nil
   end
 end

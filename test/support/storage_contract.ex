@@ -22,8 +22,23 @@ defmodule AgentDb.StorageContract.Helpers do
   """
   def restore_child(child) do
     case Application.ensure_all_started(:agent_db) do
-      {:ok, _apps} -> restart_when_free(child)
-      {:error, _reason} -> :ok
+      {:ok, _apps} ->
+        if child in [AgentDb.Workers.Embedding, AgentDb.Workers.Summarization] do
+          restore_workers(child)
+        else
+          restart_when_free(child)
+        end
+
+      {:error, _reason} ->
+        :ok
+    end
+
+    :ok
+  end
+
+  defp restore_workers(handler) do
+    for {id, _, _, _} <- worker_children(handler) do
+      restart_when_free(id)
     end
 
     :ok
@@ -58,12 +73,37 @@ defmodule AgentDb.StorageContract.Helpers do
   it itself, and the state these tests need -- no worker -- holds either way.
   """
   def stop_workers do
+    for {id, _, _, _} <- worker_children() do
+      _ = Supervisor.terminate_child(AgentDb.Supervisor, id)
+    end
+
+    # Legacy single-worker IDs (pre-pool). Ignored when absent.
     for worker <- [AgentDb.Workers.Embedding, AgentDb.Workers.Summarization] do
       _ = Supervisor.terminate_child(AgentDb.Supervisor, worker)
     end
 
     :ok
   end
+
+  defp worker_children(handler \\ nil) do
+    case Process.whereis(AgentDb.Supervisor) do
+      nil ->
+        []
+
+      _pid ->
+        for {id, _, _, _} = child <- Supervisor.which_children(AgentDb.Supervisor),
+            worker_child?(id, handler) do
+          child
+        end
+    end
+  end
+
+  defp worker_child?({handler, _n}, nil)
+       when handler in [AgentDb.Workers.Embedding, AgentDb.Workers.Summarization],
+       do: true
+
+  defp worker_child?({handler, _n}, handler), do: true
+  defp worker_child?(_id, _handler), do: false
 
   @doc """
   Makes a job claimable again straight away.
@@ -412,6 +452,181 @@ defmodule AgentDb.StorageContract do
 
           assert {:ok, [hit]} = storage().search_keyword("needlehere", scope <> "/")
           assert hit.uri == scope <> "/in.md"
+        end
+      end
+
+      describe "find_paths" do
+        test "finds paths by name within a subtree, ordered, without content" do
+          scope = "viking://resources/contract/find"
+          assert :ok = storage().put_document(scope <> "/auth-service.md", "a", [])
+          assert :ok = storage().put_document(scope <> "/nested/auth-helper.md", "b", [])
+
+          assert :ok =
+                   storage().put_document(
+                     "viking://resources/contract/other/auth-outside.md",
+                     "c",
+                     []
+                   )
+
+          assert {:ok, hits} = storage().find_paths("auth", scope, 50)
+
+          assert Enum.map(hits, & &1.uri) == [
+                   scope <> "/auth-service.md",
+                   scope <> "/nested/auth-helper.md"
+                 ]
+
+          for hit <- hits do
+            assert %{uri: _, name: _, kind: _} = hit
+            refute Map.has_key?(hit, :content)
+          end
+
+          assert hd(hits).name == "auth-service.md"
+        end
+
+        test "scope is exact-URI-or-descendant, not a raw prefix" do
+          scope = "viking://resources/contract/project"
+          assert :ok = storage().put_document(scope <> "/auth.md", "in", [])
+
+          assert :ok =
+                   storage().put_document(
+                     "viking://resources/contract/project-old/auth.md",
+                     "sibling",
+                     []
+                   )
+
+          assert {:ok, hits} = storage().find_paths("auth", scope, 50)
+          assert Enum.map(hits, & &1.uri) == [scope <> "/auth.md"]
+        end
+
+        test "includes the scope node itself when it matches" do
+          scope = "viking://resources/contract/scope-self-auth"
+          assert :ok = storage().put_document(scope, "self doc", [])
+          assert :ok = storage().put_document(scope <> "/child.md", "child", [])
+
+          assert {:ok, hits} = storage().find_paths("self-auth", scope, 50)
+          assert scope in Enum.map(hits, & &1.uri)
+        end
+
+        test "treats %, _, and backslash literally" do
+          base = "viking://resources/contract/literal"
+          assert :ok = storage().put_document(base <> "/100%.md", "a", [])
+          assert :ok = storage().put_document(base <> "/a_b.md", "b", [])
+          assert :ok = storage().put_document(base <> "/normal.md", "c", [])
+
+          assert {:ok, percent} = storage().find_paths("%", nil, 50)
+          assert Enum.map(percent, & &1.uri) == [base <> "/100%.md"]
+
+          assert {:ok, underscore} = storage().find_paths("_", nil, 50)
+          # Only URIs containing a literal underscore match; unescaped `_`
+          # would match every URI as a single-character wildcard.
+          assert Enum.map(underscore, & &1.uri) == [base <> "/a_b.md"]
+
+          assert {:ok, []} = storage().find_paths("\\", nil, 50)
+        end
+
+        test "returns nothing when nothing matches and respects the limit" do
+          base = "viking://resources/contract/find-limit"
+          assert :ok = storage().put_document(base <> "/c.md", "x", [])
+          assert :ok = storage().put_document(base <> "/b.md", "x", [])
+          assert :ok = storage().put_document(base <> "/a.md", "x", [])
+
+          assert {:ok, []} = storage().find_paths("no-such-name", nil, 50)
+
+          assert {:ok, hits} = storage().find_paths(".md", nil, 2)
+          assert length(hits) == 2
+          assert Enum.map(hits, & &1.uri) == Enum.sort(Enum.map(hits, & &1.uri))
+        end
+      end
+
+      describe "grep_content" do
+        test "returns matching lines with numbers and bounded excerpts, ordered" do
+          uri = "viking://resources/contract/grep/a.md"
+          content = "first line\nsecond AUTH line\nthird line\nAUTH again line 4"
+          assert :ok = storage().put_document(uri, content, [])
+
+          assert {:ok, hits} = storage().grep_content("auth", nil, 50)
+          assert [%{uri: ^uri, line_number: 2}, %{uri: ^uri, line_number: 4}] = hits
+
+          for hit <- hits do
+            assert String.contains?(String.downcase(hit.excerpt), "auth")
+            assert String.length(hit.excerpt) <= 280
+          end
+        end
+
+        test "scopes to the scope node and its descendants only" do
+          scope = "viking://resources/contract/grep-scope"
+          assert :ok = storage().put_document(scope <> "/in.md", "needlegrep here", [])
+
+          assert :ok =
+                   storage().put_document(
+                     "viking://resources/contract/grep-out.md",
+                     "needlegrep here",
+                     []
+                   )
+
+          assert :ok =
+                   storage().put_document(
+                     "viking://resources/contract/grep-scope-old/in.md",
+                     "needlegrep here",
+                     []
+                   )
+
+          assert {:ok, hits} = storage().grep_content("needlegrep", scope, 50)
+          assert Enum.map(hits, & &1.uri) == [scope <> "/in.md"]
+        end
+
+        test "matches L2 content only, never abstracts or overviews" do
+          uri = "viking://resources/contract/grep-layers.md"
+
+          assert :ok =
+                   storage().put_document(uri, "plain body",
+                     abstract: "unique-abstract-term",
+                     overview: "unique-overview-term"
+                   )
+
+          assert {:ok, []} = storage().grep_content("unique-abstract-term", nil, 50)
+          assert {:ok, []} = storage().grep_content("unique-overview-term", nil, 50)
+          assert {:ok, [_]} = storage().grep_content("plain body", nil, 50)
+        end
+
+        test "treats special characters literally" do
+          uri = "viking://resources/contract/grep-special.md"
+
+          assert :ok =
+                   storage().put_document(
+                     uri,
+                     "100% sure\na_b\nprice [test] ok\na.*b literal\nback\\slash here",
+                     []
+                   )
+
+          assert {:ok, [_]} = storage().grep_content("%", nil, 50)
+          assert {:ok, [_]} = storage().grep_content("_", nil, 50)
+          assert {:ok, [_]} = storage().grep_content("[test]", nil, 50)
+          assert {:ok, [_]} = storage().grep_content(".*", nil, 50)
+          assert {:ok, [_]} = storage().grep_content("\\", nil, 50)
+          assert {:ok, []} = storage().grep_content("no-such-grep-term", nil, 50)
+        end
+
+        test "bounds long lines and respects the limit" do
+          uri = "viking://resources/contract/grep-long.md"
+          long = String.duplicate("x", 200) <> "needle" <> String.duplicate("y", 300)
+          assert :ok = storage().put_document(uri, long, [])
+
+          assert {:ok, [hit]} = storage().grep_content("needle", nil, 50)
+          assert hit.uri == uri
+          assert hit.line_number == 1
+          assert String.contains?(hit.excerpt, "needle")
+          assert String.length(hit.excerpt) <= 280
+
+          many = Enum.map_join(1..5, "\n", fn _ -> "hitline needle" end)
+
+          assert :ok =
+                   storage().put_document("viking://resources/contract/grep-many.md", many, [])
+
+          assert {:ok, hits} = storage().grep_content("needle", nil, 2)
+          assert length(hits) == 2
+          uris = Enum.map(hits, & &1.uri)
+          assert uris == Enum.sort(uris)
         end
       end
 
