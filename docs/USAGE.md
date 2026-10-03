@@ -47,7 +47,10 @@ non-empty line for abstract, first 280 chars for overview).
 - Default `mode: :keyword` (no model needed). `:vector` needs embeddings;
   `:hybrid` fuses both with `hybrid_weights: {0.5, 0.5}`.
 - `scope:` limits to a subtree (exact URI or descendants only).
-- `top_k:` caps results (default 10).
+- `top_k:` caps results. Default 10, maximum 200; an out-of-range value
+  returns `{:error, {:invalid_limit, value}}` rather than silently answering a
+  different question than the one asked. This is a breaking change for a
+  caller that relied on an unbounded keyword result set.
 - Model still loading → `{:error, :model_loading}`; retry later.
 
 `find/2` matches URI paths; `grep/2` matches L2 content lines. Both are
@@ -237,6 +240,22 @@ trace without affecting results.
 Open `/admin` to import skills (User ID + folder or `.tar`/`.tgz`/`.tar.gz`);
 it reports per-skill `imported` / `replaced` / failure reason and writes
 nothing when the source is refused.
+
+The same page is the operations console. It reports:
+
+| Section | What it answers |
+| --- | --- |
+| Storage | Database and WAL byte sizes; document and directory counts overall and per top-level subtree |
+| Cache | Entry counts and memory per ETS cache table |
+| Runtime | Node uptime, supervisor and process counts, BEAM memory |
+| Models | Per role: load state, last load duration, last latency, in-flight count, model identity, provider and remote provider health |
+| Queue | Per-status counts, age of the oldest pending job, failed jobs with kind, URI, attempts, and classified reason |
+| Index | Indexed vector rows and the number of documents the index describes |
+| Recent errors | Bounded, newest-first, classified reason and operation only |
+
+Every value is read-only and bounded. An unreachable remote provider is shown
+as unreachable, not as loaded, and a cache that has grown reads differently
+from a store whose content has.
 
 Default no-auth daemon binds loopback only: any local process can read *and
 write*. That fits one laptop shared by two editors and nothing else. To serve

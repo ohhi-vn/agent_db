@@ -1,4 +1,5 @@
 defmodule AgentDbWeb.Layouts do
+  @moduledoc false
   use AgentDbWeb, :html_helpers
   import Phoenix.Controller, only: [get_csrf_token: 0]
 

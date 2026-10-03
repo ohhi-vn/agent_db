@@ -70,10 +70,10 @@ defmodule AgentDb.ML.BackendTest do
       assert {:load_llm, 1} in callbacks
       assert {:embed, 2} in callbacks
       assert {:summarize, 3} in callbacks
-      assert {:model_info, 0} in callbacks
+      refute {:model_info, 0} in callbacks
       assert function_exported?(Exla, :load_embedding, 1)
       assert function_exported?(Exla, :load_llm, 1)
-      assert Exla.model_info() == %{backend: :exla}
+      refute function_exported?(Exla, :model_info, 0)
     end
 
     test "concurrent embed calls all answer" do

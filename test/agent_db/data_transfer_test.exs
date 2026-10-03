@@ -25,9 +25,14 @@ defmodule AgentDb.DataTransferTest do
   describe "codec (export_payload / parse_archive)" do
     test "round-trips a payload without a store" do
       payload = %{
-        documents: [%{uri: "viking://resources/a.md", content: "hello", abstract: "L0", overview: nil}],
+        documents: [
+          %{uri: "viking://resources/a.md", content: "hello", abstract: "L0", overview: nil}
+        ],
         memories: [
-          %{uri: "viking://user/memories/preferences/lang", assertions: [%{value: "elixir", confidence: 0.9, source: nil}]}
+          %{
+            uri: "viking://user/memories/preferences/lang",
+            assertions: [%{value: "elixir", confidence: 0.9, source: nil}]
+          }
         ],
         sessions: [%{id: "s1", messages: [%{role: "user", content: "hi"}]}],
         scope: nil
@@ -53,7 +58,9 @@ defmodule AgentDb.DataTransferTest do
     test "refuses random bytes without side effects" do
       before = store_snapshot()
 
-      assert {:error, reason} = DataTransfer.parse_archive({:archive, :crypto.strong_rand_bytes(128)})
+      assert {:error, reason} =
+               DataTransfer.parse_archive({:archive, :crypto.strong_rand_bytes(128)})
+
       assert DataTransfer.message(reason) =~ "could not be read"
 
       assert store_snapshot() == before
@@ -63,7 +70,9 @@ defmodule AgentDb.DataTransferTest do
       big = String.duplicate("x", DataTransfer.limits().max_bytes + 1)
 
       payload = %{
-        documents: [%{uri: "viking://resources/big.md", content: big, abstract: nil, overview: nil}],
+        documents: [
+          %{uri: "viking://resources/big.md", content: big, abstract: nil, overview: nil}
+        ],
         memories: [],
         sessions: [],
         scope: nil
@@ -83,7 +92,23 @@ defmodule AgentDb.DataTransferTest do
       {:ok, archive} = DataTransfer.export_payload(empty_payload())
       without = drop_member(archive, "sessions.json")
 
-      assert {:error, {:missing_member, "sessions.json"}} = DataTransfer.parse_archive({:archive, without})
+      assert {:error, {:missing_member, "sessions.json"}} =
+               DataTransfer.parse_archive({:archive, without})
+    end
+
+    test "refuses an archive holding a link" do
+      before = store_snapshot()
+      {:ok, archive} = DataTransfer.export_payload(empty_payload())
+      linked = symlink_archive(archive)
+
+      assert {:error, {:unsupported_entry, :symlink, "escape.md"}} =
+               DataTransfer.parse_archive({:archive, linked})
+
+      assert DataTransfer.message({:unsupported_entry, :symlink, "escape.md"}) =~ "escape.md"
+
+      # The refusal happens before anything is written, so an import that
+      # carried a link did not land part of the archive either.
+      assert store_snapshot() == before
     end
   end
 
@@ -145,7 +170,11 @@ defmodule AgentDb.DataTransferTest do
 
       assert {:ok, parsed} = DataTransfer.parse_archive({:path, path})
 
-      assert Enum.all?(parsed.documents, &String.starts_with?(&1.uri, "viking://resources/project"))
+      assert Enum.all?(
+               parsed.documents,
+               &String.starts_with?(&1.uri, "viking://resources/project")
+             )
+
       assert parsed.sessions == []
     end
 
@@ -244,11 +273,15 @@ defmodule AgentDb.DataTransferTest do
       :ok = AgentDb.subscribe("viking://resources/project")
       assert {:ok, _} = AgentDb.import_data(path)
 
-      assert {:ok, [_ | _]} = AgentDb.search("Project", mode: :keyword, scope: "viking://resources/project")
+      assert {:ok, [_ | _]} =
+               AgentDb.search("Project", mode: :keyword, scope: "viking://resources/project")
+
       assert {:ok, [_ | _]} = AgentDb.find("readme", scope: "viking://resources/project")
       assert {:ok, [_ | _]} = AgentDb.grep("Project", scope: "viking://resources/project")
 
-      assert_receive {:context_changed, "viking://resources/project/readme.md", :written, _version}, 1_000
+      assert_receive {:context_changed, "viking://resources/project/readme.md", :written,
+                      _version},
+                     1_000
     end
   end
 
@@ -259,7 +292,11 @@ defmodule AgentDb.DataTransferTest do
   end
 
   defp seed_store! do
-    :ok = AgentDb.write("viking://resources/project/readme.md", "# Project", abstract: "Project overview")
+    :ok =
+      AgentDb.write("viking://resources/project/readme.md", "# Project",
+        abstract: "Project overview"
+      )
+
     :ok = AgentDb.write("viking://resources/other.md", "other content")
 
     {:ok, _} =
@@ -289,7 +326,7 @@ defmodule AgentDb.DataTransferTest do
   end
 
   defp tmp_tar(name) do
-    dir = Path.join(System.tmp_dir!(), "agent_db_transfer_#{System.unique_integer([:positive])}")
+    dir = AgentDb.Test.Scratch.dir("agent_db_transfer")
     File.mkdir_p!(dir)
     Path.join(dir, name)
   end
@@ -316,14 +353,50 @@ defmodule AgentDb.DataTransferTest do
     File.read!(path)
   end
 
+  # An archive with a symbolic link member, built the way a user's tar would
+  # produce one. `:erl_tar.create/3` writes a link entry only when the path it
+  # is given is a link on disk, so the members are staged first and the tar is
+  # built from their names.
+  defp symlink_archive(archive) do
+    {:ok, members} = :erl_tar.extract({:binary, archive}, [:memory])
+    path = tmp_tar("link.tar")
+    staging = Path.dirname(path)
+
+    for {name, content} <- members do
+      full = Path.join(staging, List.to_string(name))
+      File.mkdir_p!(Path.dirname(full))
+      File.write!(full, content)
+    end
+
+    :ok = File.ln_s("payload", Path.join(staging, "escape.md"))
+    on_exit(fn -> File.rm_rf!(staging) end)
+
+    :ok =
+      File.cd!(staging, fn ->
+        :erl_tar.create(
+          String.to_charlist(path),
+          Enum.map(members, fn {name, _} -> name end) ++ [~c"escape.md"],
+          []
+        )
+      end)
+
+    File.read!(path)
+  end
+
   defp bump_manifest_version(archive, version) do
     {:ok, members} = :erl_tar.extract({:binary, archive}, [:memory])
     by_name = Map.new(members, fn {name, content} -> {List.to_string(name), content} end)
 
-    manifest = by_name["manifest.json"] |> Jason.decode!() |> Map.put("format_version", version) |> Jason.encode!()
-    members = Enum.map(members, fn {name, content} ->
-      if List.to_string(name) == "manifest.json", do: {name, manifest}, else: {name, content}
-    end)
+    manifest =
+      by_name["manifest.json"]
+      |> Jason.decode!()
+      |> Map.put("format_version", version)
+      |> Jason.encode!()
+
+    members =
+      Enum.map(members, fn {name, content} ->
+        if List.to_string(name) == "manifest.json", do: {name, manifest}, else: {name, content}
+      end)
 
     path = tmp_tar("bumped.tar")
     :ok = :erl_tar.create(String.to_charlist(path), members, [])

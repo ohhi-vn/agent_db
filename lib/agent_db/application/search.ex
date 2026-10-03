@@ -8,6 +8,7 @@ defmodule AgentDb.Application.Search do
   # scope, a result shape and a top-k. What differs is where the ranking comes
   # from, and which of them can be refused.
 
+  alias AgentDb.Application.Navigation
   alias AgentDb.Observability
   alias AgentDb.Runtime
   alias AgentDb.URI, as: VikingURI
@@ -65,15 +66,21 @@ defmodule AgentDb.Application.Search do
   end
 
   defp do_search(term, opts) do
-    case Keyword.get(opts, :mode, :keyword) do
-      # A mode arrives as an atom from a caller, or as the string the wire
-      # carries from a transport. Both name the same three modes; anything else
-      # is reported as it arrived rather than substituted for, since answering
-      # a different question than the one asked is worse than an error.
-      mode when mode in ["keyword", :keyword] -> keyword(term, opts)
-      mode when mode in ["vector", :vector] -> vector(term, opts)
-      mode when mode in ["hybrid", :hybrid] -> hybrid(term, opts)
-      other -> {:error, {:invalid_mode, other}}
+    # The bound is checked once, here, before a leg is chosen. A leg that
+    # validated its own would answer an unusable `:top_k` as whatever that leg
+    # failed for instead -- a vector search would report its missing model for a
+    # request that was never well formed.
+    with {:ok, _limit} <- result_limit(opts) do
+      case Keyword.get(opts, :mode, :keyword) do
+        # A mode arrives as an atom from a caller, or as the string the wire
+        # carries from a transport. Both name the same three modes; anything else
+        # is reported as it arrived rather than substituted for, since answering
+        # a different question than the one asked is worse than an error.
+        mode when mode in ["keyword", :keyword] -> keyword(term, opts)
+        mode when mode in ["vector", :vector] -> vector(term, opts)
+        mode when mode in ["hybrid", :hybrid] -> hybrid(term, opts)
+        other -> {:error, {:invalid_mode, other}}
+      end
     end
   end
 
@@ -113,58 +120,13 @@ defmodule AgentDb.Application.Search do
   @spec grep(String.t(), keyword()) :: {:ok, [map()]} | {:error, term()}
   def grep(query, opts \\ []) do
     Observability.timed(:grep, %{}, fn ->
-      with :ok <- validate_grep_query(query),
-           {:ok, limit} <- validate_grep_limit(opts),
-           {:ok, scope_uri} <- validate_grep_scope(opts) do
+      with :ok <- Navigation.validate_query(query, @max_grep_query_length),
+           {:ok, limit} <-
+             Navigation.validate_limit(opts, @default_grep_limit, @max_grep_limit),
+           {:ok, scope_uri} <- Navigation.validate_scope(opts) do
         Runtime.storage().grep_content(query, scope_uri, limit)
       end
     end)
-  end
-
-  defp validate_grep_query(query) when is_binary(query) do
-    if String.valid?(query) and String.length(query) >= 1 and
-         String.length(query) <= @max_grep_query_length do
-      :ok
-    else
-      {:error, {:invalid_query, query}}
-    end
-  end
-
-  defp validate_grep_query(query), do: {:error, {:invalid_query, query}}
-
-  defp validate_grep_limit(opts) do
-    case Keyword.get(opts, :limit, @default_grep_limit) do
-      limit when is_integer(limit) and limit >= 1 and limit <= @max_grep_limit -> {:ok, limit}
-      limit -> {:error, {:invalid_limit, limit}}
-    end
-  end
-
-  # A `nil` scope searches the whole tree. The root searches everything as
-  # well, so it needs no existence check. Any other scope must parse and
-  # exist, otherwise a typo would silently answer with nothing.
-  defp validate_grep_scope(opts) do
-    case Keyword.get(opts, :scope) do
-      nil ->
-        {:ok, nil}
-
-      uri when is_binary(uri) ->
-        with {:ok, segments} <- VikingURI.parse(uri) do
-          scope_uri = VikingURI.build(segments)
-
-          if segments == [] do
-            {:ok, nil}
-          else
-            case Runtime.storage().get_node(scope_uri) do
-              {:ok, nil} -> {:error, :not_found}
-              {:ok, _node} -> {:ok, scope_uri}
-              {:error, _} = err -> err
-            end
-          end
-        end
-
-      _other ->
-        {:error, :invalid_uri}
-    end
   end
 
   defp keyword(term, opts) do
@@ -174,8 +136,13 @@ defmodule AgentDb.Application.Search do
       Observability.stage(:intent, mode, fn ->
         Observability.stage(:memory_search, mode, fn ->
           Observability.stage(:skill_retrieval, mode, fn ->
-            with {:ok, prefix} <- scope_prefix(opts) do
-              case Runtime.storage().search_keyword(term, prefix) do
+            with {:ok, prefix} <- scope_prefix(opts),
+                 {:ok, limit} <- result_limit(opts) do
+              # The bound goes down to storage rather than being applied to
+              # everything it returned: an unbounded scan materializes every
+              # match and then discards all but the first few, which is the
+              # whole cost the bound exists to avoid.
+              case Runtime.storage().search_keyword(term, prefix, limit) do
                 {:ok, nodes} -> {:ok, Enum.map(nodes, &entry/1)}
                 {:error, _} = err -> err
               end
@@ -184,6 +151,29 @@ defmodule AgentDb.Application.Search do
         end)
       end)
     end)
+  end
+
+  @max_top_k 200
+
+  # `:top_k` has always been documented as the maximum number of results, and
+  # the vector and hybrid legs have always honoured it. The keyword leg did
+  # not, so a common term on a large store returned every matching document
+  # with its full content -- the same query costing more the more it matched.
+  #
+  # Out of range is an error rather than a silent fallback: falling back to the
+  # default would answer a different question than the one asked, which is
+  # what the other validated bounds in this module already refuse to do.
+  defp result_limit(opts) do
+    case Keyword.get(opts, :top_k, @default_top_k) do
+      limit when is_integer(limit) and limit >= 1 and limit <= @max_top_k ->
+        {:ok, limit}
+
+      limit when is_integer(limit) ->
+        {:error, {:invalid_limit, limit}}
+
+      _other ->
+        {:error, {:invalid_limit, Keyword.get(opts, :top_k)}}
+    end
   end
 
   defp vector(term, opts) do

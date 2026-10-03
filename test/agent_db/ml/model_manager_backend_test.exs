@@ -10,7 +10,7 @@ defmodule AgentDb.ML.ModelManagerBackendTest do
     :ok = Supervisor.terminate_child(AgentDb.Supervisor, ModelManager)
     :ok = AgentDb.ML.FakeCallLog.start()
 
-    cache = Path.join(System.tmp_dir!(), "agent_db_mmb_#{:erlang.unique_integer([:positive])}")
+    cache = AgentDb.Test.Scratch.dir("agent_db_mmb")
     Application.put_env(:agent_db, :model_cache_dir, cache)
     Application.put_env(:agent_db, :embedding_model, @model_id)
     Application.put_env(:agent_db, :model_load_grace_ms, 300)

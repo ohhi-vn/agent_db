@@ -44,7 +44,9 @@ defmodule AgentDb.CodeIndexTest do
   """
 
   test "indexes an Elixir module with facts and find/grep reachability" do
-    assert {:ok, %{uri: uri, facts: facts}} = AgentDb.CodeIndex.index_source("proj", "user.ex", @user)
+    assert {:ok, %{uri: uri, facts: facts}} =
+             AgentDb.CodeIndex.index_source("proj", "user.ex", @user)
+
     assert uri == "viking://resources/proj/code/user.ex"
     assert "MyApp.User" in facts.modules or facts.modules != nil
 
@@ -78,12 +80,22 @@ defmodule AgentDb.CodeIndexTest do
 
     assert {:ok, desc} = AgentDb.CodeIndex.describe_module("proj-otp", "MyApp.Worker")
     assert desc.module == "MyApp.Worker"
-    assert is_list(desc.callbacks)
-    assert "handle_call/3" in desc.callbacks
+
+    # The callbacks are the ones this module defines, not the full behaviour
+    # list: @worker has no `handle_cast/2`, so reporting one would be a fact
+    # about the report rather than about the module.
+    assert desc.callbacks == ["handle_call/3", "handle_info/2", "init/1", "terminate/2"]
+  end
+
+  test "a module that defines no callbacks is reported as having none" do
+    {:ok, _} = AgentDb.CodeIndex.index_source("proj-plain", "plain.ex", @user)
+
+    assert {:ok, desc} = AgentDb.CodeIndex.describe_module("proj-plain", "MyApp.User")
+    assert desc.callbacks == []
   end
 
   test "one bad file does not stop indexing and re-index is idempotent" do
-    dir = Path.join(System.tmp_dir!(), "code_index_#{System.unique_integer([:positive])}")
+    dir = AgentDb.Test.Scratch.dir("code_index")
     File.mkdir_p!(dir)
 
     for n <- 1..10 do
@@ -92,7 +104,9 @@ defmodule AgentDb.CodeIndexTest do
 
     File.write!(Path.join(dir, "bad.ex"), "defmodule Broken do def oops( end")
 
-    assert {:ok, %{indexed: indexed, failed: failed}} = AgentDb.CodeIndex.index_dir("proj-bad", dir)
+    assert {:ok, %{indexed: indexed, failed: failed}} =
+             AgentDb.CodeIndex.index_dir("proj-bad", dir)
+
     assert length(indexed) == 10
     assert [{_rel, _reason}] = failed
 

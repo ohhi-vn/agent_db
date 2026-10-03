@@ -346,7 +346,7 @@ defmodule AgentDbWeb.AdminLiveTest do
   end
 
   defp archive(members) do
-    staging = Path.join(System.tmp_dir!(), "agent_db_live_#{System.unique_integer([:positive])}")
+    staging = AgentDb.Test.Scratch.dir("agent_db_live")
 
     for {name, content} <- members do
       path = Path.join(staging, name)

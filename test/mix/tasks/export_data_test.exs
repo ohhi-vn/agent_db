@@ -73,7 +73,9 @@ defmodule Mix.Tasks.AgentDb.ExportDataTest do
   end
 
   defp tmp(name) do
-    dir = Path.join(System.tmp_dir!(), "agent_db_export_task_#{System.unique_integer([:positive])}")
+    dir =
+      AgentDb.Test.Scratch.dir("agent_db_export_task")
+
     File.mkdir_p!(dir)
     Path.join(dir, name)
   end

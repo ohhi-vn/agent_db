@@ -55,6 +55,9 @@ defmodule AgentDb.Core.ContractsTest do
             :defer_job,
             :reset_running_jobs,
             :queue_stats,
+            :queue_detail,
+            :stats,
+            :vector_index_stats,
             :healthy?
           ] do
         assert Enum.any?(callbacks, fn {name, _arity} -> name == operation end),

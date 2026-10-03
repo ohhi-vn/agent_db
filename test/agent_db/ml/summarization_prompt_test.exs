@@ -20,7 +20,7 @@ defmodule AgentDb.ML.SummarizationPromptTest do
     # this test is asserting about.
     :ok = AgentDb.StorageContract.Helpers.stop_workers()
 
-    cache = Path.join(System.tmp_dir!(), "agent_db_sum_#{:erlang.unique_integer([:positive])}")
+    cache = AgentDb.Test.Scratch.dir("agent_db_sum")
 
     Application.put_env(:agent_db, :model_cache_dir, cache)
     Application.put_env(:agent_db, :llm_model, @llm_id)

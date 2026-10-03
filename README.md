@@ -9,11 +9,14 @@
 - [Usage](docs/USAGE.md) — daily workflows: documents, search, memory, sessions, skills, CLI, MCP, WebSocket.
 - [Agent setup](docs/agents.md) — OpenCode and Zed snippets (canonical).
 
+The API reference is generated from the code (`mix docs`) rather than written by
+hand, so it cannot drift from the modules it describes.
+
 ## Features
 
 - **Hierarchical context tree** — `viking://` URIs with `resources/`, `user/{id}/memories`, `user/{id}/resources`, `user/{id}/skills`, `peers/`
 - **Layered content** — Full content (L2) with optional caller-supplied or LLM-generated abstract (L0) and overview (L1)
-- **Keyword search** — Case-insensitive substring search over content/abstract/overview with subtree scoping
+- **Keyword search** — Case-insensitive substring search over content/abstract/overview with subtree scoping and a bounded `top_k` (default 10, max 200; an out-of-range value is refused rather than ignored)
 - **Path discovery (`find`)** — Literal, case-insensitive URI-path match with subtree scoping and bounded results
 - **Content inspection (`grep`)** — Literal, case-insensitive L2-only line matches with subtree scoping and bounded excerpts
 - **Vector search** — Semantic similarity search via sqlite-vec (HNSW index) with 384-dim embeddings
@@ -28,8 +31,9 @@
 - **Reactive subscriptions** — `AgentDb.subscribe/1` and `v1.subscribe` over `AgentDb.PubSub` with versioned `{:context_changed, uri, kind, version}` events for writes, removals, replacements, and commits; BEAM cluster distribution explicitly deferred
 - **Elixir code index** — Structural `.ex`/`.exs` indexing via `Code.string_to_quoted/2` under `viking://resources/<project>/code/` with OTP-aware caller/callee queries, no model required
 - **Hex docs** — Locked-version-aware docs under `viking://resources/hex/<package>/<version>/` discovered offline from `mix.lock`
-- **BEAM runtime snapshots** — Read-only `AgentDb.RuntimeContext.snapshot/0` (apps, supervisors, processes, ETS, memory) with bounds and redaction; never auto-writes
-- **Pluggable inference** — Local Nx/Bumblebee default plus opt-in Ollama and OpenAI-compatible adapters behind `AgentDb.Core.Inference`; `model_status/0` reports active provider kind
+- **BEAM runtime snapshots** — Read-only AgentDb.RuntimeContext.snapshot/0 (apps, supervisors, processes, ETS, memory) with bounds and redaction; never auto-writes
+- **Pluggable inference** — Local Nx/Bumblebee default plus opt-in Ollama and OpenAI-compatible adapters behind `AgentDb.Core.Inference`; one `inference_provider` key chooses both which provider serves and the provider kind `model_status/0` reports, and an unreachable remote provider is reported as such rather than as loaded
+- **Operations console** — `/admin` reports storage footprint and tree composition, cache and BEAM memory sizes, vector-index coverage, per-role model state (load duration, latency, in-flight, provider health), durable queue depth with failed jobs and their classified reasons, node uptime and process counts, and a bounded list of recent operational errors
 
 ## Installation
 
@@ -41,7 +45,11 @@ def deps do
 end
 ```
 
+MIT licensed; the terms are in [LICENSE](LICENSE).
+
 Full setup (directories, environment, listener, auth, backends): [Setup](docs/SETUP.md).
+Changing this library, or checking someone else's change: the
+[verification commands](docs/SETUP.md#verifying-a-change) are the ones CI runs.
 
 ## Quick Start
 
@@ -223,7 +231,7 @@ my-skills/code-review/
 The same import is available from the operations console at `/admin` and from
 the command line, and both go through one workflow: what a bundle may look like,
 what is refused, and where a skill lands are decided once
-(`AgentDb.Skills.Source` and `AgentDb.Application.Skills`).
+(`AgentDb.Skills.Source` and the skills workflow).
 
 ### What a source may look like
 
@@ -425,6 +433,23 @@ a deployment that sets its own must be at least as long.
 ### Environment Variables
 
 Full table with defaults and failure recovery: [Setup](docs/SETUP.md#environment-reference).
+`config/example.exs` is a working starting point: every setting in it has a
+default, so it evaluates with no environment set, and an unparseable value is
+refused by variable name.
+
+### Choosing an inference provider
+
+One key, `inference_provider`, decides which provider serves `embed/1` and
+`summarize/2` and the provider kind `model_status/0` reports:
+
+```elixir
+config :agent_db, inference_provider: :ollama
+# => Runtime.inference() == AgentDb.Adapters.Inference.Ollama
+# => AgentDb.model_status().provider == :ollama
+```
+
+A value naming no known provider fails startup validation, rather than serving
+local models while the console reports something else.
 
 ## WebSocket API
 
@@ -538,4 +563,4 @@ Details: [Setup](docs/SETUP.md#models-pre-placement-and-cache-recovery).
 
 ## License
 
-MIT
+MIT — the full text is in [LICENSE](LICENSE).

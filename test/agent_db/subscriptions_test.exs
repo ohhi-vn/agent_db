@@ -17,7 +17,9 @@ defmodule AgentDb.SubscriptionsTest do
 
     :ok = AgentDb.write("viking://resources/sub-project/docs/api.md", "hello")
 
-    assert_receive {:context_changed, "viking://resources/sub-project/docs/api.md", :written, v1}, 1_000
+    assert_receive {:context_changed, "viking://resources/sub-project/docs/api.md", :written, v1},
+                   1_000
+
     assert is_integer(v1)
 
     assert :ok = AgentDb.unsubscribe("viking://resources/sub-project")

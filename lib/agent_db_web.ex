@@ -20,8 +20,11 @@ defmodule AgentDbWeb do
 
   def controller do
     quote do
+      # These are the JSON API controllers, and they say so: the format list
+      # names the one view that answers both success and error rendering for
+      # them, rather than leaving Phoenix to infer a namespace and warn.
       use Phoenix.Controller,
-        namespace: AgentDbWeb,
+        formats: [json: AgentDbWeb.ErrorView],
         json_library: Jason
 
       import Plug.Conn

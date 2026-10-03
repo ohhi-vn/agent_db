@@ -3,6 +3,10 @@ defmodule AgentDbWeb.McpTest do
   The MCP surface's contract: handshake, tool inventory, facade mapping,
   JSON-safe errors, auth, and trace handling.
   """
+  # The JSON-RPC error codes below are protocol identifiers, not magnitudes:
+  # `-32601` is "method not found", and writing it `-32_601` would read as a
+  # quantity. The check stays on everywhere else.
+  # credo:disable-for-this-file Credo.Check.Readability.LargeNumbers
   use ExUnit.Case, async: false
 
   alias AgentDbWeb.Mcp

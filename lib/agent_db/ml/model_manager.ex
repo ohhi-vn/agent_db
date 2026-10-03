@@ -8,15 +8,9 @@ defmodule AgentDb.ML.ModelManager do
   use GenServer
 
   alias AgentDb.Config
+  alias AgentDb.ML.ModelDownload
   alias AgentDb.ML.ModelManager.Backend
   alias AgentDb.ML.ModelManager.State
-
-  require Logger
-
-  # Explicit rather than relying on Req's 15s default, so a slow host cannot
-  # block the inference process indefinitely. Not yet configurable; timeout
-  # policy belongs with the loader-split change.
-  @download_receive_timeout 30_000
 
   # Explicit rather than GenServer.call's 5s default. A call now returns
   # :model_loading immediately unless the model is already loaded, in which
@@ -27,7 +21,7 @@ defmodule AgentDb.ML.ModelManager do
 
   @type model_ref :: %{
           tokenizer: Bumblebee.Tokenizer.t(),
-          model: Bumblebee.Model.t(),
+          model: term(),
           config: map(),
           serving: module(),
           chat_template: String.t()
@@ -51,7 +45,7 @@ defmodule AgentDb.ML.ModelManager do
   Generates embeddings for the given texts.
 
   Returns `{:error, :model_loading}` when the model is not ready and has not
-  become ready within `Config.model_load_grace_ms/0`. That is distinct from a
+  become ready within the configured load grace (Config.model_load_grace_ms/0). That is distinct from a
   load that failed, and the call is safe to repeat.
   """
   @spec embed([String.t()]) :: {:ok, [Nx.Tensor.t()]} | {:error, term()}
@@ -63,7 +57,7 @@ defmodule AgentDb.ML.ModelManager do
   Generates a summary for the given prompt.
 
   Returns `{:error, :model_loading}` when the model is not ready and has not
-  become ready within `Config.model_load_grace_ms/0`.
+  become ready within the configured load grace (Config.model_load_grace_ms/0).
   """
   @spec summarize(String.t(), keyword()) :: {:ok, String.t()} | {:error, term()}
   def summarize(prompt, opts \\ []) do
@@ -176,7 +170,13 @@ defmodule AgentDb.ML.ModelManager do
   def handle_call({:embed, texts}, from, state) do
     case ensure_embedding_model(state) do
       {:ok, model_ref, new_state} ->
-        dispatch_inference(from, :embedding, new_state, &generate_embeddings(model_ref, &1), texts)
+        dispatch_inference(
+          from,
+          :embedding,
+          new_state,
+          &generate_embeddings(model_ref, &1),
+          texts
+        )
 
       # Either an already-running load, or one this call just started.
       {:error, :loading, new_state} ->
@@ -232,7 +232,7 @@ defmodule AgentDb.ML.ModelManager do
   end
 
   @impl true
-  def handle_cast({:load_result, ref, role, result}, state) do
+  def handle_cast({:load_result, ref, role, {result, duration}}, state) do
     # A load runs outside this process and casts its result back by name, so a
     # result can outlive the manager that started it -- after a restart, or
     # when a new load has already begun. Only the in-flight load for THIS role
@@ -240,7 +240,7 @@ defmodule AgentDb.ML.ModelManager do
     # and for every role in a manager that has just started, so a leftover
     # result matches nothing and is dropped.
     if state.loading_ref[role] == ref do
-      {:noreply, apply_load_result(role, result, state)}
+      {:noreply, apply_load_result(role, result, duration, state)}
     else
       {:noreply, state}
     end
@@ -262,7 +262,10 @@ defmodule AgentDb.ML.ModelManager do
 
       _ =
         Task.start(fn ->
-          send(__MODULE__, {:inference_result, ref, from, role, run_inference(role, fun, input, start)})
+          send(
+            __MODULE__,
+            {:inference_result, ref, from, role, run_inference(role, fun, input, start)}
+          )
         end)
 
       {:noreply,
@@ -313,7 +316,11 @@ defmodule AgentDb.ML.ModelManager do
     {result, stamp_latency(state, role, duration)}
   end
 
-  defp apply_load_result(role, result, state) do
+  # A load is stamped whether it succeeded or failed: a load that failed after
+  # four minutes is exactly the figure an operator needs to see.
+  defp apply_load_result(role, result, duration, state) do
+    state = %{state | last_load_ms: Map.put(state.last_load_ms, role, duration)}
+
     case result do
       {:ok, model_ref} ->
         state
@@ -395,6 +402,9 @@ defmodule AgentDb.ML.ModelManager do
     :ok
   end
 
+  # The duration travels with the result rather than being measured again on
+  # arrival: what an operator wants is how long the load actually took,
+  # including a first-use download, not how long the message waited in a queue.
   defp perform_load(config, role) when role in [:embedding, :llm] do
     start = System.monotonic_time(:millisecond)
 
@@ -407,129 +417,33 @@ defmodule AgentDb.ML.ModelManager do
     duration = System.monotonic_time(:millisecond) - start
     outcome = if match?({:ok, _}, result), do: :ok, else: :error
     AgentDb.Observability.emit_model(role, outcome, duration)
-    result
+
+    {result, duration}
   end
 
   defp load_embedding_model(config) do
     model_id = config.embedding_model
 
-    with :ok <- ensure_model_files(model_id, config.embedding_model_url, config.model_cache_dir) do
-      load_with_fallback(config, :embedding)
+    with :ok <-
+           ModelDownload.ensure_model_files(
+             model_id,
+             config.embedding_model_url,
+             config.model_cache_dir
+           ) do
+      Backend.load(config, :embedding)
     end
   end
 
   defp load_llm_model(config) do
     model_id = config.llm_model
 
-    with :ok <- ensure_model_files(model_id, config.llm_model_url, config.model_cache_dir) do
-      load_with_fallback(config, :llm)
-    end
-  end
-
-  defp load_with_fallback(%{ml_backend: :emlx, backend: backend} = config, role) do
-    case apply(backend, load_fun(role), [config]) do
-      {:ok, _} = ok ->
-        ok
-
-      {:error, reason} ->
-        Logger.warning(
-          "EMLX backend failed for #{inspect(role)}, falling back to EXLA: #{inspect(reason)}"
-        )
-
-        apply(Backend.module_for(:exla), load_fun(role), [config])
-    end
-  rescue
-    _error ->
-      Logger.warning("EMLX backend raised for #{inspect(role)}, falling back to EXLA")
-      apply(Backend.module_for(:exla), load_fun(role), [config])
-  catch
-    :exit, _ ->
-      Logger.warning("EMLX backend exited for #{inspect(role)}, falling back to EXLA")
-      apply(Backend.module_for(:exla), load_fun(role), [config])
-
-    :throw, _ ->
-      Logger.warning("EMLX backend threw for #{inspect(role)}, falling back to EXLA")
-      apply(Backend.module_for(:exla), load_fun(role), [config])
-  end
-
-  defp load_with_fallback(%{backend: backend} = config, role) do
-    apply(backend, load_fun(role), [config])
-  end
-
-  defp load_fun(:embedding), do: :load_embedding
-  defp load_fun(:llm), do: :load_llm
-
-  defp ensure_model_files(model_id, model_url, cache_dir) do
-    model_dir = Path.join(cache_dir, model_id)
-    model_file = Path.join(model_dir, "model.safetensors")
-
-    if File.exists?(model_file) do
-      :ok
-    else
-      download_model(model_url, model_dir, model_file)
-    end
-  end
-
-  # Writes to a .part path and renames into place, so a file at model_file is
-  # proof of a completed download. Previously the body was written straight to
-  # the final path, so a truncated file satisfied File.exists?/1 on every
-  # later boot and then failed at load forever.
-  defp download_model(url, model_dir, model_file) do
-    if skip_remote_download_in_test?(url) do
-      {:error, {:model_not_found, model_file}}
-    else
-      do_download_model(url, model_dir, model_file)
-    end
-  end
-
-  # Keep the test suite off the network without also blocking the load path or
-  # the download logic itself: loopback URLs are served by the test and are
-  # always attempted.
-  defp skip_remote_download_in_test?(url) do
-    Mix.env() == :test and not String.starts_with?(url, "http://127.0.0.1")
-  end
-
-  defp do_download_model(url, model_dir, model_file) do
-    partial = model_file <> ".part"
-    File.mkdir_p!(model_dir)
-
-    AgentDb.Observability.log(:info, component: :model, operation: :download, outcome: :started)
-
-    case Req.get(url, receive_timeout: @download_receive_timeout) do
-      {:ok, %Req.Response{status: 200, body: body}} ->
-        File.write!(partial, body)
-        File.rename!(partial, model_file)
-        AgentDb.Observability.log(:info, component: :model, operation: :download, outcome: :ok)
-        :ok
-
-      {:ok, %Req.Response{status: status}} ->
-        AgentDb.Observability.log(:error,
-          component: :model,
-          operation: :download,
-          outcome: :error,
-          reason: {:download_failed, status}
-        )
-
-        {:error, {:download_failed, status}}
-
-      {:error, reason} ->
-        AgentDb.Observability.log(:error,
-          component: :model,
-          operation: :download,
-          outcome: :error,
-          reason: {:download_failed, :transport}
-        )
-
-        {:error, {:download_failed, reason}}
-    end
-    |> case do
-      :ok ->
-        :ok
-
-      {:error, _} = error ->
-        # Leave nothing behind that a later run would treat as a usable cache.
-        File.rm(partial)
-        error
+    with :ok <-
+           ModelDownload.ensure_model_files(
+             model_id,
+             config.llm_model_url,
+             config.model_cache_dir
+           ) do
+      Backend.load(config, :llm)
     end
   end
 
@@ -551,7 +465,8 @@ defmodule AgentDb.ML.ModelManager do
         state: state.loading |> Map.get(:embedding, :idle) |> load_state_name(),
         model: state.config.embedding_model,
         dim: 384,
-        last_latency_ms: Map.get(state.last_latency_ms, :embedding)
+        last_latency_ms: Map.get(state.last_latency_ms, :embedding),
+        last_load_ms: Map.get(state.last_load_ms, :embedding)
       },
       llm: %{
         loaded: llm_model != nil,
@@ -561,14 +476,20 @@ defmodule AgentDb.ML.ModelManager do
         # model the store may not be running, and the http-api spec assertion
         # had to change every time the model did.
         params: state.config.llm_model_params,
-        last_latency_ms: Map.get(state.last_latency_ms, :llm)
+        last_latency_ms: Map.get(state.last_latency_ms, :llm),
+        last_load_ms: Map.get(state.last_load_ms, :llm)
       },
-      queue: %{
-        # Will be populated by JobQueue
-        pending: 0
-      },
+      # How many calls are using the model right now. The bound is
+      # Config.inference_concurrency/0, so a value at the bound is backpressure
+      # rather than a stall.
+      in_flight: state.in_flight,
       backend: state.config.ml_backend,
-      memory_bytes: vm_memory()
+      memory_bytes: vm_memory(),
+      # The kind of provider answering, reported by the provider itself rather
+      # than read from configuration elsewhere: these models are this
+      # application's own, so the answer is the same wherever the key lives.
+      provider: :local,
+      health: :healthy
     }
   end
 

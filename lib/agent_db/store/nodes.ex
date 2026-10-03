@@ -109,9 +109,8 @@ defmodule AgentDb.Store.Nodes do
   def rm_subtree(_conn, "viking://"), do: :root
 
   def rm_subtree(conn, uri) do
-    with {:ok, true} <- exists?(conn, uri) do
-      SQLite.transaction(conn, fn c -> purge_subtree(c, uri) end)
-    else
+    case exists?(conn, uri) do
+      {:ok, true} -> SQLite.transaction(conn, fn c -> purge_subtree(c, uri) end)
       {:ok, false} -> {:error, :not_found}
       {:error, _} = err -> err
     end
@@ -197,10 +196,14 @@ defmodule AgentDb.Store.Nodes do
   All doc nodes whose content/abstract/overview contain the (case-insensitive)
   substring, optionally limited to a subtree prefix. Caller passes the raw
   term; escaping happens here.
+
+  Bounded by `limit` in SQL and ordered by URI, so the two are the same on
+  every call: a store cannot return a different set of the same results just
+  because the rows came back in a different order.
   """
-  @spec search(SQLite.conn(), String.t(), String.t() | nil) ::
+  @spec search(SQLite.conn(), String.t(), String.t() | nil, pos_integer()) ::
           {:ok, [node_row()]} | {:error, term()}
-  def search(conn, term, scope_prefix) do
+  def search(conn, term, scope_prefix, limit) do
     pattern = "%" <> like_escape(String.downcase(term)) <> "%"
 
     {where, args} =
@@ -217,8 +220,8 @@ defmodule AgentDb.Store.Nodes do
     case SQLite.query(
            conn,
            "SELECT uri, parent_uri, name, kind, content, abstract, overview FROM nodes WHERE " <>
-             where,
-           args
+             where <> " ORDER BY uri ASC LIMIT ?",
+           args ++ [limit]
          ) do
       {:ok, rows} -> {:ok, Enum.map(rows, &row_to_node/1)}
       {:error, _} = err -> err
@@ -367,6 +370,66 @@ defmodule AgentDb.Store.Nodes do
     |> String.replace("\\", "\\\\")
     |> String.replace("%", "\\%")
     |> String.replace("_", "\\_")
+  end
+
+  # -- composition counts (read-only, for the operator console) --
+
+  @doc "How many nodes there are of each kind."
+  @spec counts(SQLite.conn()) ::
+          {:ok, %{documents: non_neg_integer(), directories: non_neg_integer()}}
+  def counts(conn) do
+    case SQLite.query(conn, "SELECT kind, COUNT(*) FROM nodes GROUP BY kind", []) do
+      {:ok, rows} ->
+        {:ok,
+         %{
+           documents: count_of(rows, "doc"),
+           directories: count_of(rows, "dir")
+         }}
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  # One grouped query rather than a walk: the first path segment after the
+  # scheme is the top-level subtree, and `substr` already yields "" for a
+  # node held directly at the root.
+  @doc "Document counts per top-level subtree, as `%{segment => count}`."
+  @spec count_by_top_subtree(SQLite.conn()) :: {:ok, %{optional(String.t()) => non_neg_integer()}}
+  def count_by_top_subtree(conn) do
+    sql = """
+    SELECT CASE WHEN length(substr(uri, 10)) = 0 THEN '' ELSE substr(uri, 10, instr(substr(uri, 10) || '/', '/') - 1) END,
+           COUNT(*)
+    FROM nodes WHERE kind = 'doc' GROUP BY 1
+    """
+
+    case SQLite.query(conn, sql, []) do
+      {:ok, rows} -> {:ok, Map.new(rows, fn [segment, count] -> {segment, count} end)}
+      {:error, _} = err -> err
+    end
+  end
+
+  # Exact-URI-or-descendant, so counting a subtree cannot pick up a sibling
+  # named `project-old`. Directories are not documents.
+  @doc "How many documents are at `prefix` or beneath it."
+  @spec count_documents(SQLite.conn(), String.t()) :: non_neg_integer()
+  def count_documents(conn, prefix) do
+    sql = """
+    SELECT COUNT(*) FROM nodes
+    WHERE kind = 'doc' AND (uri = ?1 OR uri LIKE ?2 ESCAPE '\\')
+    """
+
+    case SQLite.query_one(conn, sql, [prefix, like_escape(prefix <> "/") <> "%"]) do
+      {:ok, [count]} -> count
+      _ -> 0
+    end
+  end
+
+  defp count_of(rows, kind) do
+    case Enum.find(rows, fn [row_kind, _count] -> row_kind == kind end) do
+      [_kind, count] -> count
+      nil -> 0
+    end
   end
 
   @doc "Updates the updated_at timestamp for a node."

@@ -14,9 +14,32 @@ defmodule AgentDb.Observability do
   @job_event [:agent_db, :job, :stop]
   @model_event [:agent_db, :model, :stop]
 
-  @doc "Telemetry event names emitted by the store."
-  @spec events() :: [[atom()]]
-  def events, do: [@operation_event, @job_event, @model_event]
+  @doc """
+  Recent failures, newest first, each with the operation it happened in and its
+  classified reason.
+
+  Read from `Observability.Sink`, which records the failures among the events
+  above. Entries carry a classification and a timestamp only -- never a URI,
+  document content, a prompt, a user, or a credential -- and the list is bounded
+  and in memory, so it starts empty again on a restart rather than becoming a
+  history the store accumulates forever.
+
+  A store whose sink is not running answers an empty list rather than an error:
+  diagnostics are never a reason an operation fails.
+  """
+  @spec recent_errors(pos_integer()) :: [map()]
+  def recent_errors(limit \\ 20), do: AgentDb.Observability.Sink.recent_errors(limit)
+
+  @doc """
+  Counts of operations, jobs, and model calls by outcome, as
+  `%{{family, dimensions, outcome} => count}`.
+
+  Dimensions are only the bounded labels the events already carry -- operation,
+  kind, role -- so the number of counters follows the store's code rather than
+  the traffic through it.
+  """
+  @spec operation_stats() :: map()
+  def operation_stats, do: AgentDb.Observability.Sink.counts()
 
   @doc """
   Runs `fun`, emitting a low-cardinality operation measurement.

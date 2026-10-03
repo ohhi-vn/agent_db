@@ -83,9 +83,14 @@ defmodule AgentDb.Subscriptions do
   # `project`.
   defp scopes(uri) do
     case VikingURI.parse(uri) do
-      {:ok, []} -> [VikingURI.build([])]
-      {:ok, segments} -> for take <- length(segments)..0//-1, do: VikingURI.build(Enum.take(segments, take))
-      {:error, _} -> [uri]
+      {:ok, []} ->
+        [VikingURI.build([])]
+
+      {:ok, segments} ->
+        for take <- length(segments)..0//-1, do: VikingURI.build(Enum.take(segments, take))
+
+      {:error, _} ->
+        [uri]
     end
   end
 

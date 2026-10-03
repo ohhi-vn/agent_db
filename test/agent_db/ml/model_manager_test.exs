@@ -2,7 +2,6 @@ defmodule AgentDb.ML.ModelManagerTest do
   use ExUnit.Case, async: false
 
   alias AgentDb.ML.ModelManager
-  alias AgentDb.Config
 
   setup do
     # Use the already running ModelManager from the application
@@ -25,7 +24,18 @@ defmodule AgentDb.ML.ModelManagerTest do
       assert is_map(status)
       assert Map.has_key?(status, :embedding)
       assert Map.has_key?(status, :llm)
-      assert Map.has_key?(status, :queue)
+      # The manager knows how many calls are using the model, which is the one
+      # queue-shaped fact it is actually the owner of.
+      assert Map.has_key?(status, :in_flight)
+    end
+
+    test "each role reports its own load duration and last inference latency" do
+      status = ModelManager.model_status()
+
+      for role <- [:embedding, :llm] do
+        assert Map.has_key?(Map.get(status, role, %{}), :last_load_ms)
+        assert Map.has_key?(Map.get(status, role, %{}), :last_latency_ms)
+      end
     end
   end
 

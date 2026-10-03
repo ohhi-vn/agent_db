@@ -186,8 +186,7 @@ defmodule Mix.Tasks.AgentDb.ImportSkillsTest do
     |> String.graphemes()
     |> Enum.reverse()
     |> Enum.chunk_every(3)
-    |> Enum.map(&Enum.join/1)
-    |> Enum.join(",")
+    |> Enum.map_join(",", &Enum.join/1)
     |> String.reverse()
   end
 
@@ -237,7 +236,7 @@ defmodule Mix.Tasks.AgentDb.ImportSkillsTest do
   defp tmp(name) do
     path =
       Path.join(
-        Path.join(System.tmp_dir!(), "agent_db_task_#{System.unique_integer([:positive])}"),
+        AgentDb.Test.Scratch.dir("agent_db_task"),
         name
       )
 

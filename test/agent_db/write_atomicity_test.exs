@@ -1,13 +1,13 @@
 defmodule AgentDb.WriteAtomicityTest do
   use ExUnit.Case, async: false
 
-  alias AgentDb.Test.Fakes.Storage
   alias AgentDb.Cache
+  alias AgentDb.Test.Fakes.Storage
 
   setup do
     Application.put_env(:agent_db, :data_dir, AgentDb.Config.test_data_dir())
     Application.put_env(:agent_db, :storage_adapter, Storage)
-    Application.put_env(:agent_db, :inference_adapter, AgentDb.Test.Fakes.Inference)
+    Application.put_env(:agent_db, :inference_provider, AgentDb.Test.Fakes.Inference)
     :ok = AgentDb.StorageContract.Helpers.restart_app()
     Storage.reset()
     Cache.clear()
@@ -15,7 +15,7 @@ defmodule AgentDb.WriteAtomicityTest do
     on_exit(fn ->
       Application.delete_env(:agent_db, :data_dir)
       Application.delete_env(:agent_db, :storage_adapter)
-      Application.delete_env(:agent_db, :inference_adapter)
+      Application.delete_env(:agent_db, :inference_provider)
       AgentDb.Test.Script.clear(:fake_storage)
       AgentDb.Test.Script.clear(:fake_inference)
       :ok = AgentDb.StorageContract.Helpers.restart_app()

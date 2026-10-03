@@ -262,7 +262,7 @@ defmodule AgentDb.Test.Fakes.Storage do
   end
 
   @impl true
-  def search_keyword(term, scope) do
+  def search_keyword(term, scope, limit) do
     needle = String.downcase(term)
 
     hits =
@@ -273,6 +273,10 @@ defmodule AgentDb.Test.Fakes.Storage do
             matches?(document.overview, needle) do
         document
       end
+
+    # Bounded and ordered, like the real provider: a fake that ignored the
+    # limit would let a caller pass a bound test while the store ignored it.
+    hits = hits |> Enum.sort_by(&elem(&1, 0)) |> Enum.take(limit)
 
     scripted(:search_keyword, {:ok, hits})
   end
@@ -426,7 +430,9 @@ defmodule AgentDb.Test.Fakes.Storage do
         ordered =
           incoming
           |> Enum.with_index()
-          |> Enum.map(fn {message, seq} -> %{seq: seq, role: message.role, content: message.content} end)
+          |> Enum.map(fn {message, seq} ->
+            %{seq: seq, role: message.role, content: message.content}
+          end)
 
         put(:messages, Map.put(messages(), session_id, Enum.reverse(ordered)), {:ok, :imported})
 
@@ -553,8 +559,39 @@ defmodule AgentDb.Test.Fakes.Storage do
   end
 
   @impl true
-  def fail_job(job_id) do
+  def fail_job(job_id, _reason \\ nil) do
     update_job(job_id, &%{&1 | status: :failed})
+  end
+
+  @impl true
+  def queue_detail(_limit \\ 20) do
+    scripted(:queue_detail, {:ok, %{oldest_pending_ms: nil, failed: []}})
+  end
+
+  @impl true
+  def stats do
+    scripted(:stats, {:ok, empty_stats()})
+  end
+
+  @impl true
+  def vector_index_stats do
+    scripted(:vector_index_stats, {:ok, %{available: false, vectors: nil, documents: 0}})
+  end
+
+  # Counted from what this fake actually holds, so the exact-URI-or-descendant
+  # rule is real here rather than asserted about a stub.
+  @impl true
+  def document_count(prefix) do
+    prefix = String.trim_trailing(prefix, "/")
+
+    Enum.count(documents(), fn {uri, node} ->
+      is_map(node) and node[:kind] == :doc and
+        (uri == prefix or String.starts_with?(uri, prefix <> "/"))
+    end)
+  end
+
+  defp empty_stats do
+    %{documents: 0, directories: 0, by_top_subtree: %{}, db_bytes: nil, wal_bytes: nil}
   end
 
   @impl true

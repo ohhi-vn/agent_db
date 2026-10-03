@@ -242,7 +242,7 @@ defmodule AgentDb.SkillsTest do
       assert {:ok, _} =
                AgentDb.import_skills("alice", {:uploads, collection(alpha: "searchable")})
 
-      assert {:ok, [hit | _]} = AgentDb.search("searchable", scope: "viking://user/alice/skills")
+      assert {:ok, [_ | _]} = AgentDb.search("searchable", scope: "viking://user/alice/skills")
 
       assert {:ok, _} =
                AgentDb.import_skills(

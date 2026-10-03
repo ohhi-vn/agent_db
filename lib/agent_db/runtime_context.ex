@@ -37,6 +37,7 @@ defmodule AgentDb.RuntimeContext do
     %{
       node: node,
       captured_at: System.system_time(:millisecond),
+      uptime_ms: uptime_ms(),
       applications: applications(),
       supervisors: supervisors(),
       process_counts: %{total: length(Process.list())},
@@ -49,8 +50,20 @@ defmodule AgentDb.RuntimeContext do
     }
   end
 
+  # How long the VM has been up, which is what separates "this store is new"
+  # from "this store has been quietly failing for a week".
+  defp uptime_ms do
+    :erlang.statistics(:wall_clock) |> elem(0)
+  rescue
+    _ -> 0
+  catch
+    _, _ -> 0
+  end
+
+  # `:application.which_applications/0` is the supported call; the `Application`
+  # wrapper was never part of the standard library.
   defp applications do
-    Application.which_applications()
+    :application.which_applications()
     |> Enum.sort_by(&elem(&1, 0))
     |> Enum.take(@max_apps)
     |> Enum.map(fn {app, _desc, vsn} -> %{app: app, vsn: to_string(vsn)} end)
@@ -90,7 +103,8 @@ defmodule AgentDb.RuntimeContext do
       |> Enum.sort()
       |> Enum.take(@max_processes)
       |> Enum.map(fn pid ->
-        info = Process.info(pid, [:registered_name, :current_function, :reductions, :message_queue_len])
+        info =
+          Process.info(pid, [:registered_name, :current_function, :reductions, :message_queue_len])
 
         %{
           pid: inspect(pid),
@@ -122,7 +136,11 @@ defmodule AgentDb.RuntimeContext do
   end
 
   defp memory do
-    %{total: :erlang.memory(:total), processes: :erlang.memory(:processes), ets: :erlang.memory(:ets)}
+    %{
+      total: :erlang.memory(:total),
+      processes: :erlang.memory(:processes),
+      ets: :erlang.memory(:ets)
+    }
   rescue
     _ -> %{total: 0}
   end
@@ -132,10 +150,7 @@ defmodule AgentDb.RuntimeContext do
   end
 
   defp queue_depth do
-    case AgentDb.queue_stats() do
-      stats when is_map(stats) -> stats
-      _ -> %{}
-    end
+    AgentDb.queue_stats()
   rescue
     _ -> %{}
   catch

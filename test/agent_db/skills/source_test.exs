@@ -434,9 +434,10 @@ defmodule AgentDb.Skills.SourceTest do
   # A path inside a fresh temporary directory, for a file to be written to.
   defp tmp_path(name), do: Path.join(tmp("files"), name)
 
-  # One temporary directory per call, so nothing two calls make can collide.
-  defp root,
-    do: Path.join(System.tmp_dir!(), "agent_db_source_#{System.unique_integer([:positive])}")
+  # A fresh temporary directory per call, so nothing two calls make can
+  # collide -- including with a previous run's, which replayed the same
+  # `unique_integer` sequence.
+  defp root, do: AgentDb.Test.Scratch.dir("agent_db_source")
 
   defp write(folder, relative, content) do
     path = Path.join(folder, relative)

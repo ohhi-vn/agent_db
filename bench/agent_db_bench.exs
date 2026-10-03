@@ -1,7 +1,8 @@
 # Deterministic Benchee scenarios for AgentDb core operations.
 #
 # Uses isolated temporary SQLite data and real storage with model-free paths
-# (reads, tree projection, keyword search, writes, queue throughput). Vector
+# (reads, listings, tree projection, keyword search, grep, find, writes,
+# queue throughput). Vector
 # and hybrid legs need models/sqlite-vec and are measured on their error path
 # here; a warmed-model procedure on hosts with weights can extend these.
 #
@@ -37,11 +38,28 @@ for i <- 1..20 do
     )
 end
 
+# A second, larger corpus for the scenarios whose cost follows the number of
+# matches rather than the number of documents: an unbounded scan looks the same
+# at 20 documents as at 20, which is what made the keyword bound invisible.
+for i <- 1..1_000 do
+  :ok =
+    AgentDb.write(
+      "viking://resources/bench_wide/doc#{i}.md",
+      "wide corpus content #{i} with keyword beta"
+    )
+end
+
 Benchee.run(
   %{
     "read" => fn -> AgentDb.read("viking://resources/bench/doc1.md") end,
+    "list" => fn -> AgentDb.list("viking://resources/bench") end,
     "tree_projection" => fn -> AgentDb.tree("viking://resources/bench", 2) end,
     "keyword_search" => fn -> AgentDb.search("alpha", mode: :keyword, top_k: 10) end,
+    "keyword_search_wide" => fn ->
+      AgentDb.search("beta", mode: :keyword, scope: "viking://resources/bench_wide", top_k: 10)
+    end,
+    "grep" => fn -> AgentDb.grep("alpha", limit: 50) end,
+    "find" => fn -> AgentDb.find("doc", scope: "viking://resources/bench", limit: 50) end,
     "hybrid_search_error_path" => fn -> AgentDb.search("alpha", mode: :hybrid, top_k: 10) end,
     "write" => fn ->
       AgentDb.write("viking://resources/bench/tmp.md", "tmp #{System.unique_integer()}")

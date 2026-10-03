@@ -7,8 +7,14 @@ defmodule AgentDbWeb.Mcp do
   authentication (via the `:api` pipeline) and trace extraction.
   """
 
+  # The JSON-RPC error codes below are protocol identifiers, not magnitudes:
+  # `-32601` is "method not found", and writing it `-32_601` would read as a
+  # quantity. The check stays on everywhere else.
+  # credo:disable-for-this-file Credo.Check.Readability.LargeNumbers
+
   alias AgentDb
   alias AgentDb.Observability
+  alias AgentDbWeb.Context
 
   @protocol_version "2024-11-05"
   @server_name "agent-db"
@@ -357,7 +363,7 @@ defmodule AgentDbWeb.Mcp do
     with {:ok, session_id} <- required(args, "session_id"),
          {:ok, role} <- required(args, "role"),
          {:ok, content} <- required(args, "content") do
-      case AgentDb.append_message(session_id, append_role(role), content) do
+      case AgentDb.append_message(session_id, Context.role(role), content) do
         :ok -> {:ok, %{"session_id" => session_id, "status" => "ok"}}
         {:error, _} = err -> err
       end
@@ -445,11 +451,6 @@ defmodule AgentDbWeb.Mcp do
   defp search_mode("vector"), do: :vector
   defp search_mode("hybrid"), do: :hybrid
   defp search_mode(other), do: other
-
-  defp append_role("user"), do: :user
-  defp append_role("assistant"), do: :assistant
-  defp append_role("system"), do: :system
-  defp append_role(_other), do: :unknown
 
   # Store errors share the taxonomy message every other transport renders:
   # the classified tag only, never details that may carry URIs or content.

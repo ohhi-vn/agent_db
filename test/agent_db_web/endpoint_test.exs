@@ -315,7 +315,7 @@ defmodule AgentDbWeb.EndpointTest do
   end
 
   defp response(acc, head) do
-    [_version | status_line] = String.split(head, "\r\n")
+    [_version | _status_line] = String.split(head, "\r\n")
     status = head |> String.split(" ") |> Enum.at(1) |> String.to_integer()
     [head, body] = String.split(acc, "\r\n\r\n", parts: 2)
 

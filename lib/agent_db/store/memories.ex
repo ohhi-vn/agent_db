@@ -13,7 +13,7 @@ defmodule AgentDb.Store.Memories do
   # row is written first, so the predecessor's self-referencing `supersedes`
   # never names a row that does not exist yet.
 
-  alias AgentDb.Store.SQLite
+  alias AgentDb.Store.{Nodes, SQLite}
 
   @type row :: %{
           id: integer(),
@@ -125,7 +125,7 @@ defmodule AgentDb.Store.Memories do
           {"#{scope} AND status IN (#{marks})", [prefix, descendant_pattern(prefix)]}
 
         term ->
-          pattern = "%" <> like_escape(String.downcase(term)) <> "%"
+          pattern = "%" <> Nodes.like_escape(String.downcase(term)) <> "%"
 
           {"#{scope} AND status IN (#{marks}) AND lower(value) LIKE ?3 ESCAPE '\\'",
            [prefix, descendant_pattern(prefix), pattern]}
@@ -141,7 +141,7 @@ defmodule AgentDb.Store.Memories do
     end
   end
 
-  defp descendant_pattern(prefix), do: like_escape(prefix <> "/") <> "%"
+  defp descendant_pattern(prefix), do: Nodes.like_escape(prefix <> "/") <> "%"
 
   @doc "Every assertion at `uri`, oldest first, so a chain reads in order."
   @spec history(SQLite.conn(), String.t()) :: {:ok, [row()]} | {:error, term()}
@@ -172,15 +172,6 @@ defmodule AgentDb.Store.Memories do
       {:ok, row} -> {:ok, row_to_row(row)}
       {:error, _} = err -> err
     end
-  end
-
-  # LIKE escaping for a URI prefix or a user-supplied term. Mirrors
-  # AgentDb.Store.Nodes.like_escape/1, which is not exposed for other tables.
-  defp like_escape(text) do
-    text
-    |> String.replace("\\", "\\\\")
-    |> String.replace("%", "\\%")
-    |> String.replace("_", "\\_")
   end
 
   defp row_to_row([

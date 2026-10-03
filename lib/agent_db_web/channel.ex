@@ -16,6 +16,7 @@ defmodule AgentDbWeb.Channel do
 
   alias AgentDb
   alias AgentDb.Observability
+  alias AgentDbWeb.Context
 
   @impl true
   def join("api:lobby", _params, socket) do
@@ -115,7 +116,7 @@ defmodule AgentDbWeb.Channel do
         %{"session_id" => id, "role" => role, "content" => content},
         socket
       ) do
-    answer(socket, AgentDb.append_message(id, role(role), content))
+    answer(socket, AgentDb.append_message(id, Context.role(role), content))
   end
 
   def handle_in("v1.get_session", %{"session_id" => id}, socket) do
@@ -330,11 +331,4 @@ defmodule AgentDbWeb.Channel do
   end
 
   defp recall_opts(_params), do: []
-
-  # A role is a fixed vocabulary of stored values, so a word outside it is not
-  # turned into a term.
-  defp role("user"), do: :user
-  defp role("assistant"), do: :assistant
-  defp role("system"), do: :system
-  defp role(_other), do: :unknown
 end

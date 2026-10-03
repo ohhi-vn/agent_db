@@ -17,6 +17,8 @@ defmodule AgentDbWeb.AdminLive do
   import Phoenix.LiveView
   import Phoenix.Component
 
+  alias AgentDb.Observability
+  alias AgentDbWeb.AdminComponents
   alias AgentDbWeb.Context
 
   @refresh_ms 30_000
@@ -25,6 +27,9 @@ defmodule AgentDbWeb.AdminLive do
   @coalesce_ms 1_000
   @feed_max 20
   @search_top_k 10
+  # The tree root the console browses; the listing is its direct children.
+  @tree_root "viking://"
+  @error_max 20
 
   @impl Phoenix.LiveView
   def mount(_params, _session, socket) do
@@ -51,6 +56,7 @@ defmodule AgentDbWeb.AdminLive do
        session_id: "",
        session_messages: [],
        session_notice: nil,
+       tree_root: @tree_root,
        last_reload_ms: 0,
        reload_pending: false
      )
@@ -137,7 +143,7 @@ defmodule AgentDbWeb.AdminLive do
           search_term: term,
           search_scope: scope,
           search_results: [],
-          search_notice: "Search failed: #{inspect(reason)}"
+          search_notice: "Search failed: #{Observability.error_message(reason)}"
         )
     end
   end
@@ -152,7 +158,11 @@ defmodule AgentDbWeb.AdminLive do
   defp lookup_session(socket, id) do
     case Context.get_session(id) do
       {:ok, []} ->
-        assign(socket, session_id: id, session_messages: [], session_notice: "No session with that ID.")
+        assign(socket,
+          session_id: id,
+          session_messages: [],
+          session_notice: "No session with that ID."
+        )
 
       {:ok, messages} ->
         assign(socket, session_id: id, session_messages: messages, session_notice: nil)
@@ -161,7 +171,7 @@ defmodule AgentDbWeb.AdminLive do
         assign(socket,
           session_id: id,
           session_messages: [],
-          session_notice: "Could not read session: #{inspect(reason)}"
+          session_notice: "Could not read session: #{Observability.error_message(reason)}"
         )
     end
   end
@@ -275,7 +285,13 @@ defmodule AgentDbWeb.AdminLive do
       documents: documents(socket.assigns.page),
       models: Context.model_status(),
       jobs: Context.job_stats(),
+      queue_detail: Context.queue_detail(@error_max),
       health: Context.health_check(),
+      storage: Context.storage_stats(),
+      cache: Context.cache_stats(),
+      coverage: Context.index_coverage(),
+      runtime: Context.runtime_snapshot(),
+      recent_errors: Context.recent_errors(@error_max),
       notice: socket.assigns[:notice]
     )
   end
@@ -295,7 +311,7 @@ defmodule AgentDbWeb.AdminLive do
   defp delete(uri) do
     case Context.delete_document(uri) do
       :ok -> "Removed #{uri}"
-      {:error, reason} -> "Could not remove #{uri}: #{inspect(reason)}"
+      {:error, reason} -> "Could not remove #{uri}: #{Observability.error_message(reason)}"
     end
   end
 
@@ -305,321 +321,37 @@ defmodule AgentDbWeb.AdminLive do
     <div class="p-8 space-y-8">
       <header class="flex items-baseline justify-between">
         <h1 class="text-2xl font-semibold text-gray-900">AgentDb</h1>
-        <p class="text-sm text-gray-500"><%= @documents.meta.total %> documents</p>
+        <p class="text-sm text-gray-500"><%= @storage.documents %> documents</p>
       </header>
 
       <p :if={@notice} class="rounded bg-blue-50 px-3 py-2 text-sm text-blue-900"><%= @notice %></p>
 
-      <section class="rounded-lg border border-gray-200">
-        <h2 class="px-4 py-3 font-medium text-gray-900">Recent changes</h2>
-        <ul :if={@recent_changes == []} class="px-4 pb-4 text-sm text-gray-500">
-          <li>No changes yet</li>
-        </ul>
-        <ul id="recent-changes" class="divide-y divide-gray-100">
-          <li
-            :for={change <- @recent_changes}
-            class="flex items-center justify-between px-4 py-2 text-sm"
-          >
-            <span class="font-mono text-gray-900"><%= change.uri %></span>
-            <span class="font-mono text-gray-500"><%= change.kind %> &middot; v<%= change.version %></span>
-          </li>
-        </ul>
-      </section>
-
-      <section class="rounded-lg border border-gray-200">
-        <h2 class="px-4 py-3 font-medium text-gray-900">Import skills</h2>
-        <form id="import-skills" phx-submit="import_skills" class="space-y-4 px-4 pb-4">
-          <div>
-            <label for="skill-user-id" class="block text-sm text-gray-700">User ID</label>
-            <input
-              type="text"
-              id="skill-user-id"
-              name="user_id"
-              value={@user_id}
-              placeholder="alice"
-              class="mt-1 w-64 rounded border border-gray-300 px-2 py-1 font-mono text-sm"
-            />
-            <p class="mt-1 text-sm text-gray-500">
-              Skills are stored below <code class="font-mono">viking://user/&lt;user&gt;/skills</code>,
-              one subtree per user.
-            </p>
-          </div>
-
-          <div>
-            <label for="skill-folder" class="block text-sm text-gray-700">Skills folder</label>
-            <.live_file_input upload={@uploads[:skill_folder]} webkitdirectory />
-            <p class="mt-1 text-sm text-gray-500">
-              A folder holding one skill, or a collection of skill folders. Each skill needs a SKILL.md.
-            </p>
-            <ul class="mt-2 space-y-1">
-              <li
-                :for={entry <- @uploads.skill_folder.entries}
-                class="rounded bg-gray-50 px-2 py-1 text-xs text-gray-700"
-              >
-                <%= entry.client_relative_path || entry.client_name %>
-                <span :if={not entry.done?}><%= entry.progress %>%</span>
-              </li>
-            </ul>
-            <p
-              :for={reason <- upload_errors(@uploads[:skill_folder])}
-              class="mt-1 text-sm text-red-700"
-            >
-              <%= upload_error_to_string(reason) %>
-            </p>
-          </div>
-
-          <div>
-            <label for="skill-archive" class="block text-sm text-gray-700">Skills archive</label>
-            <.live_file_input upload={@uploads[:skill_archive]} />
-            <p class="mt-1 text-sm text-gray-500">
-              A .tar or .tar.gz holding the same folders, optionally under one wrapper directory.
-            </p>
-            <ul class="mt-2 space-y-1">
-              <li
-                :for={entry <- @uploads.skill_archive.entries}
-                class="rounded bg-gray-50 px-2 py-1 text-xs text-gray-700"
-              >
-                <%= entry.client_name %>
-                <span :if={not entry.done?}><%= entry.progress %>%</span>
-              </li>
-            </ul>
-            <p
-              :for={reason <- upload_errors(@uploads[:skill_archive])}
-              class="mt-1 text-sm text-red-700"
-            >
-              <%= upload_error_to_string(reason) %>
-            </p>
-          </div>
-
-          <p class="text-sm text-gray-500">
-            UTF-8 text only, at most <%= @limits.max_entries %> files and
-            <%= @limits.max_bytes %> bytes. A skill whose name is already stored is replaced whole.
-          </p>
-
-          <button type="submit" class="rounded bg-blue-600 px-4 py-2 text-sm text-white">
-            Import skills
-          </button>
-        </form>
-
-        <ul :if={@results != []} class="divide-y divide-gray-100 border-t border-gray-200">
-          <li :for={result <- @results} class="flex items-center justify-between px-4 py-2 text-sm">
-            <span class="font-mono text-gray-900"><%= result.name %></span>
-            <span :if={result.status == :failed} class="text-red-700">
-              <%= Context.skill_import_error(result.reason) %>
-            </span>
-            <span :if={result.status != :failed} class="text-gray-500">
-              <%= result.status %> &middot; <%= result.files %> files
-            </span>
-          </li>
-        </ul>
-      </section>
-
-      <section class="rounded-lg border border-gray-200">
-        <h2 class="px-4 py-3 font-medium text-gray-900">Search documents</h2>
-        <form id="doc-search" phx-submit="search" class="space-y-4 px-4 pb-4">
-          <div class="flex flex-wrap items-end gap-4">
-            <div>
-              <label for="search-term" class="block text-sm text-gray-700">Search term</label>
-              <input
-                type="text"
-                id="search-term"
-                name="term"
-                value={@search_term}
-                placeholder="keyword"
-                class="mt-1 w-64 rounded border border-gray-300 px-2 py-1 font-mono text-sm"
-              />
-            </div>
-            <div>
-              <label for="search-scope" class="block text-sm text-gray-700">Scope (optional URI)</label>
-              <input
-                type="text"
-                id="search-scope"
-                name="scope"
-                value={@search_scope}
-                placeholder="viking://resources/project"
-                class="mt-1 w-64 rounded border border-gray-300 px-2 py-1 font-mono text-sm"
-              />
-            </div>
-            <button type="submit" class="rounded bg-blue-600 px-4 py-2 text-sm text-white">
-              Search
-            </button>
-          </div>
-          <p :if={@search_notice} class="text-sm text-gray-500"><%= @search_notice %></p>
-        </form>
-
-        <ul :if={@search_results != []} class="divide-y divide-gray-100 border-t border-gray-200">
-          <li
-            :for={result <- @search_results}
-            class="flex items-center justify-between px-4 py-2 text-sm"
-          >
-            <a
-              class="font-mono text-blue-700 hover:underline"
-              href={"/admin/documents/#{URI.encode_www_form(result.uri)}/edit"}
-            >
-              <%= result.uri %>
-            </a>
-            <span :if={Map.has_key?(result, :score)} class="text-gray-500">
-              <%= Float.round(Map.get(result, :score) / 1, 3) %>
-            </span>
-          </li>
-        </ul>
-      </section>
-
-      <section class="rounded-lg border border-gray-200">
-        <h2 class="px-4 py-3 font-medium text-gray-900">Models</h2>
-        <p class="px-4 pb-2 text-sm text-gray-500">
-          Provider: <%= Map.get(@models, :provider, "unknown") %> &middot; Backend: <%= Map.get(
-            @models,
-            :backend,
-            "unknown"
-          ) %> &middot; Memory (BEAM total): <%= format_memory(Map.get(@models, :memory_bytes)) %>
-        </p>
-        <dl class="grid grid-cols-2 gap-4 px-4 pb-4 text-sm">
-          <div :for={{role, entry} <- models_summary(@models)}>
-            <dt class="text-gray-500"><%= role %></dt>
-            <dd class="font-mono text-gray-900">
-              <%= model_state(entry) %>
-            </dd>
-            <dd class="font-mono text-sm text-gray-700">
-              <%= model_identity(role, entry) %>
-            </dd>
-            <dd class="font-mono text-sm text-gray-700">
-              Last inference: <%= format_latency(Map.get(entry, :last_latency_ms)) %>
-            </dd>
-          </div>
-        </dl>
-      </section>
-
-      <section class="rounded-lg border border-gray-200">
-        <h2 class="px-4 py-3 font-medium text-gray-900">Queue</h2>
-        <dl class="grid grid-cols-4 gap-4 px-4 pb-4 text-sm">
-          <div :for={status <- [:pending, :running, :done, :failed]}>
-            <dt class="text-gray-500"><%= status %></dt>
-            <dd class="text-lg font-semibold text-gray-900"><%= Map.get(@jobs, status, 0) %></dd>
-          </div>
-        </dl>
-      </section>
-
-      <section class="rounded-lg border border-gray-200">
-        <h2 class="px-4 py-3 font-medium text-gray-900">Health</h2>
-        <dl class="grid grid-cols-3 gap-4 px-4 pb-4 text-sm">
-          <div>
-            <dt class="text-gray-500">status</dt>
-            <dd class="font-mono text-gray-900"><%= Map.get(@health, :status, "unknown") %></dd>
-          </div>
-          <div :for={{check, ok} <- Map.get(@health, :checks, %{})}>
-            <dt class="text-gray-500"><%= check %></dt>
-            <dd class="font-mono text-gray-900"><%= if ok, do: "ok", else: "down" %></dd>
-          </div>
-        </dl>
-      </section>
-
-      <section class="rounded-lg border border-gray-200">
-        <h2 class="px-4 py-3 font-medium text-gray-900">Session lookup</h2>
-        <form id="session-lookup" phx-submit="lookup_session" class="space-y-4 px-4 pb-4">
-          <div class="flex flex-wrap items-end gap-4">
-            <div>
-              <label for="session-id" class="block text-sm text-gray-700">Session ID</label>
-              <input
-                type="text"
-                id="session-id"
-                name="session_id"
-                value={@session_id}
-                placeholder="session id"
-                class="mt-1 w-64 rounded border border-gray-300 px-2 py-1 font-mono text-sm"
-              />
-            </div>
-            <button type="submit" class="rounded bg-blue-600 px-4 py-2 text-sm text-white">
-              Look up session
-            </button>
-          </div>
-          <p :if={@session_notice} class="text-sm text-gray-500"><%= @session_notice %></p>
-        </form>
-
-        <ul :if={@session_messages != []} class="divide-y divide-gray-100 border-t border-gray-200">
-          <li :for={msg <- @session_messages} class="px-4 py-2 text-sm">
-            <span class="font-mono text-gray-500"><%= msg.seq %> [<%= msg.role %>]</span>
-            <span class="text-gray-900"><%= msg.content %></span>
-          </li>
-        </ul>
-      </section>
-
-      <section class="rounded-lg border border-gray-200">
-        <h2 class="px-4 py-3 font-medium text-gray-900">Documents</h2>
-        <ul :if={@documents.names == []} class="px-4 pb-4 text-sm text-gray-500">
-          <li>No documents</li>
-        </ul>
-        <ul class="divide-y divide-gray-100">
-          <li :for={name <- @documents.names} class="flex items-center justify-between px-4 py-2">
-            <a class="font-mono text-sm text-blue-700 hover:underline" href={"/admin/documents/#{URI.encode_www_form(name)}/edit"}>
-              <%= name %>
-            </a>
-            <button phx-click="delete" phx-value-uri={name} class="text-sm text-red-600 hover:underline">
-              Remove
-            </button>
-          </li>
-        </ul>
-      </section>
+      <AdminComponents.recent_changes changes={@recent_changes} />
+      <AdminComponents.footprint storage={@storage} cache={@cache} />
+      <AdminComponents.indexes coverage={@coverage} />
+      <AdminComponents.models models={@models} />
+      <AdminComponents.queue jobs={@jobs} detail={@queue_detail} />
+      <AdminComponents.runtime runtime={@runtime} errors={@recent_errors} />
+      <AdminComponents.health health={@health} />
+      <AdminComponents.search
+        term={@search_term}
+        scope={@search_scope}
+        results={@search_results}
+        notice={@search_notice}
+      />
+      <AdminComponents.import_skills
+        uploads={@uploads}
+        user_id={@user_id}
+        limits={@limits}
+        results={@results}
+      />
+      <AdminComponents.session_lookup
+        session_id={@session_id}
+        messages={@session_messages}
+        notice={@session_notice}
+      />
+      <AdminComponents.documents documents={@documents} root={@tree_root} />
     </div>
     """
   end
-
-  defp upload_error_to_string(:too_many_files),
-    do: "That is more files than one import accepts."
-
-  defp upload_error_to_string(:too_large),
-    do: "One of those files is larger than one import accepts."
-
-  defp upload_error_to_string(reason), do: inspect(reason)
-
-  defp models_summary(models) do
-    for role <- [:embedding, :llm], Map.has_key?(models, role) do
-      {role, Map.get(models, role, %{})}
-    end
-  end
-
-  # What the store reports for a role, in words. A role mid-download reads as
-  # loading rather than simply unloaded, so an operator can tell a store that
-  # is still starting from one that has no model.
-  defp model_state(entry) when is_map(entry) do
-    state = Map.get(entry, :state, "unknown")
-    loaded = Map.get(entry, :loaded, false)
-
-    cond do
-      state == :loading -> "loading (load in progress)"
-      state == "loading" -> "loading (load in progress)"
-      loaded -> "#{state} · loaded"
-      true -> "#{state} · not loaded"
-    end
-  end
-
-  # The configured model behind a role: embedding reports dimensionality and
-  # the summarizer its configured parameter size. Latency and memory come from
-  # the status itself; a backend that does not report them reads as
-  # "not reported" rather than as a zero.
-  defp model_identity(:embedding, entry) when is_map(entry) do
-    "model #{Map.get(entry, :model, "unknown")} · dim #{Map.get(entry, :dim, "unknown")}"
-  end
-
-  defp model_identity(:llm, entry) when is_map(entry) do
-    "model #{Map.get(entry, :model, "unknown")} · params #{Map.get(entry, :params, "unknown")}"
-  end
-
-  defp model_identity(_role, entry) when is_map(entry) do
-    "model #{Map.get(entry, :model, "unknown")}"
-  end
-
-  defp format_latency(ms) when is_integer(ms) and ms >= 0, do: "#{ms} ms"
-  defp format_latency(_), do: "not reported yet"
-
-  defp format_memory(bytes) when is_integer(bytes) and bytes >= 0 do
-    cond do
-      bytes >= 1_073_741_824 -> "#{Float.round(bytes / 1_073_741_824, 1)} GB"
-      bytes >= 1_048_576 -> "#{Float.round(bytes / 1_048_576, 1)} MB"
-      bytes >= 1_024 -> "#{Float.round(bytes / 1_024, 1)} KB"
-      true -> "#{bytes} B"
-    end
-  end
-
-  defp format_memory(_), do: "not reported"
 end

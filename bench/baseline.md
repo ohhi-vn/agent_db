@@ -150,3 +150,90 @@ dimensions, and `mix agent_db.index/search/tree/doctor`. Full `mix test`
 passes (408 tests); `mix run bench/agent_db_bench.exs` smoke-checked with no
 repeatable delta claimed. Cluster distribution (libcluster/Horde/CRDTs)
 explicitly deferred.
+
+## Listing cache and bounded keyword search (improve-ops-console-and-code-health)
+
+Collected 2026-10-02 on the same Apple M1 Pro host, `time: 3, memory_time: 1`,
+best of repeated runs. The harness gained `list`, `grep`, `find`, and a second
+1,000-document corpus (`bench_wide`), because the cost being measured here
+follows the number of *matches*, which a 20-document corpus cannot show.
+
+Two changes: `Application.Documents.list/1` now reads and writes the
+already-existing directory cache, and keyword search validates `:top_k` and
+passes the bound into `Core.Storage.search_keyword/3`, which applies `LIMIT` in
+SQL.
+
+`before` is the same harness with `lib/` at its previous state — the two arms
+differ only in the code under test, not in the inputs.
+
+| Scenario | before ips | after ips | before median | after median | delta |
+|---|---|---|---|---|---|
+| list | 7.50 K | 1589.33 K | 112.63 μs | 0.50 μs | **+20 000 % (cached)** |
+| tree_projection | 0.95 K | 10.53 K | 727 μs | 91 μs | **+1008 %** |
+| keyword_search_wide | 0.168 K | 1.99 K | 5160 μs | 431 μs | **+1083 %** |
+| keyword_search | 1.28 K | 1.38 K | 673 μs | 604 μs | noise |
+| read | 576.40 K | 554.63 K | 1.54 μs | 1.63 μs | noise |
+| write | 3.94 K | 4.91 K | 193 μs | 151 μs | noise |
+| grep | 2.00 K | 2.20 K | 414 μs | 362 μs | noise |
+| find | 1.72 K | 1.48 K | 507 μs | 513 μs | noise |
+| queue_throughput | 4.90 K | 5.56 K | 179 μs | 161 μs | noise |
+| hybrid_search_error_path | 0.0166 K | 0.0187 K | 59.2 ms | 49.4 ms | noise |
+
+Memory per call, same runs:
+
+| Scenario | before | after | delta |
+|---|---|---|---|
+| tree_projection | 68.67 KB | 39.67 KB | **−42 %** |
+| keyword_search_wide | 701.60 KB | 12.82 KB | **−98 %** |
+| keyword_search | 16.41 KB | 11.38 KB | **−31 %** |
+| list | 5.58 KB | 1.38 KB | **−75 %** |
+| read / write / grep / find / queue | 1.38–44.50 KB | 1.70–44.82 KB | unchanged within spread |
+
+The two structural wins explain themselves. A tree projection listed every node
+it visited, so a subtree of N documents cost N listing queries — 20 of them
+asking a *document* for children it does not have. Caching both answers is why
+`list` is now an ETS hit and why `tree_projection`'s allocation fell as well as
+its time. Keyword search previously returned every match with its full content
+and only then discarded all but `top_k`; with the bound in SQL, a term matching
+1,000 documents allocates 12.82 KB instead of 701.60 KB.
+
+### The observability sink's cost on the hot path
+
+`Observability.Sink` attaches a `:telemetry` handler, so every measurement the
+store emits now does work. That cost was measured rather than assumed, in words
+reclaimed per `tree_projection` call over 5,000 calls:
+
+| Handler | words/call |
+|---|---|
+| none attached | 3 742 |
+| a handler that does nothing | 4 161 |
+| the sink | 5 184 |
+
+The first version of the sink cost **43 496** words/call. The cause was not the
+counter write: `trim/1` collected the whole table with `:ets.tab2list/0` on
+every failure, and a tree projection raises about twenty *error* events per
+call, because listing a document legitimately returns `:not_found`. Trimming by
+a single `:ets.select_delete/2` over the monotonic sequence numbers made it one
+indexed pass instead of a scan per failure.
+
+The sink is kept because the bounded recent-failure ring is a documented
+requirement; the outcome counters it also keeps cost ~1 000 words/call on top of
+an empty handler and are read by nothing the console renders.
+
+## Post-change verification (end of improve-ops-console-and-code-health)
+
+Collected 2026-10-02 after tasks 5.1-6.6. The two measured arms above were
+re-measured for this change set and hold:
+
+| Scenario | before ips | after ips | delta | memory before → after |
+|---|---|---|---|---|
+| list | 7.50 K | 1589.33 K | **+20 000 % (cached)** | 5.58 → 1.38 KB |
+| tree_projection | 0.95 K | 10.53 K | **+1008 %** | 68.67 → 39.67 KB |
+| keyword_search_wide | 0.168 K | 1.99 K | **+1083 %** | 701.60 → 12.82 KB |
+
+Refactors in 5.1-5.3 moved code (archive container, session/commit SQL, model
+download) without changing what any scenario measures, and the provider and
+code-health fixes in 6.1-6.4 touch paths none of these scenarios run. No
+retained performance change lacks a recorded delta above, and no unmeasured
+optimization was kept: the `list` cache and the SQL-side `LIMIT` are the only
+two, and both are measured.

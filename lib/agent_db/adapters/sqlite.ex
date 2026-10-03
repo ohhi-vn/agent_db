@@ -19,7 +19,7 @@ defmodule AgentDb.Adapters.SQLite do
   @behaviour AgentDb.Core.Storage
 
   alias AgentDb.JobQueue
-  alias AgentDb.Store.{Memories, Nodes, Reader, SQLite, Writer}
+  alias AgentDb.Store.{Commits, Memories, Nodes, Reader, Sessions, SQLite, Writer}
 
   @impl true
   def child_specs(opts) do
@@ -153,7 +153,7 @@ defmodule AgentDb.Adapters.SQLite do
     with :ok <- ensure_parents(conn, segments),
          :ok <-
            Nodes.upsert_doc(conn, uri, parent_uri(segments), List.last(segments), content, []),
-         {:ok, _job} <- enqueue_skill_work(conn, uri, content) do
+         :ok <- enqueue_skill_work(conn, uri, content) do
       :ok
     end
   end
@@ -161,7 +161,10 @@ defmodule AgentDb.Adapters.SQLite do
   # The same work a write enqueues, so an imported file is searchable and
   # summarized on the same terms as any other document.
   defp enqueue_skill_work(conn, uri, content) do
-    JobQueue.enqueue_many(conn, Enum.map(JobQueue.all_kinds(), &{&1, %{uri: uri, content: content}}))
+    JobQueue.enqueue_many(
+      conn,
+      Enum.map(JobQueue.all_kinds(), &{&1, %{uri: uri, content: content}})
+    )
   end
 
   # -- results of background inference --
@@ -264,8 +267,8 @@ defmodule AgentDb.Adapters.SQLite do
   # -- search --
 
   @impl true
-  def search_keyword(term, scope_prefix) do
-    Reader.read(fn conn -> Nodes.search(conn, term, scope_prefix) end)
+  def search_keyword(term, scope_prefix, limit) do
+    Reader.read(fn conn -> Nodes.search(conn, term, scope_prefix, limit) end)
   end
 
   @impl true
@@ -338,161 +341,34 @@ defmodule AgentDb.Adapters.SQLite do
 
   @impl true
   def create_session do
-    session_id = :crypto.strong_rand_bytes(16) |> Base.encode16(case: :lower)
-    now = System.system_time(:millisecond)
-
-    case Writer.call(fn conn ->
-           SQLite.exec_write(conn, "INSERT INTO sessions (id, created_at) VALUES (?1, ?2)", [
-             session_id,
-             now
-           ])
-         end) do
-      :ok -> {:ok, session_id}
-      {:error, _} = err -> err
-    end
+    Writer.call(fn conn -> Sessions.create(conn) end)
   end
 
   @impl true
   def append_message(session_id, role, content) do
-    Writer.call(fn conn ->
-      with {:ok, seq} <- next_seq(conn, session_id) do
-        SQLite.exec_write(
-          conn,
-          "INSERT INTO session_messages (session_id, seq, role, content) VALUES (?1, ?2, ?3, ?4)",
-          [session_id, seq, to_string(role), content]
-        )
-      end
-    end)
-  end
-
-  defp next_seq(conn, session_id) do
-    case SQLite.query_one(conn, "SELECT MAX(seq) FROM session_messages WHERE session_id = ?1", [
-           session_id
-         ]) do
-      {:ok, [nil]} -> {:ok, 0}
-      {:ok, [n]} -> {:ok, n + 1}
-      {:ok, []} -> {:ok, 0}
-      {:error, _} = err -> err
-    end
+    Writer.call(fn conn -> Sessions.append(conn, session_id, role, content) end)
   end
 
   @impl true
   def get_session(session_id) do
-    Reader.read(fn conn ->
-      case SQLite.query(
-             conn,
-             "SELECT seq, role, content FROM session_messages WHERE session_id = ?1 ORDER BY seq",
-             [session_id]
-           ) do
-        {:ok, rows} ->
-          {:ok,
-           Enum.map(rows, fn [seq, role, content] ->
-             %{seq: seq, role: role(role), content: content}
-           end)}
-
-        {:error, _} = err ->
-          err
-      end
-    end)
+    Reader.read(fn conn -> Sessions.read(conn, session_id) end)
   end
-
-  # A role is only ever one this store wrote, so an unknown value is a corrupt
-  # row rather than a caller-supplied atom to be created on the spot.
-  defp role("user"), do: :user
-  defp role("assistant"), do: :assistant
-  defp role("system"), do: :system
-  defp role(other), do: other
 
   @impl true
   def list_session_ids do
-    Reader.read(fn conn ->
-      case SQLite.query(conn, "SELECT id FROM sessions ORDER BY id", []) do
-        {:ok, rows} -> {:ok, Enum.map(rows, &hd/1)}
-        {:error, _} = err -> err
-      end
-    end)
+    Reader.read(fn conn -> Sessions.list_ids(conn) end)
   end
 
   @impl true
   def restore_session(session_id, messages) when is_binary(session_id) and is_list(messages) do
     Writer.call(fn conn ->
-      SQLite.transaction(conn, fn conn -> do_restore_session(conn, session_id, messages) end)
+      SQLite.transaction(conn, fn conn -> Sessions.restore(conn, session_id, messages) end)
     end)
-  end
-
-  defp do_restore_session(conn, session_id, messages) do
-    with {:ok, existing} <- read_session_messages(conn, session_id) do
-      cond do
-        same_messages?(existing, messages) -> {:ok, :skipped}
-        existing != [] -> {:error, {:session_conflict, session_id}}
-        true -> insert_restored_session(conn, session_id, messages)
-      end
-    end
-  end
-
-  defp read_session_messages(conn, session_id) do
-    case SQLite.query(
-           conn,
-           "SELECT seq, role, content FROM session_messages WHERE session_id = ?1 ORDER BY seq",
-           [session_id]
-         ) do
-      {:ok, rows} ->
-        {:ok, Enum.map(rows, fn [seq, role, content] -> %{seq: seq, role: role(role), content: content} end)}
-
-      {:error, _} = err ->
-        err
-    end
-  end
-
-  defp same_messages?(existing, incoming) do
-    Enum.map(existing, &{&1.role, &1.content}) ==
-      Enum.map(incoming, &{normalize_role(&1.role), &1.content})
-  end
-
-  defp normalize_role(role) when is_atom(role), do: role
-  defp normalize_role("user"), do: :user
-  defp normalize_role("assistant"), do: :assistant
-  defp normalize_role("system"), do: :system
-  defp normalize_role(other), do: other
-
-  defp insert_restored_session(conn, session_id, messages) do
-    now = System.system_time(:millisecond)
-
-    with :ok <-
-           SQLite.exec_write(conn, "INSERT OR IGNORE INTO sessions (id, created_at) VALUES (?1, ?2)", [
-             session_id,
-             now
-           ]) do
-      Enum.reduce_while(Enum.with_index(messages), :ok, fn {message, seq}, :ok ->
-        case SQLite.exec_write(
-               conn,
-               "INSERT INTO session_messages (session_id, seq, role, content) VALUES (?1, ?2, ?3, ?4)",
-               [session_id, seq, to_string(normalize_role(message.role)), message.content]
-             ) do
-          :ok -> {:cont, :ok}
-          {:error, _} = err -> {:halt, err}
-        end
-      end)
-      |> case do
-        :ok -> {:ok, :imported}
-        {:error, _} = err -> err
-      end
-    end
   end
 
   @impl true
   def commit_hash(session_id, destination_uri) do
-    Reader.read(fn conn ->
-      case SQLite.query_one(
-             conn,
-             "SELECT content_hash FROM commit_meta WHERE session_id = ?1 AND destination_uri = ?2",
-             [session_id, destination_uri]
-           ) do
-        {:ok, [hash]} -> {:ok, hash}
-        {:ok, nil} -> {:ok, nil}
-        {:error, _} = err -> err
-      end
-    end)
+    Reader.read(fn conn -> Commits.hash(conn, session_id, destination_uri) end)
   end
 
   @impl true
@@ -511,18 +387,7 @@ defmodule AgentDb.Adapters.SQLite do
                  content,
                  []
                ),
-             :ok <-
-               SQLite.exec_write(
-                 conn,
-                 """
-                 INSERT INTO commit_meta (session_id, destination_uri, content_hash, committed_at)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(session_id, destination_uri) DO UPDATE SET
-                   content_hash = excluded.content_hash,
-                   committed_at = excluded.committed_at
-                 """,
-                 [session_id, destination_uri, hash, System.system_time(:millisecond)]
-               ) do
+             :ok <- Commits.record(conn, session_id, destination_uri, hash) do
           :ok
         end
       end)
@@ -575,7 +440,7 @@ defmodule AgentDb.Adapters.SQLite do
   def complete_job(job_id), do: JobQueue.complete(job_id)
 
   @impl true
-  def fail_job(job_id), do: JobQueue.fail(job_id)
+  def fail_job(job_id, reason \\ nil), do: JobQueue.fail(job_id, reason)
 
   @impl true
   def defer_job(job_id, delay_ms), do: JobQueue.defer(job_id, delay_ms)
@@ -585,6 +450,66 @@ defmodule AgentDb.Adapters.SQLite do
 
   @impl true
   def queue_stats, do: JobQueue.stats()
+
+  @impl true
+  def queue_detail(limit), do: JobQueue.detail(limit)
+
+  # -- composition and footprint --
+
+  # Counts and file sizes for an operator looking at a store, not part of any
+  # write path: read-only, grouped into a fixed number of queries, and honest
+  # about the difference between "not reported" and zero.
+  @impl true
+  def stats do
+    Reader.read(fn conn ->
+      with {:ok, counts} <- Nodes.counts(conn),
+           {:ok, by_subtree} <- Nodes.count_by_top_subtree(conn) do
+        {:ok,
+         Map.merge(counts, %{
+           by_top_subtree: by_subtree,
+           db_bytes: file_size(AgentDb.Config.db_path()),
+           wal_bytes: file_size(AgentDb.Config.db_path() <> "-wal")
+         })}
+      end
+    end)
+  end
+
+  # A WAL that has been checkpointed away has no file, which is not a size of
+  # zero -- so a missing file reports nothing rather than an empty log.
+  defp file_size(path) do
+    case File.stat(path) do
+      {:ok, %File.Stat{size: size}} -> size
+      {:error, _} -> nil
+    end
+  end
+
+  @impl true
+  def vector_index_stats do
+    # `Nodes.counts/1` answers `{:ok, counts}` or nothing, so there is no error
+    # to pass through here.
+    Reader.read(fn conn ->
+      {:ok, counts} = Nodes.counts(conn)
+      vector_counts(conn, counts.documents)
+    end)
+  end
+
+  # "The index is unavailable" and "the index holds nothing" are different
+  # facts, and only the first of them means vector search cannot be served.
+  defp vector_counts(conn, documents) do
+    if SQLite.vec_available?(conn) do
+      case SQLite.query_one(conn, "SELECT COUNT(*) FROM vec_nodes", []) do
+        {:ok, [vectors]} -> {:ok, %{available: true, vectors: vectors, documents: documents}}
+        {:error, _} = err -> err
+      end
+    else
+      {:ok, %{available: false, vectors: nil, documents: documents}}
+    end
+  end
+
+  @impl true
+  def document_count(prefix) do
+    Reader.read(fn conn -> Nodes.count_documents(conn, prefix) end)
+  end
 
   @impl true
   def healthy? do

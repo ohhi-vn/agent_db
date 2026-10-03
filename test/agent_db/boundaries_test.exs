@@ -11,12 +11,15 @@ defmodule AgentDb.BoundariesTest do
   use ExUnit.Case, async: false
 
   @core [
+    AgentDb.Application.DataTransfer,
     AgentDb.Application.Documents,
     AgentDb.Application.Memories,
+    AgentDb.Application.Navigation,
     AgentDb.Application.Search,
     AgentDb.Application.Sessions,
     AgentDb.Application.Skills,
-    AgentDb.Application.Status
+    AgentDb.Application.Status,
+    AgentDb.Application.DataTransfer.Manifest
   ]
 
   describe "core workflows" do
@@ -27,13 +30,32 @@ defmodule AgentDb.BoundariesTest do
       # instrumentation it emits (no process, no backend, fails safe), and the
       # reader that turns one kind of input into another before the workflow
       # sees it. What it may not name is a provider.
+      #
+      # Three more names are allowed because they are the same layer, not a
+      # layer below: `DataTransfer` orchestrates the sibling workflows whose
+      # public functions it calls (never their storage), `Navigation` is the
+      # shared input validation the navigation operations call instead of each
+      # carrying a copy, and `DataTransfer.Manifest` is the transfer's own
+      # format -- the members it writes and the validation they must pass, which
+      # is the same question asked in two directions and belongs beside the
+      # transfer rather than inside it. `Archive` is the pure container codec
+      # both the importer and the transfer call.
       allowed = [
         AgentDb.Runtime,
         AgentDb.Cache,
         AgentDb.URI,
         AgentDb.Config,
         AgentDb.Observability,
-        AgentDb.Skills.Source
+        AgentDb.Skills.Source,
+        AgentDb.Application.Documents,
+        AgentDb.Application.Memories,
+        AgentDb.Application.Navigation,
+        AgentDb.Application.Search,
+        AgentDb.Application.Sessions,
+        AgentDb.Application.Skills,
+        AgentDb.Application.Status,
+        AgentDb.Application.DataTransfer.Manifest,
+        AgentDb.Archive
       ]
 
       for module <- @core do

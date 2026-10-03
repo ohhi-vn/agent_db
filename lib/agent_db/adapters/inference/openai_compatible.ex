@@ -11,6 +11,10 @@ defmodule AgentDb.Adapters.Inference.OpenAICompatible do
 
   @receive_timeout 10_000
 
+  # Status is asked for on a console timer, so it gets a deadline of its own
+  # rather than reusing the one an inference call waits on.
+  @health_timeout 1_500
+
   @impl true
   def child_specs(_opts), do: []
 
@@ -20,7 +24,11 @@ defmodule AgentDb.Adapters.Inference.OpenAICompatible do
       url = String.trim_trailing(base, "/") <> "/embeddings"
       headers = auth_headers()
 
-      case Req.post(url, json: %{input: texts}, headers: headers, receive_timeout: @receive_timeout) do
+      case Req.post(url,
+             json: %{input: texts},
+             headers: headers,
+             receive_timeout: @receive_timeout
+           ) do
         {:ok, %Req.Response{status: 200, body: %{"data" => items}}} ->
           {:ok, Enum.map(items, fn %{"embedding" => vec} -> encode(vec) end)}
 
@@ -56,7 +64,11 @@ defmodule AgentDb.Adapters.Inference.OpenAICompatible do
       body = %{messages: [%{role: "user", content: prompt}]}
 
       case Req.post(url, json: body, headers: headers, receive_timeout: @receive_timeout) do
-        {:ok, %Req.Response{status: 200, body: %{"choices" => [%{"message" => %{"content" => text}} | _]}}} ->
+        {:ok,
+         %Req.Response{
+           status: 200,
+           body: %{"choices" => [%{"message" => %{"content" => text}} | _]}
+         }} ->
           if String.trim(text || "") == "", do: {:error, :empty_summary}, else: {:ok, text}
 
         {:ok, %Req.Response{status: 401}} ->
@@ -84,13 +96,61 @@ defmodule AgentDb.Adapters.Inference.OpenAICompatible do
 
   @impl true
   def model_status do
+    health = health()
+
     %{
-      embedding: %{loaded: false, state: :idle, model: "openai-compatible", dim: 1536, provider: :openai_compatible},
-      llm: %{loaded: false, state: :idle, model: "openai-compatible", params: "remote", provider: :openai_compatible},
-      queue: %{pending: 0},
-      provider: :openai_compatible
+      embedding: %{
+        loaded: false,
+        state: served_state(health),
+        model: "openai-compatible",
+        dim: 1536,
+        provider: :openai_compatible
+      },
+      llm: %{
+        loaded: false,
+        state: served_state(health),
+        model: "openai-compatible",
+        params: "remote",
+        provider: :openai_compatible
+      },
+      provider: :openai_compatible,
+      health: health
     }
   end
+
+  # A remote provider holds no local model, so whether it is usable is a fact
+  # about reaching it rather than about what this process loaded. Reporting
+  # `:idle` for an unreachable endpoint reads as "nothing configured".
+  #
+  # Probed with its own, much shorter deadline than an inference call, because
+  # status is asked for on a console timer and must not hold it. The probe
+  # carries the same credentials an inference request would; a credential is
+  # only ever sent as a header and never appears in the reported health.
+  defp health do
+    case base_url() do
+      {:ok, base} ->
+        url = String.trim_trailing(base, "/") <> "/models"
+
+        case Req.get(url, headers: auth_headers(), receive_timeout: @health_timeout) do
+          {:ok, %Req.Response{status: status}} when status in 200..299 -> :ok
+          # Reachable but refusing us is a different problem from unreachable,
+          # and one an operator fixes with a key rather than with a restart.
+          {:ok, %Req.Response{status: 401}} -> :unauthorized
+          {:ok, %Req.Response{}} -> :unreachable
+          _other -> :unreachable
+        end
+
+      {:error, _} ->
+        :unreachable
+    end
+  rescue
+    _ -> :unreachable
+  catch
+    _, _ -> :unreachable
+  end
+
+  defp served_state(:ok), do: :ready
+  defp served_state(_), do: :unreachable
 
   defp base_url do
     case AgentDb.Config.openai_compatible_base_url() do

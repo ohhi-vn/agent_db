@@ -12,7 +12,7 @@ defmodule AgentDb.HexDocsTest do
   end
 
   test "discovers locked packages offline" do
-    dir = Path.join(System.tmp_dir!(), "hex_lock_#{System.unique_integer([:positive])}")
+    dir = AgentDb.Test.Scratch.dir("hex_lock")
     File.mkdir_p!(dir)
     lock = Path.join(dir, "mix.lock")
 
@@ -35,12 +35,18 @@ defmodule AgentDb.HexDocsTest do
 
   test "locked version outranks other versions offline" do
     for ver <- ["1.7.0", "1.8.0", "1.9.0"] do
-      :ok = AgentDb.write("viking://resources/hex/phoenix/#{ver}/README.md", "Phoenix authentication #{ver}")
+      :ok =
+        AgentDb.write(
+          "viking://resources/hex/phoenix/#{ver}/README.md",
+          "Phoenix authentication #{ver}"
+        )
     end
 
     locked = %{"phoenix" => "1.8.0"}
 
-    {:ok, results} = AgentDb.search("Phoenix authentication", mode: :keyword, scope: "viking://resources/hex")
+    {:ok, results} =
+      AgentDb.search("Phoenix authentication", mode: :keyword, scope: "viking://resources/hex")
+
     ranked = AgentDb.HexDocs.rank(results, locked)
 
     assert hd(ranked).uri =~ "phoenix/1.8.0"
@@ -51,8 +57,11 @@ defmodule AgentDb.HexDocsTest do
     :ok = AgentDb.write("viking://resources/hex/phoenix/1.8.0/README.md", "phoenix old docs")
     :ok = AgentDb.write("viking://resources/hex/phoenix/1.8.1/README.md", "phoenix new docs")
 
-    assert {:ok, "phoenix old docs"} = AgentDb.read("viking://resources/hex/phoenix/1.8.0/README.md")
-    assert {:ok, "phoenix new docs"} = AgentDb.read("viking://resources/hex/phoenix/1.8.1/README.md")
+    assert {:ok, "phoenix old docs"} =
+             AgentDb.read("viking://resources/hex/phoenix/1.8.0/README.md")
+
+    assert {:ok, "phoenix new docs"} =
+             AgentDb.read("viking://resources/hex/phoenix/1.8.1/README.md")
 
     {:ok, results} = AgentDb.search("phoenix", mode: :keyword, scope: "viking://resources/hex")
     ranked = AgentDb.HexDocs.rank(results, %{"phoenix" => "1.8.1"})

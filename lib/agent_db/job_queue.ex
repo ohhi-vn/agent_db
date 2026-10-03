@@ -11,6 +11,11 @@ defmodule AgentDb.JobQueue do
 
   alias AgentDb.Store.{Nodes, Reader, SQLite, Writer}
 
+  # The connection every mutation runs on. `AgentDb.Store.SQLite` defines the
+  # same type but is an internal module, so a type named here stays resolvable
+  # in the generated reference instead of pointing at a hidden module.
+  @type conn :: Exqlite.Sqlite3.db()
+
   @type kind :: :embed | :summarize_abstract | :summarize_overview
   @type payload :: map()
   @type status :: :pending | :running | :done | :failed
@@ -45,7 +50,7 @@ defmodule AgentDb.JobQueue do
   replacement calls this from inside its own transaction on the writer
   connection, where a second claim on the writer would deadlock.
   """
-  @spec enqueue(SQLite.conn(), kind(), payload()) :: {:ok, integer()} | {:error, term()}
+  @spec enqueue(conn(), kind(), payload()) :: {:ok, integer()} | {:error, term()}
   def enqueue(conn, kind, payload) do
     now = System.system_time(:millisecond)
 
@@ -69,7 +74,7 @@ defmodule AgentDb.JobQueue do
   transaction, so one statement replaces one per kind. Row ids are not
   returned; callers that need them keep using `enqueue/3`.
   """
-  @spec enqueue_many(SQLite.conn(), [{kind(), payload()}]) :: :ok | {:error, term()}
+  @spec enqueue_many(conn(), [{kind(), payload()}]) :: :ok | {:error, term()}
   def enqueue_many(_conn, []), do: :ok
 
   def enqueue_many(conn, jobs) do
@@ -188,7 +193,7 @@ defmodule AgentDb.JobQueue do
   @spec complete(integer()) :: :ok | {:error, term()}
   def complete(job_id), do: Writer.call(fn conn -> complete(conn, job_id) end)
 
-  @spec complete(SQLite.conn(), integer()) :: :ok | {:error, term()}
+  @spec complete(conn(), integer()) :: :ok | {:error, term()}
   def complete(conn, job_id) do
     SQLite.exec_write(
       conn,
@@ -203,12 +208,17 @@ defmodule AgentDb.JobQueue do
   @doc """
   Records a failure, scheduling a retry while attempts remain and marking the
   job failed once they are exhausted.
-  """
-  @spec fail(integer()) :: :ok | {:error, term()}
-  def fail(job_id), do: Writer.call(fn conn -> fail(conn, job_id) end)
 
-  @spec fail(SQLite.conn(), integer()) :: :ok | {:error, term()}
-  def fail(conn, job_id) do
+  `reason` is the classified failure the worker saw. It is stored so a failed
+  job can be explained later without waiting for the log line that recorded it
+  to still exist, and it is a classification -- never content, a prompt, or a
+  credential.
+  """
+  @spec fail(integer(), String.t() | nil) :: :ok | {:error, term()}
+  def fail(job_id, reason \\ nil), do: Writer.call(fn conn -> fail(conn, job_id, reason) end)
+
+  @spec fail(conn(), integer(), String.t() | nil) :: :ok | {:error, term()}
+  def fail(conn, job_id, reason) do
     now = System.system_time(:millisecond)
 
     case SQLite.query_one(conn, "SELECT attempts, max_attempts FROM job_queue WHERE id = ?1", [
@@ -221,17 +231,14 @@ defmodule AgentDb.JobQueue do
 
           SQLite.exec_write(
             conn,
-            "UPDATE job_queue SET status = 'pending', scheduled_at = ?1, updated_at = ?2 WHERE id = ?3",
-            [now + delay, now, job_id]
+            "UPDATE job_queue SET status = 'pending', scheduled_at = ?1, last_error = ?2, updated_at = ?3 WHERE id = ?4",
+            [now + delay, reason, now, job_id]
           )
         else
           SQLite.exec_write(
             conn,
-            "UPDATE job_queue SET status = 'failed', updated_at = ?1 WHERE id = ?2",
-            [
-              now,
-              job_id
-            ]
+            "UPDATE job_queue SET status = 'failed', last_error = ?1, updated_at = ?2 WHERE id = ?3",
+            [reason, now, job_id]
           )
         end
 
@@ -253,7 +260,7 @@ defmodule AgentDb.JobQueue do
   @spec defer(integer(), non_neg_integer()) :: :ok | {:error, term()}
   def defer(job_id, delay_ms), do: Writer.call(fn conn -> requeue(conn, job_id, delay_ms) end)
 
-  @spec requeue(SQLite.conn(), integer(), non_neg_integer()) :: :ok | {:error, term()}
+  @spec requeue(conn(), integer(), non_neg_integer()) :: :ok | {:error, term()}
   def requeue(conn, job_id, delay_ms) do
     now = System.system_time(:millisecond)
 
@@ -275,7 +282,7 @@ defmodule AgentDb.JobQueue do
   @spec reset_running_jobs() :: :ok | {:error, term()}
   def reset_running_jobs, do: Writer.call(fn conn -> reset_running_jobs(conn) end)
 
-  @spec reset_running_jobs(SQLite.conn()) :: :ok | {:error, term()}
+  @spec reset_running_jobs(conn()) :: :ok | {:error, term()}
   def reset_running_jobs(conn) do
     now = System.system_time(:millisecond)
 
@@ -297,7 +304,7 @@ defmodule AgentDb.JobQueue do
   match would also delete jobs for unrelated URIs whose *content* happens to
   mention this one, silently dropping work outside the removed subtree.
   """
-  @spec cancel_for_uri(SQLite.conn(), String.t()) :: :ok | {:error, term()}
+  @spec cancel_for_uri(conn(), String.t()) :: :ok | {:error, term()}
   def cancel_for_uri(conn, uri) do
     SQLite.exec_write(
       conn,
@@ -341,6 +348,71 @@ defmodule AgentDb.JobQueue do
           err
       end
     end)
+  end
+
+  @doc """
+  How far behind the queue is and what is failing in it.
+
+  `oldest_pending_ms` is the age of the longest-waiting pending job -- the one
+  number that says whether the workers are keeping up -- and `nil` when nothing
+  is pending. `failed` is the newest failures first, bounded by `limit`, each
+  carrying the classified reason that was persisted when the job gave up.
+
+  The URI comes out of the payload rather than a separate column, so it is read
+  where it already is written.
+  """
+  @spec detail(pos_integer()) :: {:ok, map()} | {:error, term()}
+  def detail(limit \\ 20) do
+    Reader.read(fn conn ->
+      with {:ok, [oldest]} <-
+             SQLite.query_one(
+               conn,
+               "SELECT MIN(created_at) FROM job_queue WHERE status = 'pending'",
+               []
+             ),
+           {:ok, rows} <- failed_rows(conn, limit) do
+        {:ok, %{oldest_pending_ms: age_of(oldest), failed: rows}}
+      else
+        {:error, _} = err -> err
+      end
+    end)
+  end
+
+  defp failed_rows(conn, limit) do
+    sql = """
+    SELECT id, kind, json_extract(payload, '$.uri'), attempts, max_attempts, last_error, updated_at
+    FROM job_queue
+    WHERE status = 'failed'
+    ORDER BY updated_at DESC
+    LIMIT ?
+    """
+
+    case SQLite.query(conn, sql, [limit]) do
+      {:ok, rows} ->
+        {:ok,
+         Enum.map(rows, fn [id, kind, uri, attempts, max_attempts, reason, at] ->
+           %{
+             id: id,
+             kind: kind,
+             uri: uri,
+             attempts: attempts,
+             max_attempts: max_attempts,
+             last_error: reason,
+             failed_at: at
+           }
+         end)}
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  # NULL when nothing is pending: "no work" and "work waiting since the epoch"
+  # must not read the same.
+  defp age_of(nil), do: nil
+
+  defp age_of(oldest) do
+    max(0, System.system_time(:millisecond) - oldest)
   end
 
   defp status_of("pending"), do: :pending

@@ -69,9 +69,6 @@ defmodule AgentDb.ML.ModelManager.Backend.Emlx do
   @impl true
   def summarize(model_ref, prompt, opts), do: Exla.summarize(model_ref, prompt, opts)
 
-  @impl true
-  def model_info, do: %{backend: :emlx}
-
   defp emlx_backend_spec, do: :emlx
 
   # The rewrite applies to the Axon model inside the model_info, which is what

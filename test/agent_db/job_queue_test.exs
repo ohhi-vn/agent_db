@@ -113,25 +113,25 @@ defmodule AgentDb.JobQueueTest do
   end
 
   describe "a completed embedding with nowhere to store it" do
-  # The embedding is computed but the vec table exists only with the sqlite-vec
-  # extension. The work is finished; retrying cannot change that, so the job
-  # completes rather than consuming its attempts as failed. Driven through the
-  # storage port because this file runs with the workers stopped.
-  @tag :vec_absent
-  test "completes rather than failing when the vec table is absent" do
-    uri = unique_uri("no-vec")
-    assert :ok = AgentDb.write(uri, "content")
-    assert {:ok, job} = storage().dequeue_job([:embed])
+    # The embedding is computed but the vec table exists only with the sqlite-vec
+    # extension. The work is finished; retrying cannot change that, so the job
+    # completes rather than consuming its attempts as failed. Driven through the
+    # storage port because this file runs with the workers stopped.
+    @tag :vec_absent
+    test "completes rather than failing when the vec table is absent" do
+      uri = unique_uri("no-vec")
+      assert :ok = AgentDb.write(uri, "content")
+      assert {:ok, job} = storage().dequeue_job([:embed])
 
-    assert {:ok, _outcome} = storage().put_embedding_result(job.id, uri, <<1::384>>)
+      assert {:ok, _outcome} = storage().put_embedding_result(job.id, uri, <<1::384>>)
 
-    assert 1 = storage().count_jobs(uri, ["done"])
-    assert 0 = storage().count_jobs(uri, ["failed"])
-    # The write also enqueued two summary jobs, which this file does not run
-    # (the workers are stopped), so they are still outstanding.
-    assert 2 = storage().count_jobs(uri, ["pending", "running"])
+      assert 1 = storage().count_jobs(uri, ["done"])
+      assert 0 = storage().count_jobs(uri, ["failed"])
+      # The write also enqueued two summary jobs, which this file does not run
+      # (the workers are stopped), so they are still outstanding.
+      assert 2 = storage().count_jobs(uri, ["pending", "running"])
+    end
   end
-end
 
   describe "deferring" do
     test "a deferral gives back the attempt the claim consumed" do

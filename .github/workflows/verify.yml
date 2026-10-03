@@ -1,0 +1,124 @@
+# Verifies every change before it reaches the default branch.
+#
+# One workflow, so a failure names which gate failed rather than presenting an
+# undifferentiated red build. The same commands a developer runs locally are the
+# ones run here (`mix lint`, `mix test`), because the point of a gate is that it
+# is the check you already ran.
+name: verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  # A new push supersedes an in-flight run for the same ref.
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: format, compile, test (OTP ${{ matrix.otp }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The oldest OTP the library claims to support, and the one the
+          # maintainers develop against. A matrix leg is one line: add or remove
+          # an entry here.
+          - otp: "27"
+            elixir: "1.20.4-otp-27"
+            lint: false
+          - otp: "29"
+            elixir: "1.20.4-otp-29"
+            lint: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ matrix.elixir }}
+          otp-version: ${{ matrix.otp }}
+
+      - name: Cache dependencies, build, and the Dialyzer PLT
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.hex
+            ~/.cache/rebar3
+            _build
+          key: ${{ runner.os }}-otp${{ matrix.otp }}-mix-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-otp${{ matrix.otp }}-mix-
+
+      - name: Fetch dependencies
+        run: mix deps.get
+
+      # Dependencies compile first and separately, so the compile step below
+      # reports only this project's own warnings. A cold build of the
+      # EXLA/Nx/Phoenix tree emits thousands of warnings from the toolchain's
+      # reading of dependency metadata -- none from this repository's source.
+      - name: Compile dependencies
+        run: mix deps.compile
+
+      - name: Formatting
+        run: mix format --check-formatted
+
+      - name: Compilation
+        run: mix compile --force --warnings-as-errors
+
+      # No inference provider key and no model directory are set: the suite
+      # answers through `test/support/*_fakes.ex`, so nothing is downloaded and
+      # nothing reaches the network.
+      - name: Tests
+        run: mix test
+
+      # The slow analysis runs on one leg only: its findings do not depend on
+      # the OTP version, and its PLT dominates the runtime.
+      - name: Static analysis
+        if: matrix.lint
+        run: mix lint
+
+  package:
+    name: package contents and generated docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.20.4-otp-29"
+          otp-version: "29"
+
+      - name: Cache dependencies and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.hex
+            ~/.cache/rebar3
+            _build
+          key: ${{ runner.os }}-pkg-otp29-mix-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-pkg-otp29-mix-
+
+      - run: mix deps.get
+      - run: mix deps.compile
+
+      # Reads the built tarball rather than `mix.exs`: what a consumer receives
+      # is the assertion that matters, and a leaked model cache or build
+      # directory has to fail here.
+      - name: Build the package
+        run: mix hex.build
+
+      - name: Verify what the package contains
+        run: mix run --no-start tools/verify_package.exs
+
+      # `mix docs` exits zero while printing warnings, so the gate is the log.
+      - name: Generate documentation
+        run: |
+          mix docs 2>&1 | tee docs.log
+          if grep -q "warning:" docs.log; then
+            echo "documentation built with warnings; see docs.log"
+            exit 1
+          fi

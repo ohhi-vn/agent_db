@@ -12,6 +12,10 @@ defmodule AgentDb.Adapters.Inference.Ollama do
 
   @receive_timeout 10_000
 
+  # Status is asked for on a console timer, so it gets a deadline of its own
+  # rather than reusing the one an inference call waits on.
+  @health_timeout 1_500
+
   @impl true
   def child_specs(_opts), do: []
 
@@ -31,7 +35,10 @@ defmodule AgentDb.Adapters.Inference.Ollama do
     model = AgentDb.Config.ollama_llm_model()
     url = String.trim_trailing(base, "/") <> "/api/generate"
 
-    case Req.post(url, json: %{model: model, prompt: prompt, stream: false}, receive_timeout: @receive_timeout) do
+    case Req.post(url,
+           json: %{model: model, prompt: prompt, stream: false},
+           receive_timeout: @receive_timeout
+         ) do
       {:ok, %Req.Response{status: 200, body: %{"response" => text}}} when is_binary(text) ->
         if String.trim(text) == "", do: {:error, :empty_summary}, else: {:ok, text}
 
@@ -53,13 +60,52 @@ defmodule AgentDb.Adapters.Inference.Ollama do
 
   @impl true
   def model_status do
+    health = health()
+
     %{
-      embedding: %{loaded: false, state: :idle, model: AgentDb.Config.ollama_embed_model(), dim: 768, provider: :ollama},
-      llm: %{loaded: false, state: :idle, model: AgentDb.Config.ollama_llm_model(), params: "remote", provider: :ollama},
-      queue: %{pending: 0},
-      provider: :ollama
+      embedding: %{
+        loaded: false,
+        state: served_state(health),
+        model: AgentDb.Config.ollama_embed_model(),
+        dim: 768,
+        provider: :ollama
+      },
+      llm: %{
+        loaded: false,
+        state: served_state(health),
+        model: AgentDb.Config.ollama_llm_model(),
+        params: "remote",
+        provider: :ollama
+      },
+      provider: :ollama,
+      health: health
     }
   end
+
+  # A remote provider holds no local model, so whether it is usable is a fact
+  # about reaching it rather than about what this process loaded. Reporting
+  # `:idle` for an unreachable server reads as "nothing configured"; reporting
+  # the failure is what tells an operator their inference is not going to work.
+  #
+  # The probe is deliberately given a much shorter deadline than an inference
+  # request: status is asked for by a console on a timer and must not hold it
+  # for the length of a real request timeout.
+  defp health do
+    url = String.trim_trailing(AgentDb.Config.ollama_base_url(), "/") <> "/api/tags"
+
+    case Req.get(url, receive_timeout: @health_timeout) do
+      {:ok, %Req.Response{status: status}} when status in 200..299 -> :ok
+      {:ok, %Req.Response{}} -> :unreachable
+      _other -> :unreachable
+    end
+  rescue
+    _ -> :unreachable
+  catch
+    _, _ -> :unreachable
+  end
+
+  defp served_state(:ok), do: :ready
+  defp served_state(_), do: :unreachable
 
   defp embed_all(base, model, texts) do
     url = String.trim_trailing(base, "/") <> "/api/embed"

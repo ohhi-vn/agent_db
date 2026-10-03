@@ -10,8 +10,6 @@ defmodule AgentDbWeb.WebSocket do
 
   channel("api:lobby", AgentDbWeb.Channel)
 
-  transport(:websocket, Phoenix.Transports.WebSocket)
-
   @impl true
   def connect(params, _socket, _opts) do
     if AgentDb.Config.http_auth() do

@@ -9,6 +9,7 @@ defmodule AgentDbWeb.Router do
   """
   use AgentDbWeb, :router
 
+  import Phoenix.LiveDashboard.Router
   import Phoenix.LiveView.Router
 
   alias AgentDbWeb.{AuthPlug, CORSPlug, SessionAuth}
@@ -57,9 +58,9 @@ defmodule AgentDbWeb.Router do
   end
 
   if Mix.env() == :dev do
-    scope "/dev", AgentDbWeb do
+    scope "/dev" do
       pipe_through(:browser)
-      forward("/dashboard", Phoenix.LiveDashboard, metrics: true)
+      live_dashboard("/dashboard", metrics: true)
     end
   end
 end

@@ -23,7 +23,7 @@ defmodule AgentDb.Core.Inference do
   @type embedding :: binary()
 
   @doc "Supervised children the provider needs."
-  @callback child_specs(keyword()) :: [Supervisor.child_spec() | module()]
+  @callback child_specs(keyword()) :: [Supervisor.child_spec() | module() | {module(), term()}]
 
   @doc "Embeds `texts`, returning one comparable vector per input."
   @callback embed([String.t()]) :: {:ok, [embedding()]} | {:error, term()}

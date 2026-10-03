@@ -41,7 +41,9 @@ defmodule Mix.Tasks.AgentDb.ExportData do
   end
 
   defp destination([path]), do: {:ok, path}
-  defp destination(_args), do: Mix.raise("Expected one PATH: the destination .tar or .tar.gz file.")
+
+  defp destination(_args),
+    do: Mix.raise("Expected one PATH: the destination .tar or .tar.gz file.")
 
   defp export_data(path, opts) do
     export_opts = if opts[:scope], do: [scope: opts[:scope]], else: []

@@ -52,11 +52,20 @@ defmodule AgentDb.StorageContract.Helpers do
   defp restart_when_free(_child, 0), do: :ok
 
   defp restart_when_free(child, attempts) do
-    case Supervisor.restart_child(AgentDb.Supervisor, child) do
-      {:ok, _pid} -> :ok
-      {:error, :running} -> retry_restart(child, attempts)
-      {:error, :shutdown} -> retry_restart(child, attempts)
-      _other -> :ok
+    # `restore_child/1` starts the application before reaching here, but these
+    # are `on_exit` callbacks: they run after the test body, and by then another
+    # file's teardown may have stopped the application again. There is nothing to
+    # restore a child under, and exiting here would fail a test that had already
+    # passed -- the next file to start the application gets the tree it expects.
+    if Process.whereis(AgentDb.Supervisor) do
+      case Supervisor.restart_child(AgentDb.Supervisor, child) do
+        {:ok, _pid} -> :ok
+        {:error, :running} -> retry_restart(child, attempts)
+        {:error, :shutdown} -> retry_restart(child, attempts)
+        _other -> :ok
+      end
+    else
+      :ok
     end
   end
 
@@ -393,7 +402,7 @@ defmodule AgentDb.StorageContract do
                      :binary.copy(<<0.0::float-32>>, 384)
                    )
 
-          assert {:ok, []} = storage().search_keyword("body", nil)
+          assert {:ok, []} = storage().search_keyword("body", nil, 10)
         end
 
         test "a removed node is not given a summary" do
@@ -439,7 +448,7 @@ defmodule AgentDb.StorageContract do
                      []
                    )
 
-          assert {:ok, [hit]} = storage().search_keyword("quick", nil)
+          assert {:ok, [hit]} = storage().search_keyword("quick", nil, 10)
           assert hit.uri == "viking://resources/contract/search/one.md"
         end
 
@@ -450,8 +459,27 @@ defmodule AgentDb.StorageContract do
           assert :ok =
                    storage().put_document("viking://resources/contract/out.md", "needlehere", [])
 
-          assert {:ok, [hit]} = storage().search_keyword("needlehere", scope <> "/")
+          assert {:ok, [hit]} = storage().search_keyword("needlehere", scope <> "/", 10)
           assert hit.uri == scope <> "/in.md"
+        end
+
+        test "a keyword search is bounded and ordered" do
+          scope = "viking://resources/contract/bounded"
+
+          for n <- 1..5 do
+            assert :ok = storage().put_document("#{scope}/doc#{n}.md", "sharedterm", [])
+          end
+
+          assert {:ok, bounded} = storage().search_keyword("sharedterm", scope <> "/", 3)
+          assert length(bounded) == 3
+
+          # Ordered by URI, so the same query returns the same documents however
+          # many times it is asked.
+          uris = Enum.map(bounded, & &1.uri)
+          assert uris == Enum.sort(uris)
+
+          assert {:ok, again} = storage().search_keyword("sharedterm", scope <> "/", 3)
+          assert Enum.map(again, & &1.uri) == uris
         end
       end
 
@@ -837,6 +865,70 @@ defmodule AgentDb.StorageContract do
 
           assert {:ok, stats} = storage().queue_stats()
           assert stats.pending >= 1
+        end
+
+        test "queue detail reports how far behind the queue is" do
+          assert {:ok, %{oldest_pending_ms: age, failed: []}} = storage().queue_detail(10)
+          assert is_nil(age) or is_integer(age)
+        end
+
+        test "queue detail explains a job that gave up" do
+          uri = "viking://resources/contract/gave-up.md"
+          assert {:ok, job_id} = storage().enqueue_job(:embed, %{uri: uri, content: "c"})
+
+          for _attempt <- 1..5 do
+            assert {:ok, _job} = storage().dequeue_job([:embed])
+            assert :ok = storage().fail_job(job_id, "inference_failed")
+            make_runnable(job_id)
+          end
+
+          assert {:ok, %{failed: [failed | _]}} = storage().queue_detail(10)
+          assert failed.kind == "embed"
+          assert failed.uri == uri
+          assert failed.attempts == failed.max_attempts
+          # The reason is the bounded code, not the failure term: what went
+          # wrong has to survive without carrying what it went wrong about.
+          assert failed.last_error == "inference_failed"
+        end
+      end
+
+      describe "composition and footprint" do
+        test "counts the documents and directories it holds" do
+          assert :ok =
+                   storage().put_document("viking://resources/contract/nodes/a.md", "a", jobs: [])
+
+          assert :ok =
+                   storage().put_document("viking://resources/contract/nodes/b.md", "b", jobs: [])
+
+          assert {:ok, stats} = storage().stats()
+          assert stats.documents >= 2
+          assert stats.directories >= 1
+        end
+
+        test "counts documents per top-level subtree" do
+          assert :ok =
+                   storage().put_document("viking://resources/contract/subtree/a.md", "a",
+                     jobs: []
+                   )
+
+          assert {:ok, stats} = storage().stats()
+          assert is_integer(stats.by_top_subtree["resources"])
+          assert stats.by_top_subtree["resources"] >= 1
+        end
+
+        test "distinguishes an unavailable index from an empty one" do
+          assert {:ok, vector} = storage().vector_index_stats()
+          assert is_boolean(vector.available)
+
+          # Not available is `nil` counts, never zero: "there is no index" and
+          # "the index holds nothing" are different facts.
+          if vector.available do
+            assert is_integer(vector.vectors)
+          else
+            assert is_nil(vector.vectors)
+          end
+
+          assert is_integer(vector.documents)
         end
       end
 

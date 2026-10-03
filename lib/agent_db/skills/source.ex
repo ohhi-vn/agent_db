@@ -40,6 +40,7 @@ defmodule AgentDb.Skills.Source do
   configures its own caps to match rather than restating them.
   """
 
+  alias AgentDb.Archive
   alias AgentDb.URI, as: VikingURI
 
   @manifest "SKILL.md"
@@ -235,130 +236,58 @@ defmodule AgentDb.Skills.Source do
   # type and declared size, so the whole bundle can be refused before a byte of
   # it is expanded, and a member that is a link or a device is caught before it
   # is ever handed over.
+  #
+  # `AgentDb.Archive` owns the container: gzip detection and inflation, listing,
+  # extraction, and the two bounds. What this module adds is what a *skill*
+  # needs rather than what a tar file needs -- each member's path checked
+  # against the URI grammar, counted against the importer's limits, and read as
+  # text.
   defp read_archive(binary) do
-    with {:ok, tar} <- plain_tar(binary),
-         {:ok, rows} <- table(tar),
-         :ok <- check_count(length(rows)),
-         :ok <- check_size(declared_size(rows)),
-         {:ok, read} <- read_rows(rows, new_read()) do
-      attach(tar, read)
+    with {:ok, members} <- Archive.list(binary, @max_entries, @max_bytes),
+         {:ok, read} <- read_rows(members, new_read()),
+         {:ok, contents} <- Archive.extract(binary, @max_bytes) do
+      fill(read, contents)
     end
   end
 
-  # Gzip is undone here, through the streaming inflater, rather than by the tar
-  # reader: a compressed archive is inflated whole before any caller could bound
-  # it, and the streaming one exists for input that cannot be trusted to stay
-  # the size it looks. What the tar reader is handed is therefore plain bytes,
-  # and the inflated total is bounded before it is ever assembled.
-  defp plain_tar(<<0x1F, 0x8B, _rest::binary>> = binary), do: inflate(binary)
-  defp plain_tar(binary), do: {:ok, binary}
-
-  defp inflate(binary) do
-    zlib = :zlib.open()
-
-    try do
-      :zlib.inflateInit(zlib, 31)
-      inflate_loop(zlib, binary, 0, [])
-    catch
-      # Bytes that are not a complete gzip stream come back as an exception
-      # rather than as an answer, and are no more readable than a broken tar.
-      _kind, reason -> {:error, {:malformed_archive, reason}}
-    after
-      :zlib.close(zlib)
-    end
-  end
-
-  defp inflate_loop(zlib, input, total, acc) do
-    case :zlib.safeInflate(zlib, input) do
-      {:finished, output} -> assemble(total + :erlang.iolist_size(output), [acc | output])
-      {:continue, output} -> expand(zlib, total + :erlang.iolist_size(output), [acc | output])
-      {:need_dictionary, _adler, _output} -> {:error, {:malformed_archive, :needs_dictionary}}
-    end
-  end
-
-  defp expand(_zlib, total, _acc) when total > @max_bytes, do: {:error, {:too_large, @max_bytes}}
-  defp expand(zlib, total, acc), do: inflate_loop(zlib, [], total, acc)
-
-  # The bound is checked here as well as on the way: an archive that expands in
-  # one go must not be assembled before it is refused.
-  defp assemble(total, _acc) when total > @max_bytes, do: {:error, {:too_large, @max_bytes}}
-  defp assemble(_total, acc), do: {:ok, :erlang.iolist_to_binary(acc)}
-
-  defp table(tar) do
-    case :erl_tar.table({:binary, tar}, [:verbose]) do
-      {:ok, rows} -> {:ok, rows}
-      {:error, reason} -> {:error, {:malformed_archive, reason}}
-    end
-  end
-
-  # Declared rather than actual, because a header can lie: the bound on what is
-  # actually read is the extraction's own, below. This one is what refuses a
-  # bundle before any of it has been expanded.
-  defp declared_size(rows) do
-    sizes = for {_name, type, size, _mtime, _mode, _uid, _gid} <- rows, type == :regular, do: size
-    Enum.sum(sizes)
-  end
-
-  defp read_rows(rows, read) do
-    Enum.reduce_while(rows, {:ok, read}, fn row, {:ok, read} ->
-      case read_row(read, row) do
+  # Entries are taken from the listing in the order it gave them, so a member of
+  # the listing is a member of what is filled in below.
+  defp read_rows(members, read) do
+    Enum.reduce_while(members, {:ok, read}, fn member, {:ok, read} ->
+      case read_row(read, member) do
         {:ok, read} -> {:cont, {:ok, read}}
         {:error, _} = error -> {:halt, error}
       end
     end)
   end
 
-  defp read_row(read, {charlist, :directory, _size, _mtime, _mode, _uid, _gid}) do
-    with {:ok, name} <- normalize_name(charlist),
+  defp read_row(read, %{type: :directory, name: name}) do
+    with {:ok, name} <- normalize_name(name),
          {:ok, path} <- normalize([], name) do
       add_dir(read, path)
     end
   end
 
-  defp read_row(read, {charlist, :regular, _size, _mtime, _mode, _uid, _gid}) do
-    with {:ok, name} <- normalize_name(charlist),
+  defp read_row(read, %{type: :regular, name: name}) do
+    with {:ok, name} <- normalize_name(name),
          {:ok, path} <- normalize([], name) do
-      add_pending(read, path, charlist)
-    end
-  end
-
-  defp read_row(_read, {charlist, type, _size, _mtime, _mode, _uid, _gid}) do
-    case normalize_name(charlist) do
-      {:ok, name} -> {:error, {:unsupported_entry, type, name}}
-      {:error, _} = error -> error
+      add_pending(read, path, name)
     end
   end
 
   # The listing and the extraction read the same archive in the same order, so a
   # member of one is a member of the other. Contents are attached to the entries
   # the listing already accepted rather than examined a second time.
-  defp attach(tar, read) do
-    case extract(tar) do
-      {:ok, members} -> fill(read, members)
-      {:error, _} = error -> error
-    end
-  end
-
-  defp extract(tar) do
-    # A second bound, on what is read rather than on what was declared: a header
-    # can claim a size the member does not have.
-    case :erl_tar.extract({:binary, tar}, [:memory, {:max_size, @max_bytes}]) do
-      {:ok, members} -> {:ok, Map.new(members)}
-      {:error, :too_big} -> {:error, {:too_large, @max_bytes}}
-      {:error, reason} -> {:error, {:malformed_archive, reason}}
-    end
-  end
-
-  defp fill(read, members) do
+  defp fill(read, contents) do
     read.entries
     |> Enum.reduce_while({:ok, []}, fn
       {:dir, _path, _name} = entry, {:ok, acc} ->
         {:cont, {:ok, [entry | acc]}}
 
       {:file, path, name, :pending}, {:ok, acc} ->
-        case Map.fetch(members, name) do
+        case Map.fetch(contents, name) do
           {:ok, content} -> {:cont, {:ok, [{:file, path, name, content} | acc]}}
-          :error -> {:halt, {:error, {:malformed_archive, {:missing, List.to_string(name)}}}}
+          :error -> {:halt, {:error, {:malformed_archive, {:missing, name}}}}
         end
     end)
     |> case do
@@ -433,9 +362,10 @@ defmodule AgentDb.Skills.Source do
     with {:ok, name} <- to_text(name), do: validate(name, String.split(name, "/"), prefix)
   end
 
-  defp normalize_name(charlist) do
-    with {:ok, name} <- to_text(List.to_string(charlist)), do: {:ok, name}
-  end
+  # A name arriving from the archive is already text: `AgentDb.Archive` reads
+  # the header, so a member whose name is not valid UTF-8 is reported here
+  # rather than silently mangled by the conversion.
+  defp normalize_name(name), do: to_text(name)
 
   defp to_text(name) do
     if String.valid?(name),

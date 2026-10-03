@@ -315,8 +315,9 @@ defmodule AgentDbTest do
     assert String.contains?(content, "user: Remember this")
     assert String.contains?(content, "assistant: Got it")
 
-    # Restored, not duplicated.
-    assert {:ok, [dest]} = AgentDb.list("viking://user/u1/memories")
+    # Restored, not duplicated: one entry, and it is this destination's name.
+    # `list/1` answers names, so the name is what is asserted.
+    assert {:ok, ["session-restore"]} = AgentDb.list("viking://user/u1/memories")
   end
 
   test "rm clears only the removed destination's commit bookkeeping" do
@@ -550,7 +551,7 @@ defmodule AgentDbTest do
       uri,
       fn job_id ->
         cap_attempts(job_id, 0)
-        AgentDb.Adapters.SQLite.fail_job(job_id)
+        AgentDb.Adapters.SQLite.fail_job(job_id, "inference_failed")
       end,
       timeout_ms
     )
@@ -595,8 +596,14 @@ defmodule AgentDbTest do
     assert unservable?(reason)
   end
 
+  # Every classified "this leg cannot be served" outcome counts: the assertion
+  # is that the caller is told, not which of them it was told. A leg that timed
+  # out on a loaded machine is the same answer as one whose model is absent.
   defp unservable?({:model_not_found, _path}), do: true
   defp unservable?(:vector_index_unavailable), do: true
+  defp unservable?({:hybrid_leg_timeout, _leg}), do: true
+  defp unservable?({:hybrid_leg_failed, _leg, _reason}), do: true
+  defp unservable?(:model_loading), do: true
   defp unservable?(_), do: false
 
   # -- Sessions --

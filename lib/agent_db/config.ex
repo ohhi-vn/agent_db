@@ -9,6 +9,13 @@ defmodule AgentDb.Config do
     Application.get_env(:agent_db, :data_dir) || Path.join(File.cwd!(), "data")
   end
 
+  # The one place the database file's name is decided, so startup and the
+  # footprint reported to an operator cannot name two different files.
+  @spec db_path() :: String.t()
+  def db_path do
+    Application.get_env(:agent_db, :db_path) || Path.join(data_dir(), "agent_db.db")
+  end
+
   @spec model_cache_dir() :: String.t()
   def model_cache_dir do
     Application.get_env(:agent_db, :model_cache_dir) ||

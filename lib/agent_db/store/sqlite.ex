@@ -8,7 +8,7 @@ defmodule AgentDb.Store.SQLite do
 
   require Logger
 
-  @type conn :: Sqlite3.db()
+  @type conn :: Exqlite.Sqlite3.db()
   @type ok_err :: :ok | {:error, term()}
 
   @doc "Opens a SQLite database with WAL and foreign_keys enabled. Loads sqlite-vec extension."
@@ -28,19 +28,19 @@ defmodule AgentDb.Store.SQLite do
     # Try to load sqlite-vec extension. This works if the extension is compiled
     # and available in the SQLite extension directory.
     case exec(conn, "SELECT vec_version()") do
-      {:ok, _} ->
+      :ok ->
         :ok
 
       {:error, _} ->
         # Extension not loaded, try to load it
         case exec(conn, "SELECT load_extension('vec0')") do
-          {:ok, _} ->
+          :ok ->
             :ok
 
           {:error, _} ->
             # Try alternative names
             case exec(conn, "SELECT load_extension('sqlite_vec')") do
-              {:ok, _} ->
+              :ok ->
                 :ok
 
               {:error, _} ->
@@ -194,11 +194,65 @@ defmodule AgentDb.Store.SQLite do
         {:error, _} = err -> {:halt, err}
       end
     end)
+    |> case do
+      :ok -> add_missing_columns(conn)
+      {:error, _} = err -> err
+    end
+    |> case do
+      :ok ->
+        # Then try to create vec_nodes table (optional, requires sqlite-vec extension)
+        try_create_vec_table(conn)
+        reconcile_orphan_embeddings(conn)
+        :ok
 
-    # Then try to create vec_nodes table (optional, requires sqlite-vec extension)
-    try_create_vec_table(conn)
-    reconcile_orphan_embeddings(conn)
-    :ok
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  # `CREATE TABLE IF NOT EXISTS` cannot add a column to a table that already
+  # exists, so a database created before a column was introduced keeps its old
+  # shape. Adding one is a widening of the existing table: nullable, no default,
+  # no rewrite of the rows already there -- so it runs once against a live store
+  # and an older store ends up with the same shape as a fresh one.
+  #
+  # Guarded by the table's own columns rather than by a version marker, so a
+  # database that predates the marker and one that arrived with it both work.
+  @added_columns [
+    # The classified reason a job last failed, so an operator can see why work
+    # is failing without the failure living only in a log line that has already
+    # rotated away.
+    {"job_queue", "last_error", "TEXT"}
+  ]
+
+  defp add_missing_columns(conn) do
+    Enum.reduce_while(@added_columns, :ok, fn {table, column, definition}, :ok ->
+      case column_present?(conn, table, column) do
+        {:ok, true} ->
+          {:cont, :ok}
+
+        {:ok, false} ->
+          case exec(conn, "ALTER TABLE #{table} ADD COLUMN #{column} #{definition}") do
+            :ok ->
+              {:cont, :ok}
+
+            {:error, _} = err ->
+              {:halt, err}
+          end
+
+        {:error, _} = err ->
+          {:halt, err}
+      end
+    end)
+  end
+
+  # PRAGMA table_info returns one row per column as
+  # {cid, name, type, notnull, dflt_value, pk}.
+  defp column_present?(conn, table, column) do
+    case query(conn, "PRAGMA table_info(#{table})", []) do
+      {:ok, rows} -> {:ok, Enum.any?(rows, fn [_cid, name | _rest] -> name == column end)}
+      {:error, _} = err -> err
+    end
   end
 
   # Releases vec_nodes rows left behind by removals that predate the purge in

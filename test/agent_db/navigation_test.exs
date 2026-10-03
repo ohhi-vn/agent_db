@@ -90,7 +90,7 @@ defmodule AgentDb.NavigationTest do
         )
 
       assert {:ok, hits} = AgentDb.find("a.md", scope: "viking://resources/grep")
-      assert length(hits) >= 1
+      assert hits != []
 
       assert {:ok, [first, second]} =
                AgentDb.grep("needle", scope: "viking://resources/grep/a.md")

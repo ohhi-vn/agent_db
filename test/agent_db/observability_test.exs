@@ -185,7 +185,9 @@ defmodule AgentDb.ObservabilityTest do
       assert Observability.error_message({:invalid_mode, "bogus"}) == "invalid_mode"
       assert Observability.error_message(:not_found) == "not_found"
       assert Observability.error_message(:model_loading) == "model_loading"
-      assert Observability.error_message({:not_a_memory_uri, "viking://secret/doc"}) == "not_a_memory_uri"
+
+      assert Observability.error_message({:not_a_memory_uri, "viking://secret/doc"}) ==
+               "not_a_memory_uri"
 
       for reason <- [{:invalid_mode, "x"}, :not_found, {:hybrid_leg_timeout, :vector}] do
         assert reason |> Observability.error_message() |> Jason.encode!() |> is_binary()

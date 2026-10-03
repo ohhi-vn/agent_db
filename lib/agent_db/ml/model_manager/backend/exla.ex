@@ -36,7 +36,9 @@ defmodule AgentDb.ML.ModelManager.Backend.Exla do
   end
 
   @impl true
-  def summarize(model_ref, prompt, opts) do
+  def summarize(model_ref, prompt, _opts) do
+    # Generation length comes from the serving's own configuration rather than
+    # from the call, which is why the options are not read here.
     formatted = String.replace(model_ref.chat_template, "%{prompt}", prompt)
 
     with {:ok, result} <- run(model_ref, formatted),
@@ -58,9 +60,6 @@ defmodule AgentDb.ML.ModelManager.Backend.Exla do
       {:error, _} = err -> err
     end
   end
-
-  @impl true
-  def model_info, do: %{backend: :exla}
 
   defp load_model(config, model_id, role) do
     loader = config.loader

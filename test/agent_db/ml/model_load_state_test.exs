@@ -14,7 +14,7 @@ defmodule AgentDb.ML.ModelLoadStateTest do
     # model id that does not exist.
     :ok = AgentDb.StorageContract.Helpers.stop_workers()
 
-    cache = Path.join(System.tmp_dir!(), "agent_db_ls_#{:erlang.unique_integer([:positive])}")
+    cache = AgentDb.Test.Scratch.dir("agent_db_ls")
 
     # A distinct model id per test. The call log is shared and a load from an
     # earlier test can still be in flight, so entries are filtered by the id
@@ -203,7 +203,7 @@ defmodule AgentDb.ML.ModelLoadStateTest do
       # One call may win the race and serve the request; the rest are told to
       # retry. None of them may start a second load.
       assert Enum.count(results, &match?({:ok, _}, &1)) <= 1
-      assert Enum.count(results, &match?({:error, :model_loading}, &1)) >= 1
+      assert Enum.any?(results, &match?({:error, :model_loading}, &1))
 
       assert :ready = await_settled(:embedding)
       assert [_] = load_calls(model_id)

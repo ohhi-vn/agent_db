@@ -14,7 +14,7 @@ defmodule Mix.Tasks.ContextTasksTest do
   end
 
   test "index, search, tree, and doctor reuse the facade" do
-    dir = Path.join(System.tmp_dir!(), "mix_ctx_#{System.unique_integer([:positive])}")
+    dir = AgentDb.Test.Scratch.dir("mix_ctx")
     File.mkdir_p!(dir)
     File.write!(Path.join(dir, "a.ex"), "defmodule MixCtx.A do def go, do: :ok end")
 

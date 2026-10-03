@@ -1,0 +1,4 @@
+# The versions this project is developed against. CI verifies the oldest
+# supported OTP as well; see .github/workflows/verify.yml for the matrix.
+erlang 29.0.5
+elixir 1.20.4

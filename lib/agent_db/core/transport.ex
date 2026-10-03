@@ -16,5 +16,5 @@ defmodule AgentDb.Core.Transport do
   @callback enabled?() :: boolean()
 
   @doc "The supervised children this transport needs, in the order they must start."
-  @callback child_specs(keyword()) :: [Supervisor.child_spec() | module()]
+  @callback child_specs(keyword()) :: [Supervisor.child_spec() | module() | {module(), term()}]
 end

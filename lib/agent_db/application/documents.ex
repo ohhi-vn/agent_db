@@ -9,6 +9,7 @@ defmodule AgentDb.Application.Documents do
   # stored one is missing, how a write acknowledges, when a write is complete
   # -- and none of how any of it is stored.
 
+  alias AgentDb.Application.Navigation
   alias AgentDb.Cache
   alias AgentDb.Observability
   alias AgentDb.Runtime
@@ -184,12 +185,51 @@ defmodule AgentDb.Application.Documents do
   @doc "Lists the names of a URI's direct children, and only those."
   @spec list(uri()) :: {:ok, [String.t()]} | {:error, term()}
   def list(uri) do
-    Observability.timed(:list, %{}, fn ->
-      case VikingURI.parse(uri) do
-        {:ok, segments} -> Runtime.storage().list_children(VikingURI.build(segments))
-        {:error, _} = err -> err
-      end
-    end)
+    Observability.timed(:list, %{}, fn -> list_cached(uri) end)
+  end
+
+  # A listing is cached the same way a node is, because a tree projection lists
+  # every node it visits: without this, projecting a subtree of N nodes cost N
+  # listing queries, most of which asked a document for children it does not
+  # have.
+  #
+  # Both answers are cached. `:not_found` is a real answer here -- it is what a
+  # document and a missing URI both return -- and caching it is what stops the
+  # projection from re-asking for the same empty listing on every call.
+  #
+  # Invalidation is the cache's existing job: every path that changes a
+  # listing's membership -- a write, a subtree removal, a session commit, a
+  # memory recorded or forgotten, a skill import -- already drops the parent
+  # and every ancestor's entry, and a background result never changes names.
+  defp list_cached(uri) do
+    case Cache.get_dir(uri) do
+      {:ok, cached} ->
+        cached
+
+      :miss ->
+        case list_uncached(uri) do
+          {:ok, _names} = result ->
+            Cache.put_dir(uri, result)
+            result
+
+          {:error, :not_found} = result ->
+            Cache.put_dir(uri, result)
+            result
+
+          {:error, _} = result ->
+            # A failure that says nothing about membership -- an unreachable
+            # database, say -- is not cached, so a transient fault does not
+            # outlive it.
+            result
+        end
+    end
+  end
+
+  defp list_uncached(uri) do
+    case VikingURI.parse(uri) do
+      {:ok, segments} -> Runtime.storage().list_children(VikingURI.build(segments))
+      {:error, _} = err -> err
+    end
   end
 
   @default_find_limit 50
@@ -214,58 +254,12 @@ defmodule AgentDb.Application.Documents do
   @spec find(String.t(), keyword()) :: {:ok, [map()]} | {:error, term()}
   def find(query, opts \\ []) do
     Observability.timed(:find, %{}, fn ->
-      with :ok <- validate_query(query),
-           {:ok, limit} <- validate_limit(opts),
-           {:ok, scope_uri} <- validate_scope(opts) do
+      with :ok <- Navigation.validate_query(query, @max_query_length),
+           {:ok, limit} <- Navigation.validate_limit(opts, @default_find_limit, @max_find_limit),
+           {:ok, scope_uri} <- Navigation.validate_scope(opts) do
         Runtime.storage().find_paths(query, scope_uri, limit)
       end
     end)
-  end
-
-  defp validate_query(query) when is_binary(query) do
-    if String.valid?(query) and String.length(query) >= 1 and
-         String.length(query) <= @max_query_length do
-      :ok
-    else
-      {:error, {:invalid_query, query}}
-    end
-  end
-
-  defp validate_query(query), do: {:error, {:invalid_query, query}}
-
-  defp validate_limit(opts) do
-    case Keyword.get(opts, :limit, @default_find_limit) do
-      limit when is_integer(limit) and limit >= 1 and limit <= @max_find_limit -> {:ok, limit}
-      limit -> {:error, {:invalid_limit, limit}}
-    end
-  end
-
-  # A `nil` scope searches the whole tree. The root searches everything as
-  # well, so it needs no existence check. Any other scope must parse and
-  # exist, otherwise a typo would silently answer with nothing.
-  defp validate_scope(opts) do
-    case Keyword.get(opts, :scope) do
-      nil ->
-        {:ok, nil}
-
-      uri when is_binary(uri) ->
-        with {:ok, segments} <- VikingURI.parse(uri) do
-          scope_uri = VikingURI.build(segments)
-
-          if segments == [] do
-            {:ok, nil}
-          else
-            case Runtime.storage().get_node(scope_uri) do
-              {:ok, nil} -> {:error, :not_found}
-              {:ok, _node} -> {:ok, scope_uri}
-              {:error, _} = err -> err
-            end
-          end
-        end
-
-      _other ->
-        {:error, :invalid_uri}
-    end
   end
 
   @doc "A depth-limited projection of the tree at `uri` (default depth 2)."

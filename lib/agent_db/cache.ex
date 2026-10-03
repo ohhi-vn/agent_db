@@ -131,6 +131,33 @@ defmodule AgentDb.Cache do
     %{node_cache: size(@node_cache), dir_cache: size(@dir_cache)}
   end
 
+  @doc """
+  Entry counts and bytes per table, for an operator telling a grown cache from
+  a grown store.
+
+  Bytes are the table's own reported memory rather than the size of what it
+  holds, so a large content entry and a small one cost the same to count --
+  which is the point: this says how much the cache costs, not what it says.
+  """
+  @spec detailed_stats() :: map()
+  def detailed_stats do
+    %{
+      node_cache: table_stats(@node_cache),
+      dir_cache: table_stats(@dir_cache),
+      total_entries: size(@node_cache) + size(@dir_cache),
+      total_bytes: bytes(@node_cache) + bytes(@dir_cache)
+    }
+  end
+
+  defp table_stats(table), do: %{entries: size(table), bytes: bytes(table)}
+
+  defp bytes(table) do
+    case :ets.whereis(table) do
+      :undefined -> 0
+      _tid -> :ets.info(table, :memory)
+    end
+  end
+
   @doc "The table a node entry lives in."
   @spec node_cache() :: atom()
   def node_cache, do: @node_cache

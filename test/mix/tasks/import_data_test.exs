@@ -71,7 +71,7 @@ defmodule Mix.Tasks.AgentDb.ImportDataTest do
 
   defp tmp(name) do
     dir =
-      Path.join(System.tmp_dir!(), "agent_db_import_task_#{System.unique_integer([:positive])}")
+      AgentDb.Test.Scratch.dir("agent_db_import_task")
 
     File.mkdir_p!(dir)
     Path.join(dir, name)

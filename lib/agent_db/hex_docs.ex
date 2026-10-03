@@ -29,6 +29,53 @@ defmodule AgentDb.HexDocs do
   @spec docs_uri(String.t(), String.t()) :: String.t()
   def docs_uri(package, version), do: "#{@hex_root}/#{package}/#{version}"
 
+  @doc """
+  How much of the locked Hex documentation the store actually holds.
+
+  `packages` is how many packages have documents under their root,
+  `documents` how many documents those are, and `locked` how many packages
+  `mix.lock` pins. The gap between `locked` and `packages` is what an operator
+  needs: a store holding three of its forty dependencies' docs is not one that
+  documents its dependencies.
+
+  Discovery is offline and every count is a bounded lookup, so this is safe to
+  call from a console that refreshes on a timer.
+  """
+  @spec coverage() :: %{
+          locked: non_neg_integer(),
+          packages: non_neg_integer(),
+          documents: non_neg_integer()
+        }
+  def coverage do
+    storage = AgentDb.Runtime.storage()
+
+    %{
+      locked: locked_count(),
+      packages: covered_packages(storage),
+      documents: storage.document_count("#{@hex_root}/")
+    }
+  end
+
+  defp locked_count do
+    {:ok, packages} = discover()
+    length(packages)
+  end
+
+  # One listing plus one count per package, so the cost follows the number of
+  # documented packages rather than the size of the store.
+  defp covered_packages(storage) do
+    case storage.list_children("#{@hex_root}/") do
+      {:ok, names} ->
+        Enum.count(
+          names,
+          &match?({:ok, n} when n > 0, storage.document_count("#{@hex_root}/#{&1}"))
+        )
+
+      {:error, _} ->
+        0
+    end
+  end
+
   @doc "Ingests README/API stubs for locked packages as ordinary documents."
   @spec ingest([%{package: String.t(), version: String.t()}]) ::
           {:ok, %{indexed: [String.t()]}} | {:error, term()}
@@ -59,7 +106,12 @@ defmodule AgentDb.HexDocs do
     locked = Keyword.get(opts, :locked, %{})
     scope = Keyword.get(opts, :scope, @hex_root)
 
-    with {:ok, results} <- AgentDb.search(query, mode: :keyword, scope: scope, top_k: Keyword.get(opts, :top_k, 20)) do
+    with {:ok, results} <-
+           AgentDb.search(query,
+             mode: :keyword,
+             scope: scope,
+             top_k: Keyword.get(opts, :top_k, 20)
+           ) do
       {:ok, rank(results, locked)}
     end
   end
@@ -93,8 +145,11 @@ defmodule AgentDb.HexDocs do
         Enum.flat_map(lock, fn
           {pkg, tuple} when is_binary(pkg) and is_tuple(tuple) ->
             case Tuple.to_list(tuple) do
-              [:hex, _name, version | _] when is_binary(version) -> [%{package: pkg, version: version}]
-              _ -> []
+              [:hex, _name, version | _] when is_binary(version) ->
+                [%{package: pkg, version: version}]
+
+              _ ->
+                []
             end
 
           _ ->

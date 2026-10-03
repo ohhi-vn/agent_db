@@ -30,7 +30,6 @@ defmodule AgentDb do
 
   alias AgentDb.Application.{Documents, Memories, Search, Sessions, Skills, Status}
   alias AgentDb.Subscriptions
-  alias AgentDb.URI, as: VikingURI
 
   @type uri :: String.t()
   @type content :: String.t()
@@ -114,7 +113,7 @@ defmodule AgentDb do
   Discovers files and directories whose URI path contains `query`.
 
   A literal, case-insensitive substring match over the URI path (excluding
-  the `viking://` scheme). See `AgentDb.Application.Documents.find/2` for
+  the `viking://` scheme). See AgentDb.Application.Documents.find/2 for
   scoping, limits, ordering, and errors.
   """
   @spec find(String.t(), keyword()) :: {:ok, [map()]} | {:error, term()}
@@ -124,7 +123,7 @@ defmodule AgentDb do
   Searches full document content (L2) for a literal substring.
 
   A literal, case-insensitive match that never looks at abstracts or
-  overviews. See `AgentDb.Application.Search.grep/2` for scoping, limits,
+  overviews. See AgentDb.Application.Search.grep/2 for scoping, limits,
   ordering, and errors.
   """
   @spec grep(String.t(), keyword()) :: {:ok, [map()]} | {:error, term()}
@@ -166,7 +165,7 @@ defmodule AgentDb do
 
   # -- memory --
 
-  @doc "Records a durable fact as a memory. See `AgentDb.Application.Memories.remember/3`."
+  @doc "Records a durable fact as a memory. See AgentDb.Application.Memories.remember/3."
   @spec remember(uri(), content(), keyword()) :: {:ok, uri()} | {:error, term()}
   def remember(uri, value, opts \\ []) do
     case Memories.remember(uri, value, opts) do
@@ -179,11 +178,11 @@ defmodule AgentDb do
     end
   end
 
-  @doc "Reads memories back. See `AgentDb.Application.Memories.recall/1`."
+  @doc "Reads memories back. See AgentDb.Application.Memories.recall/1."
   @spec recall(uri() | keyword()) :: {:ok, [map()]} | {:error, term()}
   defdelegate recall(uri_or_opts \\ []), to: Memories
 
-  @doc "Removes a memory and its provenance. See `AgentDb.Application.Memories.forget/1`."
+  @doc "Removes a memory and its provenance. See AgentDb.Application.Memories.forget/1."
   @spec forget(uri()) :: :ok | {:error, term()}
   def forget(uri) do
     case Memories.forget(uri) do
@@ -230,11 +229,22 @@ defmodule AgentDb do
 
   Answers the outcome of every skill, or one error for the source as a whole.
   Nothing is written until the whole source has been accepted, so an error leaves
-  the store as it was. `AgentDb.skills_import_error_message/1` turns the error
+  the store as it was. `AgentDb.skill_import_error_message/1` turns the error
   into a sentence.
   """
-  @spec import_skills(String.t(), AgentDb.Application.Skills.source()) ::
-          {:ok, %{skills: [AgentDb.Application.Skills.result()]}} | {:error, term()}
+  @spec import_skills(String.t(), AgentDb.Skills.Source.source()) ::
+          {:ok,
+           %{
+             skills: [
+               %{
+                 name: String.t(),
+                 status: :imported | :replaced | :failed,
+                 files: non_neg_integer(),
+                 reason: term() | nil
+               }
+             ]
+           }}
+          | {:error, term()}
   def import_skills(user_id, source) do
     case Skills.import(user_id, source) do
       {:ok, %{skills: skills} = out} ->
@@ -305,7 +315,9 @@ defmodule AgentDb do
 
   @doc "Why a data export or import was refused, as a sentence an operator can act on."
   @spec export_data_error_message(term()) :: String.t()
-  defdelegate export_data_error_message(reason), to: AgentDb.Application.DataTransfer, as: :message
+  defdelegate export_data_error_message(reason),
+    to: AgentDb.Application.DataTransfer,
+    as: :message
 
   # -- status --
 
@@ -321,11 +333,67 @@ defmodule AgentDb do
   @spec queue_stats() :: map()
   defdelegate queue_stats(), to: Status, as: :queue
 
-  # -- validation, for callers that check a URI before using it --
+  @doc """
+  How far behind the queue is, and which jobs are failing.
 
-  @doc "The segments of a `viking://` URI, or `{:error, :invalid_uri}`."
-  @spec parse_uri(uri()) :: {:ok, [String.t()]} | {:error, term()}
-  def parse_uri(uri), do: VikingURI.parse(uri)
+  Beyond `queue_stats/0`'s counts: the age of the longest-waiting pending job,
+  and the failures that spent their retries, each with the classified reason.
+  """
+  @spec queue_detail(pos_integer()) :: map()
+  defdelegate queue_detail(limit \\ 20), to: Status, as: :queue_detail
+
+  @doc """
+  What the store holds and how much room it takes on disk.
+
+  Document and directory counts, documents per top-level subtree, and the
+  database and write-ahead-log sizes.
+  """
+  @spec storage_stats() :: map()
+  defdelegate storage_stats(), to: Status, as: :storage
+
+  @doc """
+  The size of the store's disposable read caches: entries and bytes per table.
+  """
+  @spec cache_stats() :: map()
+  defdelegate cache_stats(), to: Status, as: :cache
+
+  @doc """
+  How much of the store's content each index covers.
+
+  Vector index availability and row count against the document count, plus the
+  documents under each index's own roots. An index that cannot be queried
+  reports unavailable rather than reporting zero.
+  """
+  @spec index_coverage() :: map()
+  def index_coverage do
+    Status.index_coverage()
+    |> Map.merge(%{
+      code_documents: AgentDb.CodeIndex.coverage().documents,
+      hex_documents: AgentDb.HexDocs.coverage().documents,
+      hex_packages: AgentDb.HexDocs.coverage().packages
+    })
+  end
+
+  @doc """
+  A bounded, read-only view of the BEAM runtime: uptime, applications,
+  supervisors, process counts, ETS tables, memory, and scheduler figures.
+
+  Read-only by construction: nothing is started, stopped, or messaged to take
+  one. Never writes, so a snapshot is safe to take at any time.
+  """
+  @spec runtime_snapshot() :: {:ok, map()} | {:error, term()}
+  defdelegate runtime_snapshot(), to: AgentDb.RuntimeContext, as: :snapshot
+
+  @doc """
+  Recent operational failures, newest first, with the operation they happened in
+  and their classified reason. Bounded and in memory only.
+  """
+  @spec recent_errors(pos_integer()) :: [map()]
+  def recent_errors(limit \\ 20), do: AgentDb.Observability.recent_errors(limit)
+
+  @doc "Operation, job, and model counts by outcome since this process started."
+  @spec operation_stats() :: map()
+  defdelegate operation_stats(), to: AgentDb.Observability, as: :operation_stats
 
   # Best-effort fan-out: a crashed or slow subscriber must never change the
   # write outcome.

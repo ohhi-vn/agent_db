@@ -10,10 +10,16 @@ defmodule AgentDbWeb.Context do
   become a change to the wire.
   """
   alias AgentDb
+  alias AgentDb.Observability
 
   @default_page 1
   @default_per_page 20
   @default_top_k 10
+
+  # The console browses the whole store, and the tree root is the one URI that
+  # is a valid listing scope for every document in it. Naming it is what makes
+  # the total a real count rather than the zero an empty prefix produces.
+  @tree_root "viking://"
 
   @doc "A page of the document names under `prefix`."
   @spec list_documents(map() | keyword()) :: {:ok, map()} | {:error, term()}
@@ -22,7 +28,7 @@ defmodule AgentDbWeb.Context do
     page = integer_param(opts, "page", @default_page)
     per_page = integer_param(opts, "per_page", @default_per_page)
 
-    case AgentDb.list(opts["prefix"] || "") do
+    case AgentDb.list(opts["prefix"] || @tree_root) do
       {:ok, names} ->
         {:ok, page_of(names, page, per_page)}
 
@@ -31,17 +37,24 @@ defmodule AgentDbWeb.Context do
     end
   end
 
+  # A page that is zero, negative, beyond the last one, or not a number at all is
+  # clamped rather than refused: an operator clicking through a listing should
+  # land on the nearest real page, not on a 500. Refusing would also make the
+  # console depend on how the caller spelled the page.
   defp page_of(names, page, per_page) do
     names = Enum.sort(names)
+    per_page = max(per_page, 1)
+    total_pages = max(div(length(names) + per_page - 1, per_page), 1)
+    page = page |> max(1) |> min(total_pages)
     offset = (page - 1) * per_page
 
     %{
-      data: Enum.slice(names, offset, per_page) || [],
+      data: Enum.slice(names, offset, per_page),
       meta: %{
         page: page,
         per_page: per_page,
         total: length(names),
-        total_pages: div(length(names) + per_page - 1, per_page)
+        total_pages: total_pages
       }
     }
   end
@@ -59,7 +72,7 @@ defmodule AgentDbWeb.Context do
   def delete_document(uri), do: AgentDb.rm(uri)
 
   @doc "Imports Agent Skills into a user's skills subtree. See `AgentDb.import_skills/2`."
-  @spec import_skills(String.t(), AgentDb.Application.Skills.source()) ::
+  @spec import_skills(String.t(), AgentDb.Skills.Source.source()) ::
           {:ok, map()} | {:error, term()}
   def import_skills(user_id, source), do: AgentDb.import_skills(user_id, source)
 
@@ -124,10 +137,6 @@ defmodule AgentDbWeb.Context do
     end
   end
 
-  @doc "Sessions, of which the store keeps no index to list."
-  @spec list_sessions(keyword()) :: {:ok, []}
-  def list_sessions(_opts \\ []), do: {:ok, []}
-
   @doc "A session's messages."
   @spec get_session(String.t()) :: {:ok, [map()]} | {:error, term()}
   def get_session(id), do: AgentDb.get_session(id)
@@ -139,6 +148,44 @@ defmodule AgentDbWeb.Context do
   @doc "How much background work is outstanding, by status."
   @spec job_stats() :: map()
   def job_stats, do: AgentDb.queue_stats()
+
+  @doc "How far behind the queue is, and which jobs are failing."
+  @spec queue_detail(pos_integer()) :: map()
+  def queue_detail(limit \\ 20), do: AgentDb.queue_detail(limit)
+
+  @doc "What the store holds and how much room it takes on disk."
+  @spec storage_stats() :: map()
+  def storage_stats, do: AgentDb.storage_stats()
+
+  @doc "The size of the store's disposable read caches."
+  @spec cache_stats() :: map()
+  def cache_stats, do: AgentDb.cache_stats()
+
+  @doc "How much of the store's content each index covers."
+  @spec index_coverage() :: map()
+  def index_coverage, do: AgentDb.index_coverage()
+
+  @doc "A bounded, read-only view of the BEAM runtime."
+  @spec runtime_snapshot() :: map()
+  def runtime_snapshot, do: snapshot_or_empty()
+
+  @doc "Recent operational failures, newest first."
+  @spec recent_errors(pos_integer()) :: [map()]
+  def recent_errors(limit \\ 20), do: AgentDb.recent_errors(limit)
+
+  @doc "Operation, job, and model counts by outcome."
+  @spec operation_stats() :: map()
+  def operation_stats, do: AgentDb.operation_stats()
+
+  # A snapshot answers `{:ok, map}` or a classified error. A console section
+  # that cannot be taken is a section saying so, not a section that takes the
+  # console down with it.
+  defp snapshot_or_empty do
+    case AgentDb.runtime_snapshot() do
+      {:ok, snapshot} -> snapshot
+      {:error, _reason} -> %{error: :unavailable}
+    end
+  end
 
   @doc """
   Whether the store is usable, per check.
@@ -160,7 +207,35 @@ defmodule AgentDbWeb.Context do
     case opts[key] do
       nil -> default
       value when is_integer(value) -> value
-      value when is_binary(value) -> String.to_integer(value)
+      value when is_binary(value) -> Integer.parse(value, 10) |> parsed_int(default)
+      _other -> default
     end
+  end
+
+  defp parsed_int({value, ""}, _default), do: value
+  defp parsed_int({value, _rest}, _default), do: value
+  defp parsed_int(:error, default), do: default
+
+  # A role arrives as the word the wire carries. One outside the set a session
+  # holds is not turned into a term: an unrecognised role is a bad request, not
+  # a reason to grow the vocabulary of stored rows.
+  @doc "Maps a wire role to the atom the store writes, or `:unknown`."
+  @spec role(String.t()) :: :user | :assistant | :system | :unknown
+  def role("user"), do: :user
+  def role("assistant"), do: :assistant
+  def role("system"), do: :system
+  def role(_other), do: :unknown
+
+  # One rendering for every store error: status from the shared taxonomy, body
+  # always JSON-safe with a machine-readable code, details never echoed.
+  @doc "Renders a store error on a controller connection."
+  @spec transport_error(Plug.Conn.t(), term()) :: Plug.Conn.t()
+  def transport_error(conn, reason) do
+    conn
+    |> Plug.Conn.put_status(Observability.http_status(reason))
+    |> Phoenix.Controller.json(%{
+      error: Observability.error_message(reason),
+      code: Observability.error_code(reason)
+    })
   end
 end

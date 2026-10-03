@@ -12,9 +12,8 @@ defmodule AgentDb.RuntimeTest do
 
   alias AgentDb.Runtime
   alias AgentDb.Test.Fakes.{Inference, Storage, Transport}
-  alias AgentDb.Test.Script
 
-  @adapters [:storage_adapter, :inference_adapter, :transport_adapter]
+  @adapters [:storage_adapter, :inference_provider, :transport_adapter]
 
   setup do
     Application.put_env(:agent_db, :data_dir, AgentDb.Config.test_data_dir())
@@ -79,7 +78,7 @@ defmodule AgentDb.RuntimeTest do
     end
 
     test "is what background work goes through as well" do
-      configure(storage_adapter: Storage, inference_adapter: Inference)
+      configure(storage_adapter: Storage, inference_provider: Inference)
       assert :ok = restart_app()
 
       # A worker claiming work reaches storage through the same port the
@@ -97,7 +96,7 @@ defmodule AgentDb.RuntimeTest do
       # Both ports substituted together, because a vector search is a question
       # about a stored index as much as about the model: this is the whole
       # search path with none of the default providers in it.
-      configure(storage_adapter: Storage, inference_adapter: Inference)
+      configure(storage_adapter: Storage, inference_provider: Inference)
 
       assert :ok = Runtime.validate!()
       assert :ok = restart_app()
@@ -121,7 +120,7 @@ defmodule AgentDb.RuntimeTest do
     end
 
     test "summarizes through the selected provider, and the result is stored" do
-      configure(storage_adapter: Storage, inference_adapter: Inference)
+      configure(storage_adapter: Storage, inference_provider: Inference)
       assert :ok = restart_app()
 
       # The provider's own summary, reached through the whole background path:
@@ -144,7 +143,7 @@ defmodule AgentDb.RuntimeTest do
     end
 
     test "whose deferral is reported as loading rather than as a failure" do
-      configure(inference_adapter: Inference)
+      configure(inference_provider: Inference)
       assert :ok = restart_app()
 
       Inference.stub_embed({:error, :model_loading})
@@ -153,7 +152,7 @@ defmodule AgentDb.RuntimeTest do
     end
 
     test "is what model status reports" do
-      configure(inference_adapter: Inference)
+      configure(inference_provider: Inference)
       assert :ok = restart_app()
 
       assert %{embedding: %{model: "fake-embedder"}} = AgentDb.model_status()

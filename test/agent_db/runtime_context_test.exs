@@ -29,6 +29,7 @@ defmodule AgentDb.RuntimeContextTest do
     # Redaction: no message bodies, ETS contents, or credentials.
     blob = inspect(snap)
     refute blob =~ "sk-secret"
+
     for proc <- snap.processes do
       assert Map.has_key?(proc, :mailbox_len)
       refute Map.has_key?(proc, :messages)
@@ -45,7 +46,7 @@ defmodule AgentDb.RuntimeContextTest do
 
   test "unreachable node reports an error and store still works" do
     assert {:error, {:node_unreachable, _}} =
-             AgentDb.RuntimeContext.snapshot(:"down@nonexistent")
+             AgentDb.RuntimeContext.snapshot(:down@nonexistent)
 
     assert :ok = AgentDb.write("viking://resources/snap/a.md", "still works")
     assert {:ok, "still works"} = AgentDb.read("viking://resources/snap/a.md")

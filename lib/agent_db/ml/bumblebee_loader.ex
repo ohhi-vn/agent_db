@@ -8,7 +8,7 @@ defmodule AgentDb.ML.BumblebeeLoader do
 
   `load_model/2` is a single call that returns the already-loaded model as
   `{:ok, %{model: model, spec: spec}}`. It does not take the loaded result as
-  input: `Bumblebee.normalize_repository!/1` accepts only `{:hf, id}` or
+  input: Bumblebee's repository normalizer accepts only `{:hf, id}` or
   `{:local, dir}` and raises `ArgumentError` on anything else.
   """
 
@@ -24,7 +24,7 @@ defmodule AgentDb.ML.BumblebeeLoader do
   Loads the model for a repository onto the backend named by `opts[:backend]`.
 
   `opts[:backend]` is AgentDb's own vocabulary — `:cpu`, `:cuda` or `:rocm`,
-  the values `AgentDb.Config.exla_backend/0` returns. Bumblebee wants a backend
+  the values AgentDb.Config.exla_backend/0 returns. Bumblebee wants a backend
   *module* or `{module, opts}`, so it is translated here rather than passed
   through: an untranslated `:cpu` is read as a module named `:cpu` and raises.
 
@@ -138,6 +138,9 @@ defmodule AgentDb.ML.BumblebeeLoader do
   end
 
   defp compile_opts(opts) do
-    [batch_size: Keyword.get(opts, :batch_size, 1), sequence_length: Keyword.get(opts, :sequence_length, 256)]
+    [
+      batch_size: Keyword.get(opts, :batch_size, 1),
+      sequence_length: Keyword.get(opts, :sequence_length, 256)
+    ]
   end
 end

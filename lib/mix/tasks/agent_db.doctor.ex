@@ -54,14 +54,12 @@ defmodule Mix.Tasks.AgentDb.Doctor do
   end
 
   defp pubsub_ok? do
-    try do
-      :ok = Phoenix.PubSub.subscribe(AgentDb.PubSub, "agent_db:doctor")
-      :ok = Phoenix.PubSub.unsubscribe(AgentDb.PubSub, "agent_db:doctor")
-      true
-    rescue
-      _ -> false
-    catch
-      _, _ -> false
-    end
+    :ok = Phoenix.PubSub.subscribe(AgentDb.PubSub, "agent_db:doctor")
+    :ok = Phoenix.PubSub.unsubscribe(AgentDb.PubSub, "agent_db:doctor")
+    true
+  rescue
+    _ -> false
+  catch
+    _, _ -> false
   end
 end

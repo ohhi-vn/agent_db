@@ -94,7 +94,7 @@ defmodule AgentDb.Core.Storage do
   @type layer :: :abstract | :overview
 
   @doc "Supervised children the adapter needs, given the resolved `path` to the database file."
-  @callback child_specs(keyword()) :: [Supervisor.child_spec() | module()]
+  @callback child_specs(keyword()) :: [Supervisor.child_spec() | module() | {module(), term()}]
 
   @doc "The node at `uri`, or `{:ok, nil}` when nothing is stored there."
   @callback get_node(String.t()) :: {:ok, tree_node() | nil} | {:error, term()}
@@ -146,8 +146,15 @@ defmodule AgentDb.Core.Storage do
   @callback put_embedding_result(integer(), String.t(), binary()) ::
               {:ok, :stored | :discarded} | {:error, term()}
 
-  @doc "Case-insensitive substring search over stored documents, optionally within `scope_prefix`."
-  @callback search_keyword(String.t(), String.t() | nil) ::
+  @doc """
+  Case-insensitive substring search over stored documents, optionally within
+  `scope_prefix`.
+
+  At most `limit` results, ordered deterministically by URI. The bound is
+  applied by the provider rather than by the caller, so a query matching more
+  documents than were asked for does not materialize all of them.
+  """
+  @callback search_keyword(String.t(), String.t() | nil, pos_integer()) ::
               {:ok, [tree_node()]} | {:error, term()}
 
   @doc "Nearest neighbours of a query embedding, optionally within `scope_prefix`."
@@ -249,8 +256,12 @@ defmodule AgentDb.Core.Storage do
   @doc """
   Records a job failure, rescheduling it with backoff while attempts remain and
   marking it failed once they are exhausted.
+
+  `reason` is the worker's classified failure, persisted so a failed job can be
+  explained later without a log line. It is a classification -- never content,
+  a prompt, or a credential.
   """
-  @callback fail_job(integer()) :: :ok | {:error, term()}
+  @callback fail_job(integer(), String.t() | nil) :: :ok | {:error, term()}
 
   @doc "Puts a job back without spending one of its attempts, for work that is merely waiting."
   @callback defer_job(integer(), non_neg_integer()) :: :ok | {:error, term()}
@@ -261,6 +272,72 @@ defmodule AgentDb.Core.Storage do
   @doc "Job counts by status."
   @callback queue_stats() :: {:ok, map()} | {:error, term()}
 
+  @doc """
+  How much work is outstanding and what went wrong.
+
+  Extends `queue_stats/0` with the age of the oldest pending job and a bounded
+  list of failed jobs carrying the reason, so an operator can tell a queue that
+  is backing up from one whose work is failing.
+
+  `oldest_pending_ms` is the age of the longest-waiting runnable job and is
+  `nil` when nothing is pending. `failed` is newest-first and bounded. Each
+  entry's `last_error` is a classified reason -- never content, a prompt, or a
+  credential.
+  """
+  @callback queue_detail(pos_integer()) ::
+              {:ok, %{oldest_pending_ms: non_neg_integer() | nil, failed: [map()]}}
+              | {:error, term()}
+
+  @doc """
+  The store's composition and footprint, read-only.
+
+  `documents` and `directories` count every node of each kind;
+  `by_top_subtree` counts documents filed at or below each top-level subtree
+  (`resources`, `user`, `peers`, ...). `db_bytes` and `wal_bytes` are the sizes
+  of the database file and its write-ahead log, which is a fact about one
+  implementation: a provider with no single database file reports `nil` rather
+  than inventing one.
+
+  This counts; it never walks the tree, so its cost does not grow with depth.
+  """
+  @callback stats() ::
+              {:ok,
+               %{
+                 documents: non_neg_integer(),
+                 directories: non_neg_integer(),
+                 by_top_subtree: %{optional(String.t()) => non_neg_integer()},
+                 db_bytes: non_neg_integer() | nil,
+                 wal_bytes: non_neg_integer() | nil
+               }}
+              | {:error, term()}
+
+  @doc """
+  Coverage of the vector index relative to what is stored.
+
+  `available` is whether the index can be queried at all; when it is not,
+  `vectors` is `nil` rather than zero, because "not available" and "holds
+  nothing" are different facts an operator needs to tell apart. `vectors`
+  counts indexed rows and `documents` counts the documents they describe, so a
+  store can report how much of its content is vector-searchable.
+  """
+  @callback vector_index_stats() ::
+              {:ok,
+               %{
+                 available: boolean(),
+                 vectors: non_neg_integer() | nil,
+                 documents: non_neg_integer()
+               }}
+              | {:error, term()}
+
   @doc "Whether the durable state can be reached at all."
   @callback healthy?() :: boolean()
+
+  @doc """
+  How many documents are stored at `prefix` or beneath it.
+
+  Membership is exact-URI-or-descendant, the same rule `find/4` and
+  `grep_content/3` use, so a count of a subtree cannot include a sibling whose
+  name merely starts the same way. Directories are not counted.
+  """
+  @callback document_count(String.t()) :: non_neg_integer()
 end

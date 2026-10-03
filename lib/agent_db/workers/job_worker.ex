@@ -197,8 +197,11 @@ defmodule AgentDb.Workers.JobWorker do
     end
   end
 
+  # The bounded error code travels with the failure, so a job that finally
+  # gives up can still be explained by whoever looks at it later rather than by
+  # the log line that has since rotated away.
   defp fail(storage, job_id, reason) do
-    case storage.fail_job(job_id) do
+    case storage.fail_job(job_id, Observability.error_code(reason)) do
       :ok ->
         Observability.log(:error,
           component: :worker,

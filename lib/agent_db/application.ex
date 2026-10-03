@@ -26,7 +26,7 @@ defmodule AgentDb.Application do
 
     data_dir = AgentDb.Config.data_dir()
     File.mkdir_p!(data_dir)
-    path = Path.join(data_dir, "agent_db.db")
+    path = AgentDb.Config.db_path()
     opts = [path: path]
 
     # A provider that cannot answer its port is a configuration error, and this
@@ -36,6 +36,7 @@ defmodule AgentDb.Application do
     children =
       pubsub_specs() ++
         cache_specs() ++
+        [AgentDb.Observability.Sink] ++
         AgentDb.Runtime.storage().child_specs(opts) ++
         AgentDb.Runtime.inference().child_specs(opts) ++
         worker_specs() ++

@@ -59,9 +59,8 @@ defmodule AgentDb.Application.Sessions do
   """
   @spec commit(id(), String.t(), keyword()) :: {:ok, String.t() | :unchanged} | {:error, term()}
   def commit(session_id, destination_uri, opts \\ []) do
-    with {:ok, []} <- VikingURI.parse(destination_uri) do
-      {:error, :is_root}
-    else
+    case VikingURI.parse(destination_uri) do
+      {:ok, []} -> {:error, :is_root}
       {:ok, _segments} -> write_commit(session_id, destination_uri, opts)
       {:error, _} = err -> err
     end

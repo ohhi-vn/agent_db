@@ -1,4 +1,5 @@
 defmodule AgentDbWeb.ErrorView do
+  @moduledoc false
   use AgentDbWeb, :view
 
   def render("404.json", _assigns) do
