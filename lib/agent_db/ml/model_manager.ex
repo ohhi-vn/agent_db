@@ -464,7 +464,7 @@ defmodule AgentDb.ML.ModelManager do
         loaded: embedding_model != nil,
         state: state.loading |> Map.get(:embedding, :idle) |> load_state_name(),
         model: state.config.embedding_model,
-        dim: 384,
+        dim: AgentDb.Adapters.Inference.ObservedDim.get(:local),
         last_latency_ms: Map.get(state.last_latency_ms, :embedding),
         last_load_ms: Map.get(state.last_load_ms, :embedding)
       },

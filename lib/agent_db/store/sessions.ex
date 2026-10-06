@@ -40,7 +40,7 @@ defmodule AgentDb.Store.Sessions do
   def read(conn, session_id) do
     case SQLite.query(
            conn,
-           "SELECT seq, role, content FROM session_messages WHERE session_id = ?1 ORDER BY seq",
+           "SELECT seq, role, content FROM session_messages WHERE session_id = ?1 ORDER BY seq LIMIT 1000",
            [session_id]
          ) do
       {:ok, rows} ->
@@ -57,7 +57,7 @@ defmodule AgentDb.Store.Sessions do
   @doc "Ids of every session, ordered."
   @spec list_ids(SQLite.conn()) :: {:ok, [String.t()]} | {:error, term()}
   def list_ids(conn) do
-    case SQLite.query(conn, "SELECT id FROM sessions ORDER BY id", []) do
+    case SQLite.query(conn, "SELECT id FROM sessions ORDER BY id LIMIT 500", []) do
       {:ok, rows} -> {:ok, Enum.map(rows, &hd/1)}
       {:error, _} = err -> err
     end

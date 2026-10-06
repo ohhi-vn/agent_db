@@ -68,7 +68,13 @@ defmodule AgentDb.Test.Fakes.Storage do
   alias AgentDb.URI, as: VikingURI
 
   @table :agent_db_fake_storage
-  @keys [:documents, :memories, :messages, :hashes, :embeddings, :jobs]
+  @keys [:documents, :memories, :messages, :hashes, :embeddings, :vec_active, :jobs]
+
+  # Dim-safety emulation bounds, mirroring the SQLite provider: absurd dims
+  # are refused and distinct dims are capped, so a misconfigured provider
+  # cannot proliferate tables without bound.
+  @max_vec_dim 8192
+  @max_vec_dims 16
 
   # A node reported for any URI, for a test about the port's shape rather than
   # about this provider's behaviour. Lives outside `@keys` so a reset between
@@ -157,11 +163,14 @@ defmodule AgentDb.Test.Fakes.Storage do
 
       _present ->
         # Every store keyed by URI, in one step: the removals that have to
-        # agree with each other are the point of the contract.
-        put(:documents, Map.drop(documents(), subtree(uri)), [])
-        put(:memories, Map.drop(memories(), subtree(uri)), [])
+        # agree with each other are the point of the contract. The doomed set
+        # is captured before the first drop: recomputing it afterwards would
+        # find nothing left and silently keep every vector and memory row.
+        doomed = subtree(uri)
+        put(:documents, Map.drop(documents(), doomed), [])
+        put(:memories, Map.drop(memories(), doomed), [])
         put(:hashes, Map.drop(hashes(), subtree_map_keys(uri)), [])
-        put(:embeddings, Map.drop(embeddings(), subtree(uri)), [])
+        put(:embeddings, drop_vec_uris(embeddings(), doomed), [])
         put(:jobs, Enum.reject(jobs(), fn job -> uri_matches?(job.payload["uri"], uri) end), [])
         scripted(:remove_subtree, :ok)
     end
@@ -184,9 +193,10 @@ defmodule AgentDb.Test.Fakes.Storage do
   @spec do_replace_skill(String.t(), [map()]) :: {:ok, map()} | {:error, term()}
   def do_replace_skill(uri, files) do
     replaced? = Map.has_key?(documents(), uri)
-    put(:documents, Map.drop(documents(), subtree(uri)), [])
-    put(:memories, Map.drop(memories(), subtree(uri)), [])
-    put(:embeddings, Map.drop(embeddings(), subtree(uri)), [])
+    doomed = subtree(uri)
+    put(:documents, Map.drop(documents(), doomed), [])
+    put(:memories, Map.drop(memories(), doomed), [])
+    put(:embeddings, drop_vec_uris(embeddings(), doomed), [])
     put(:jobs, Enum.reject(jobs(), fn job -> uri_matches?(job.payload["uri"], uri) end), [])
 
     outcome =
@@ -241,16 +251,48 @@ defmodule AgentDb.Test.Fakes.Storage do
   @impl true
   def put_embedding_result(job_id, uri, embedding) do
     # Fenced on the node, exactly as the default provider is: a result computed
-    # before a removal must not bring the URI back.
+    # before a removal must not bring the URI back. Routed per-request from the
+    # blob itself into a per-dim map, mirroring the namespaced vec tables: mixed
+    # dims never share a map, and the last written dim becomes active.
     case Map.fetch(documents(), uri) do
       {:ok, %{kind: :doc}} ->
-        put(:embeddings, Map.put(embeddings(), uri, embedding), :ok)
-        finish(job_id, :stored)
+        case fake_vec_dim(embedding) do
+          {:ok, dim} -> store_fake_vector(job_id, uri, embedding, dim)
+          {:error, _} = err -> err
+        end
 
       _absent ->
         discard(job_id)
     end
   end
+
+  defp store_fake_vector(job_id, uri, embedding, dim) do
+    maps = embeddings()
+
+    if not Map.has_key?(maps, dim) and map_size(maps) >= @max_vec_dims do
+      {:error, :too_many_dims}
+    else
+      put(:embeddings, Map.update(maps, dim, %{uri => embedding}, &Map.put(&1, uri, embedding)), [])
+      put(:vec_active, dim, [])
+      finish(job_id, :stored)
+    end
+  end
+
+  defp fake_vec_dim(blob) when is_binary(blob) do
+    if rem(byte_size(blob), 4) == 0 and byte_size(blob) > 0 do
+      dim = div(byte_size(blob), 4)
+
+      if dim >= 1 and dim <= @max_vec_dim do
+        {:ok, dim}
+      else
+        {:error, {:invalid_dim, dim}}
+      end
+    else
+      {:error, {:invalid_dim, byte_size(blob)}}
+    end
+  end
+
+  defp fake_vec_dim(_other), do: {:error, {:invalid_dim, :not_a_binary}}
 
   # Storing a result and finishing the job that produced it are one outcome, so
   # a stored result with an unfinished job would be redone.
@@ -276,7 +318,7 @@ defmodule AgentDb.Test.Fakes.Storage do
 
     # Bounded and ordered, like the real provider: a fake that ignored the
     # limit would let a caller pass a bound test while the store ignored it.
-    hits = hits |> Enum.sort_by(&elem(&1, 0)) |> Enum.take(limit)
+    hits = hits |> Enum.sort_by(& &1.uri) |> Enum.take(limit)
 
     scripted(:search_keyword, {:ok, hits})
   end
@@ -354,21 +396,38 @@ defmodule AgentDb.Test.Fakes.Storage do
     # port hands over: bytes, not text. Exact match is the only similarity a
     # double can implement honestly, so identical text finds itself and
     # different text does not -- enough to show a vector search is scoped and
-    # answered from the index rather than from the text.
-    hits =
-      for {uri, embedding} <- embeddings(),
-          uri_matches?(uri, scope),
-          distance(query, embedding) <= @identical do
-        %{
-          uri: uri,
-          content: content_at(uri),
-          abstract: abstract_at(uri),
-          overview: overview_at(uri),
-          score: 1.0
-        }
-      end
+    # answered from the index rather than from the text. Routed by the query
+    # blob's own dim into that dim's map: a query from another dim than the
+    # active one is refused, never misranked across dims.
+    case fake_vec_dim(query) do
+      {:error, _} = err ->
+        err
 
-    scripted(:search_vector, {:ok, hits})
+      {:ok, query_dim} ->
+        case vec_active() do
+          nil ->
+            scripted(:search_vector, {:ok, []})
+
+          ^query_dim ->
+            hits =
+              for {uri, embedding} <- Map.get(embeddings(), query_dim, %{}),
+                  uri_matches?(uri, scope),
+                  distance(query, embedding) <= @identical do
+                %{
+                  uri: uri,
+                  content: content_at(uri),
+                  abstract: abstract_at(uri),
+                  overview: overview_at(uri),
+                  score: 1.0
+                }
+              end
+
+            scripted(:search_vector, {:ok, hits})
+
+          _other ->
+            {:error, :dim_mismatch}
+        end
+    end
   end
 
   # Both are float32 vectors of the same length, so the distance is the sum of
@@ -463,24 +522,179 @@ defmodule AgentDb.Test.Fakes.Storage do
   end
 
   @impl true
-  def put_memory(uri, value, confidence, source) do
+  def put_memory(uri, value, confidence, source, opts \\ []) do
     with {:ok, _segments} <- VikingURI.parse(uri) do
       record(uri, value, [])
+
+      status = Keyword.get(opts, :status, :active)
+      now = System.system_time(:millisecond)
 
       assertion = %{
         id: System.unique_integer([:positive]),
         uri: uri,
         value: value,
         confidence: confidence * 1.0,
+        importance: Keyword.get(opts, :importance, 0.5) * 1.0,
         source: source,
-        status: :active,
+        status: status,
         supersedes: nil,
-        updated_at: System.system_time(:millisecond)
+        created_at: now,
+        updated_at: now,
+        last_surfaced_at: nil
       }
 
-      put(:memories, Map.update(memories(), uri, [assertion], &supersede(&1, assertion)), :ok)
+      # Only an active record revises the belief: a candidate waits beside it.
+      if status == :active do
+        put(:memories, Map.update(memories(), uri, [assertion], &supersede(&1, assertion)), :ok)
+      else
+        put(:memories, Map.update(memories(), uri, [assertion], &(&1 ++ [assertion])), :ok)
+      end
     end
   end
+
+  @impl true
+  def promote_memory(uri) do
+    case latest_candidate(uri) do
+      nil ->
+        {:error, :no_candidate}
+
+      candidate ->
+        others_promoted =
+          memories()
+          |> Map.get(uri, [])
+          |> Enum.map(fn
+            %{id: id, status: :active} = row when id != candidate.id ->
+              %{row | status: :superseded, supersedes: candidate.id}
+
+            %{id: id} = row when id == candidate.id ->
+              %{row | status: :active}
+
+            row ->
+              row
+          end)
+          |> Enum.reject(fn %{id: id, status: status} ->
+            status == :candidate and id != candidate.id
+          end)
+
+        put(:memories, Map.put(memories(), uri, others_promoted), {:ok, :promoted})
+    end
+  end
+
+  defp latest_candidate(uri) do
+    memories()
+    |> Map.get(uri, [])
+    |> Enum.filter(&(&1.status == :candidate))
+    |> List.last()
+  end
+
+  @impl true
+  def reject_memory_candidate(uri) do
+    case latest_candidate(uri) do
+      nil ->
+        {:error, :no_candidate}
+
+      _candidate ->
+        remaining = Enum.reject(Map.get(memories(), uri, []), &(&1.status == :candidate))
+        put(:memories, Map.put(memories(), uri, remaining), [])
+
+        # Recording the candidate overwrote the document: with nothing left
+        # the document, vector and queued work go too, otherwise the document
+        # is repaired to the surviving active value.
+        case Enum.find(remaining, &(&1.status == :active)) do
+          nil -> drop_uri_state(uri)
+          active -> put(:documents, Map.update!(documents(), uri, &%{&1 | content: active.value}), :ok)
+        end
+    end
+  end
+
+  defp drop_uri_state(uri) do
+    put(:documents, Map.delete(documents(), uri), [])
+    put(:embeddings, drop_vec_uri(embeddings(), uri), [])
+    put(:jobs, Enum.reject(jobs(), fn job -> uri_matches?(job.payload["uri"], uri) end), [])
+    :ok
+  end
+
+  @impl true
+  def mark_memories_surfaced(ids) do
+    now = System.system_time(:millisecond)
+    wanted = MapSet.new(ids)
+
+    touched =
+      Map.new(memories(), fn {uri, assertions} ->
+        {uri,
+         Enum.map(assertions, fn assertion ->
+           if MapSet.member?(wanted, assertion.id) do
+             %{assertion | last_surfaced_at: now}
+           else
+             assertion
+           end
+         end)}
+      end)
+
+    put(:memories, touched, :ok)
+  end
+
+  @impl true
+  def memory_conflict_pairs(prefix) do
+    # Compared within the active dim map only, mirroring the namespaced
+    # tables: vectors stored under another dim are a different index, not
+    # comparable candidates.
+    case vec_active() do
+      nil ->
+        {:error, :embeddings_unavailable}
+
+      dim ->
+        rows =
+          for {uri, assertions} <- memories(),
+              uri_matches?(uri, prefix),
+              assertion <- assertions,
+              assertion.status == :active do
+            assertion
+          end
+
+        vectors = Map.take(Map.get(embeddings(), dim, %{}), Enum.map(rows, & &1.uri))
+
+        if map_size(vectors) < 2 do
+          {:error, :embeddings_unavailable}
+        else
+          {:ok, fake_similar_pairs(rows, vectors)}
+        end
+    end
+  end
+
+  defp fake_similar_pairs(rows, vectors) do
+    uris = rows |> Enum.map(& &1.uri) |> Enum.filter(&Map.has_key?(vectors, &1)) |> Enum.uniq()
+
+    for a <- uris,
+        b <- uris,
+        a < b,
+        fake_same_type?(a, b),
+        (sim = fake_cosine(Map.fetch!(vectors, a), Map.fetch!(vectors, b))) >= 0.9 do
+      %{uri_a: a, uri_b: b, similarity: sim}
+    end
+    |> Enum.sort_by(& &1.similarity, :desc)
+  end
+
+  defp fake_same_type?(a, b), do: fake_memory_type(a) == fake_memory_type(b) and fake_memory_type(a) != nil
+
+  defp fake_memory_type(uri) do
+    case VikingURI.parse(uri) do
+      {:ok, ["user", "memories", type | _rest]} -> type
+      _ -> nil
+    end
+  end
+
+  defp fake_cosine(a, b) when byte_size(a) == byte_size(b) and byte_size(a) > 0 do
+    xs = for <<x::float-32 <- a>>, do: x
+    ys = for <<y::float-32 <- b>>, do: y
+    dot = Enum.zip(xs, ys) |> Enum.map(fn {x, y} -> x * y end) |> Enum.sum()
+    nx = :math.sqrt(Enum.map(xs, &(&1 * &1)) |> Enum.sum())
+    ny = :math.sqrt(Enum.map(ys, &(&1 * &1)) |> Enum.sum())
+
+    if nx == 0.0 or ny == 0.0, do: 0.0, else: dot / (nx * ny)
+  end
+
+  defp fake_cosine(_, _), do: 0.0
 
   @impl true
   def recall_memories(prefix, term, statuses) do
@@ -575,7 +789,73 @@ defmodule AgentDb.Test.Fakes.Storage do
 
   @impl true
   def vector_index_stats do
-    scripted(:vector_index_stats, {:ok, %{available: false, vectors: nil, documents: 0}})
+    scripted(:vector_index_stats, {:ok, fake_vector_counts()})
+  end
+
+  # Counted from what this fake actually holds: documents filed, vectors in
+  # the active dim map, and whether any document is missing from it.
+  defp fake_vector_counts do
+    docs = Enum.count(documents(), fn {_uri, node} -> is_map(node) and node[:kind] == :doc end)
+
+    case vec_active() do
+      nil ->
+        %{available: true, active_dim: :unknown, vectors: 0, documents: docs, needs_backfill: docs > 0}
+
+      dim ->
+        vecs = Map.get(embeddings(), dim, %{})
+        missing? = Enum.any?(documents(), fn {uri, node} ->
+          is_map(node) and node[:kind] == :doc and not Map.has_key?(vecs, uri)
+        end)
+
+        %{available: true, active_dim: dim, vectors: map_size(vecs), documents: docs, needs_backfill: missing?}
+    end
+  end
+
+  @doc """
+  Enqueues `:embed` jobs only for document URIs missing in the active dim
+  map. Mirrors the SQLite backfill: covered URIs are never re-enqueued.
+  """
+  @spec backfill_vector_index() :: {:ok, non_neg_integer()} | {:error, term()}
+  def backfill_vector_index do
+    case vec_active() do
+      nil ->
+        {:ok, 0}
+
+      dim ->
+        vecs = Map.get(embeddings(), dim, %{})
+
+        missing =
+          for {uri, node} <- documents(),
+              is_map(node) and node[:kind] == :doc,
+              not Map.has_key?(vecs, uri) do
+            {uri, node[:content] || ""}
+          end
+
+        Enum.reduce_while(missing, {:ok, 0}, fn {uri, content}, {:ok, n} ->
+          case enqueue_job(:embed, %{uri: uri, content: content}) do
+            {:ok, _} -> {:cont, {:ok, n + 1}}
+            {:error, _} = err -> {:halt, err}
+          end
+        end)
+    end
+  end
+
+  @doc """
+  Drops a non-active dim map. Refuses the active dim; nothing here ever wipes
+  on its own.
+  """
+  @spec prune_vector_index(pos_integer()) :: :ok | {:error, term()}
+  def prune_vector_index(dim) do
+    cond do
+      not (is_integer(dim) and dim >= 1 and dim <= @max_vec_dim) ->
+        {:error, {:invalid_dim, dim}}
+
+      vec_active() != nil and dim == vec_active() ->
+        {:error, :active_dim}
+
+      true ->
+        put(:embeddings, Map.delete(embeddings(), dim), :ok)
+    end
   end
 
   # Counted from what this fake actually holds, so the exact-URI-or-descendant
@@ -652,7 +932,10 @@ defmodule AgentDb.Test.Fakes.Storage do
   end
 
   # The two collections that start empty as a list and the rest as a map.
+  # No dim observed yet reads as unknown, the same fact the SQLite provider
+  # reports before its first vector.
   defp initial(key) when key in [:jobs], do: []
+  defp initial(:vec_active), do: nil
   defp initial(_key), do: %{}
 
   defp documents do
@@ -664,7 +947,18 @@ defmodule AgentDb.Test.Fakes.Storage do
   defp messages, do: state(:messages)
   defp hashes, do: state(:hashes)
   defp embeddings, do: state(:embeddings)
+  defp vec_active, do: state(:vec_active)
   defp jobs, do: state(:jobs)
+
+  # Drops a URI from every dim map, keeping empty dims around: a created table
+  # stays created, which is what the distinct-dim cap counts.
+  defp drop_vec_uri(maps, uri) do
+    Map.new(maps, fn {dim, by_uri} -> {dim, Map.delete(by_uri, uri)} end)
+  end
+
+  defp drop_vec_uris(maps, uris) do
+    Enum.reduce(uris, maps, fn uri, acc -> drop_vec_uri(acc, uri) end)
+  end
 
   # A document, and every directory above it, so the tree a write implies
   # exists.

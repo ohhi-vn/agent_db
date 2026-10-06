@@ -111,7 +111,11 @@ defmodule AgentDb.Observability.Sink do
   # it into a sorted list of strings looked tidier and cost more than the rest of
   # the handler put together: this runs on every measurement the store emits,
   # including one per node in a tree projection.
-  defp dimension(metadata), do: Map.take(metadata, [:operation, :kind, :role])
+  defp dimension(metadata) do
+    metadata
+    |> Map.take([:operation, :kind, :role])
+    |> Map.new(fn {k, v} -> {k, if(is_atom(v), do: v, else: :unknown)} end)
+  end
 
   defp count(family, dimension, outcome) do
     key = {:count, family, dimension, outcome}

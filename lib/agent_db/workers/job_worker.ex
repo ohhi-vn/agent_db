@@ -72,44 +72,64 @@ defmodule AgentDb.Workers.JobWorker do
   def init({handler, worker_id}) do
     # Asked for, not assumed: a worker that started without looking for work
     # would sit idle until something else happened to wake it.
-    {:ok, %{handler: handler, worker_id: worker_id}, {:continue, :work}}
+    {:ok, %{handler: handler, worker_id: worker_id, failures: 0}, {:continue, :work}}
   end
 
   @impl GenServer
   def handle_continue(:work, state) do
-    work(state)
-    {:noreply, state}
+    {:noreply, work(state)}
   end
 
   @impl GenServer
   def handle_info(:process_next, state) do
-    work(state)
-    {:noreply, state}
+    {:noreply, work(state)}
   end
 
   # An idle worker costs one wakeup every few seconds rather than one per job.
   @idle_poll_ms 5_000
+  @max_backoff_ms 60_000
 
   # How long to wait before looking again at a model that is still loading.
   @model_loading_delay_ms 1_000
 
   # A claim is followed immediately by another: work often arrives in batches
   # already queued, so idling between them would only add latency.
-  defp work(%{handler: handler, worker_id: worker_id}) do
-    case Runtime.storage().dequeue_job(handler.kinds()) do
-      {:ok, job} ->
-        :ok = process(Runtime.storage(), handler, job)
-        send(self(), :process_next)
+  defp work(%{handler: handler, worker_id: worker_id, failures: failures} = state) do
+    result =
+      try do
+        case Runtime.storage().dequeue_job(handler.kinds()) do
+          {:ok, job} ->
+            :ok = process(Runtime.storage(), handler, job)
+            send(self(), :process_next)
+            %{state | failures: 0}
 
-      {:error, :empty} ->
-        Process.send_after(self(), :process_next, @idle_poll_ms)
+          {:error, :empty} ->
+            Process.send_after(self(), :process_next, @idle_poll_ms)
+            %{state | failures: 0}
 
-      {:error, reason} ->
-        Logger.error("#{worker_id} dequeue error: #{inspect(reason)}")
-        Process.send_after(self(), :process_next, @idle_poll_ms)
-    end
+          {:error, reason} ->
+            Logger.error("#{worker_id} dequeue error: #{inspect(reason)}")
+            Process.send_after(self(), :process_next, backoff(failures))
+            %{state | failures: failures + 1}
+        end
+      rescue
+        error ->
+          Logger.error("#{worker_id} worker crashed, recovered: #{inspect(error)}")
+          Process.send_after(self(), :process_next, backoff(failures))
+          %{state | failures: failures + 1}
+      catch
+        kind, reason ->
+          Logger.error("#{worker_id} worker caught #{inspect(kind)}: #{inspect(reason)}")
+          Process.send_after(self(), :process_next, backoff(failures))
+          %{state | failures: failures + 1}
+      end
 
-    :ok
+    :ok = :ok
+    result
+  end
+
+  defp backoff(failures) do
+    min(@max_backoff_ms, @idle_poll_ms * Integer.pow(2, min(failures, 3)))
   end
 
   # The three outcomes are kept apart because the queue treats them differently.
@@ -123,10 +143,21 @@ defmodule AgentDb.Workers.JobWorker do
 
     Observability.with_span("agent_db.job", %{kind: job.kind}, fn ->
       outcome =
-        case handler.generate(job) do
-          {:ok, result} -> store(storage, handler, job, result)
-          {:error, :model_loading} -> defer(storage, job.id)
-          {:error, reason} -> fail(storage, job.id, reason)
+        try do
+          if job.kind in handler.kinds() do
+            case handler.generate(job) do
+              {:ok, result} -> store(storage, handler, job, result)
+              {:error, :model_loading} -> defer(storage, job.id)
+              {:error, reason} -> fail(storage, job.id, reason)
+              other -> fail(storage, job.id, {:invalid_job_result, other})
+            end
+          else
+            fail(storage, job.id, {:unknown_job_kind, job.kind})
+          end
+        rescue
+          error -> fail(storage, job.id, {:worker_crash, error.__struct__})
+        catch
+          kind, reason -> fail(storage, job.id, {:worker_catch, kind, reason})
         end
 
       execution = System.monotonic_time(:millisecond) - start
@@ -154,7 +185,16 @@ defmodule AgentDb.Workers.JobWorker do
   defp trace_id(_), do: nil
 
   defp store(storage, handler, job, result) do
-    case handler.store(job, result) do
+    outcome =
+      try do
+        handler.store(job, result)
+      rescue
+        error -> {:error, {:store_crash, error.__struct__}}
+      catch
+        kind, reason -> {:error, {:store_catch, kind, reason}}
+      end
+
+    case outcome do
       {:ok, :stored} ->
         # A read may already have cached the deterministic fallback, and a
         # summary that lands behind it would never be seen. Whoever writes has

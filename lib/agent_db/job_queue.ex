@@ -54,16 +54,24 @@ defmodule AgentDb.JobQueue do
   def enqueue(conn, kind, payload) do
     now = System.system_time(:millisecond)
 
-    case SQLite.exec_write(
-           conn,
-           """
-           INSERT INTO job_queue (kind, payload, status, scheduled_at, created_at, updated_at)
-           VALUES (?1, ?2, 'pending', ?3, ?3, ?3)
-           """,
-           [to_string(kind), Jason.encode!(payload), now]
-         ) do
-      :ok -> {:ok, last_insert_rowid(conn)}
-      {:error, _} = err -> err
+    with {:ok, json} <- encode_payload(payload),
+         :ok <-
+           SQLite.exec_write(
+             conn,
+             """
+             INSERT INTO job_queue (kind, payload, status, scheduled_at, created_at, updated_at)
+             VALUES (?1, ?2, 'pending', ?3, ?3, ?3)
+             """,
+             [to_string(kind), json, now]
+           ) do
+      {:ok, last_insert_rowid(conn)}
+    end
+  end
+
+  defp encode_payload(payload) do
+    case Jason.encode(payload) do
+      {:ok, _} = ok -> ok
+      {:error, reason} -> {:error, {:invalid_payload, reason}}
     end
   end
 
@@ -80,23 +88,38 @@ defmodule AgentDb.JobQueue do
   def enqueue_many(conn, jobs) do
     now = System.system_time(:millisecond)
 
-    {placeholders, args} =
-      jobs
-      |> Enum.with_index()
-      |> Enum.map(fn {{kind, payload}, i} ->
-        base = i * 3 + 1
+    with {:ok, encoded} <- encode_many(jobs) do
+      {placeholders, args} =
+        encoded
+        |> Enum.with_index()
+        |> Enum.map(fn {{kind, json}, i} ->
+          base = i * 3 + 1
 
-        {"(?#{base}, ?#{base + 1}, 'pending', ?#{base + 2}, ?#{base + 2}, ?#{base + 2})",
-         [to_string(kind), Jason.encode!(payload), now]}
-      end)
-      |> Enum.unzip()
+          {"(?#{base}, ?#{base + 1}, 'pending', ?#{base + 2}, ?#{base + 2}, ?#{base + 2})",
+           [to_string(kind), json, now]}
+        end)
+        |> Enum.unzip()
 
-    SQLite.exec_write(
-      conn,
-      "INSERT INTO job_queue (kind, payload, status, scheduled_at, created_at, updated_at) VALUES " <>
-        Enum.join(placeholders, ", "),
-      List.flatten(args)
-    )
+      SQLite.exec_write(
+        conn,
+        "INSERT INTO job_queue (kind, payload, status, scheduled_at, created_at, updated_at) VALUES " <>
+          Enum.join(placeholders, ", "),
+        List.flatten(args)
+      )
+    end
+  end
+
+  defp encode_many(jobs) do
+    Enum.reduce_while(jobs, {:ok, []}, fn {kind, payload}, {:ok, acc} ->
+      case Jason.encode(payload) do
+        {:ok, json} -> {:cont, {:ok, [{kind, json} | acc]}}
+        {:error, reason} -> {:halt, {:error, {:invalid_payload, reason}}}
+      end
+    end)
+    |> case do
+      {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
+      {:error, _} = err -> err
+    end
   end
 
   @doc """
@@ -135,31 +158,64 @@ defmodule AgentDb.JobQueue do
            [now]
          ) do
       {:ok, nil} ->
-        {:error, :empty}
+        case reap_unknown_kind(conn) do
+          :ok -> {:error, :empty}
+          {:error, :empty} -> {:error, :empty}
+          {:error, _} = err -> err
+        end
 
       {:ok, [job_id, kind, payload_json, attempts, max_attempts, scheduled_at]} ->
         case claim_row(conn, job_id, attempts + 1) do
           :claimed ->
-            {:ok,
-             %{
-               id: job_id,
-               kind: kind(kind),
-               payload: Jason.decode!(payload_json),
-               attempts: attempts + 1,
-               max_attempts: max_attempts,
-               queued_at: scheduled_at,
-               claimed_at: now
-             }}
+            case Jason.decode(payload_json) do
+              {:ok, payload} ->
+                {:ok,
+                 %{
+                   id: job_id,
+                   kind: kind(kind),
+                   payload: payload,
+                   attempts: attempts + 1,
+                   max_attempts: max_attempts,
+                   queued_at: scheduled_at,
+                   claimed_at: now
+                 }}
+
+              {:error, reason} ->
+                _ = fail(conn, job_id, "invalid_payload")
+                _ = reason
+                {:error, :empty}
+            end
 
           :lost when attempts_left > 1 ->
             claim(conn, kinds, attempts_left - 1)
 
           :lost ->
             {:error, :empty}
+
+          {:error, _} = err ->
+            err
         end
 
       {:error, _} = err ->
         err
+    end
+  end
+
+  defp reap_unknown_kind(conn) do
+    case SQLite.query_one(
+           conn,
+           """
+           SELECT id FROM job_queue
+           WHERE status = 'pending'
+             AND kind NOT IN ('embed', 'summarize_abstract', 'summarize_overview')
+           ORDER BY scheduled_at ASC
+           LIMIT 1
+           """,
+           []
+         ) do
+      {:ok, nil} -> {:error, :empty}
+      {:ok, [job_id]} -> fail(conn, job_id, "unknown_job_kind")
+      {:error, _} = err -> err
     end
   end
 
@@ -288,7 +344,7 @@ defmodule AgentDb.JobQueue do
 
     SQLite.exec_write(
       conn,
-      "UPDATE job_queue SET status = 'pending', attempts = 0, scheduled_at = ?1, updated_at = ?1 WHERE status = 'running'",
+      "UPDATE job_queue SET status = 'pending', scheduled_at = ?1, updated_at = ?1 WHERE status = 'running'",
       [now]
     )
   end

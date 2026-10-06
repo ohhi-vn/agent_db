@@ -24,8 +24,13 @@ defmodule AgentDb.Adapters.Inference do
       # Float32 bytes rather than tensors: the store only ever persists a
       # vector, and keeping the numeric type out of the contract means a
       # provider is free to compute its vectors however it likes.
-      {:ok, tensors} -> {:ok, Enum.map(tensors, &:erlang.iolist_to_binary(Nx.to_binary(&1)))}
-      {:error, _} = err -> err
+      {:ok, tensors} ->
+        vectors = Enum.map(tensors, &:erlang.iolist_to_binary(Nx.to_binary(&1)))
+        Enum.each(vectors, &AgentDb.Adapters.Inference.ObservedDim.observe(:local, &1))
+        {:ok, vectors}
+
+      {:error, _} = err ->
+        err
     end
   end
 

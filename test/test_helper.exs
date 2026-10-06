@@ -30,5 +30,6 @@ Code.require_file("support/ml_fakes.ex", __DIR__)
 Code.require_file("support/provider_fakes.ex", __DIR__)
 Code.require_file("support/storage_contract.ex", __DIR__)
 Code.require_file("support/scratch.ex", __DIR__)
+Code.require_file("support/memory_ranking_fixture.ex", __DIR__)
 
 ExUnit.start()

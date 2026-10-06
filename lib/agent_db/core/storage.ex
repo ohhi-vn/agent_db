@@ -49,10 +49,19 @@ defmodule AgentDb.Core.Storage do
           uri: String.t(),
           value: String.t(),
           confidence: float(),
+          importance: float() | nil,
           source: String.t() | nil,
-          status: :active | :superseded,
+          status: :active | :superseded | :candidate,
           supersedes: integer() | nil,
+          last_surfaced_at: integer() | nil,
           updated_at: integer()
+        }
+
+  @typedoc "Two active memories at distinct URIs that may conflict."
+  @type memory_conflict :: %{
+          uri_a: String.t(),
+          uri_b: String.t(),
+          similarity: float()
         }
 
   @typedoc "One message of a session, in order."
@@ -222,16 +231,48 @@ defmodule AgentDb.Core.Storage do
   @callback put_commit(String.t(), String.t(), String.t(), String.t()) ::
               {:ok, :ok} | {:error, term()}
 
-  @doc "Writes a memory's document and its assertion together, so a URI never holds a document no assertion backs."
-  @callback put_memory(String.t(), String.t(), float(), String.t() | nil) ::
+  @doc """
+  Writes a memory's document and its assertion together, so a URI never holds a document no assertion backs.
+
+  `opts` carries `:importance` (0.0..1.0, defaults when absent) and `:status`
+  (`:active` by default, or `:candidate` for a record awaiting promotion).
+  Implementations SHOULD accept the options as a trailing keyword with a
+  default, so callers that pass none keep working unchanged.
+  """
+  @callback put_memory(String.t(), String.t(), float(), String.t() | nil, keyword()) ::
               {:ok, :ok} | {:error, term()}
 
   @doc "Assertions at `prefix` or beneath it, most confident first."
-  @callback recall_memories(String.t(), String.t() | nil, [:active | :superseded]) ::
+  @callback recall_memories(String.t(), String.t() | nil, [
+              :active | :superseded | :candidate
+            ]) ::
               {:ok, [memory_row()]} | {:error, term()}
 
-  @doc "Whether any assertion is recorded at `uri`, superseded ones included."
+  @doc "Whether any assertion is recorded at `uri`, superseded and candidate ones included."
   @callback memory_recorded?(String.t()) :: {:ok, boolean()} | {:error, term()}
+
+  @doc """
+  Promotes the latest candidate at `uri` to the active assertion, superseding
+  any prior active one. `{:error, :no_candidate}` when none is waiting.
+  """
+  @callback promote_memory(String.t()) :: {:ok, :promoted} | {:error, term()}
+
+  @doc """
+  Removes candidate assertions at `uri` without a trace. Active and superseded
+  history is untouched. `{:error, :no_candidate}` when none is waiting.
+  """
+  @callback reject_memory_candidate(String.t()) :: :ok | {:error, term()}
+
+  @doc "Records that the assertions with these ids were surfaced by a recall."
+  @callback mark_memories_surfaced([integer()]) :: :ok | {:error, term()}
+
+  @doc """
+  Pairs of active memories beneath `prefix` whose values are similar enough to
+  be possible conflicts. Reuses stored vectors and runs no inference.
+  `{:error, :embeddings_unavailable}` when conflicts cannot be evaluated.
+  """
+  @callback memory_conflict_pairs(String.t()) ::
+              {:ok, [memory_conflict()]} | {:error, term()}
 
   @doc "Records durable background work."
   @callback enqueue_job(atom(), map()) :: {:ok, integer()} | {:error, term()}

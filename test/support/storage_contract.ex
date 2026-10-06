@@ -94,6 +94,38 @@ defmodule AgentDb.StorageContract.Helpers do
     :ok
   end
 
+  @doc """
+  Stores float vectors for URIs through the job flow, for tests that need
+  vectors behind stored content. Outcomes are ignored: a provider without a
+  vector index discards the result, which is exactly what such tests branch on.
+  """
+  def store_vectors(storage, vectors_by_uri) do
+    for {uri, vec} <- vectors_by_uri do
+      {:ok, job_id} = storage.enqueue_job(:embed, %{uri: uri, content: ""})
+      {:ok, _job} = storage.dequeue_job([:embed])
+      _ = storage.put_embedding_result(job_id, uri, encode_vector(vec))
+    end
+
+    :ok
+  end
+
+  @doc "Encodes float lists as the float32 bytes the ports exchange."
+  def encode_vector(vec) when is_list(vec) do
+    for x <- vec, into: <<>>, do: <<x::float-32>>
+  end
+
+  @doc "Claims every runnable job of `kinds`, oldest first, for inspection."
+  def drain_jobs(storage, kinds) do
+    Stream.unfold(nil, fn _ ->
+      case storage.dequeue_job(kinds) do
+        {:ok, job} -> {job, nil}
+        {:error, :empty} -> nil
+        {:error, _} -> nil
+      end
+    end)
+    |> Enum.to_list()
+  end
+
   defp worker_children(handler \\ nil) do
     case Process.whereis(AgentDb.Supervisor) do
       nil ->
@@ -750,6 +782,108 @@ defmodule AgentDb.StorageContract do
           assert {:ok, false} =
                    storage().memory_recorded?("viking://user/memories/profile/nobody")
         end
+
+        test "a candidate waits outside default recall until promoted" do
+          uri = "viking://user/memories/preferences/language"
+
+          assert :ok = storage().put_memory(uri, "prefers Elixir", 0.9, nil, status: :candidate)
+
+          # Hidden from the default active read, visible on request.
+          assert {:ok, []} = storage().recall_memories(uri, nil, [:active])
+
+          assert {:ok, [waiting]} = storage().recall_memories(uri, nil, [:candidate])
+          assert waiting.value == "prefers Elixir"
+          assert waiting.status == :candidate
+
+          # A candidate counts as recorded, so rejecting it is not "no memory".
+          assert {:ok, true} = storage().memory_recorded?(uri)
+
+          assert {:ok, :promoted} = storage().promote_memory(uri)
+
+          assert {:ok, [active]} = storage().recall_memories(uri, nil, [:active])
+          assert active.value == "prefers Elixir"
+          assert active.status == :active
+
+          assert {:error, :no_candidate} = storage().promote_memory(uri)
+        end
+
+        test "a rejected candidate leaves no trace while an active belief survives" do
+          fresh = "viking://user/memories/preferences/theme"
+          held = "viking://user/memories/preferences/shell"
+
+          assert :ok = storage().put_memory(fresh, "dark mode", 0.9, nil, status: :candidate)
+          assert :ok = storage().put_memory(held, "prefers Zsh", 0.9, nil)
+          assert :ok = storage().put_memory(held, "prefers Fish", 0.9, nil, status: :candidate)
+
+          assert :ok = storage().reject_memory_candidate(fresh)
+
+          assert {:ok, []} =
+                   storage().recall_memories(fresh, nil, [:active, :superseded, :candidate])
+
+          assert {:ok, false} = storage().memory_recorded?(fresh)
+
+          assert :ok = storage().reject_memory_candidate(held)
+          assert {:ok, [active]} = storage().recall_memories(held, nil, [:active])
+          assert active.value == "prefers Zsh"
+
+          assert {:error, :no_candidate} = storage().reject_memory_candidate(held)
+        end
+
+        test "importance is persisted and surfacing is recorded" do
+          uri = "viking://user/memories/profile/name"
+          assert :ok = storage().put_memory(uri, "ada", 0.9, nil, importance: 0.8)
+
+          assert {:ok, [row]} = storage().recall_memories(uri, nil, [:active])
+          assert row.importance == 0.8
+          assert row.last_surfaced_at == nil
+
+          assert :ok = storage().mark_memories_surfaced([row.id])
+          assert :ok = storage().mark_memories_surfaced([])
+
+          assert {:ok, [touched]} = storage().recall_memories(uri, nil, [:active])
+          assert is_integer(touched.last_surfaced_at)
+        end
+
+        test "similar values at distinct URIs are reported as conflicts" do
+          a = "viking://user/memories/preferences/first"
+          b = "viking://user/memories/preferences/second"
+          c = "viking://user/memories/preferences/third"
+          d = "viking://user/memories/events/other"
+
+          for {uri, value} <- [
+                {a, "likes Elixir a lot"},
+                {b, "likes Elixir a lot"},
+                {c, "mutes notifications at night"},
+                {d, "likes Elixir a lot"}
+              ] do
+            assert :ok = storage().put_memory(uri, value, 0.9, nil)
+          end
+
+          # Near-identical vectors for the similar pair, orthogonal for the
+          # distinct value, near-identical for the other-type lookalike.
+          :ok =
+            AgentDb.StorageContract.Helpers.store_vectors(storage(), %{
+              a => [1.0, 0.0, 0.0, 0.0],
+              b => [0.99, 0.01, 0.0, 0.0],
+              c => [0.0, 0.0, 0.0, 1.0],
+              d => [0.99, 0.01, 0.0, 0.0]
+            })
+
+          # Scoped at the memories root so the other-type lookalike is in
+          # range: only same-type pairs may form.
+          case storage().memory_conflict_pairs("viking://user/memories") do
+            {:ok, pairs} ->
+              # Same-type near-duplicate reported; the distinct value and the
+              # other-type lookalike are not.
+              assert [%{uri_a: first, uri_b: second, similarity: sim}] = pairs
+              assert Enum.sort([first, second]) == Enum.sort([a, b])
+              assert sim > 0.9
+
+            {:error, :embeddings_unavailable} ->
+              # Hosts without the vector extension cannot evaluate.
+              :ok
+          end
+        end
       end
 
       describe "durable work" do
@@ -856,7 +990,7 @@ defmodule AgentDb.StorageContract do
           :ok = stop_workers()
 
           assert {:ok, job} = storage().dequeue_job([:embed])
-          assert job.attempts == 1
+          assert job.attempts == 2
         end
 
         test "queued work is reported by status" do
@@ -929,6 +1063,105 @@ defmodule AgentDb.StorageContract do
           end
 
           assert is_integer(vector.documents)
+        end
+
+        test "vectors route by blob dim and cross-dim queries are refused" do
+          a = "viking://resources/contract/dims/a.md"
+          b = "viking://resources/contract/dims/b.md"
+          assert :ok = storage().put_document(a, "alpha", [])
+          assert :ok = storage().put_document(b, "beta", [])
+
+          :ok =
+            AgentDb.StorageContract.Helpers.store_vectors(storage(), %{
+              a => [1.0, 0.0, 0.0, 0.0],
+              b => [1.0, 0.0]
+            })
+
+          assert {:ok, stats} = storage().vector_index_stats()
+
+          if stats.available and is_integer(stats.vectors) do
+            # Mixed dims land apart: each query finds its own dim's row.
+            assert {:ok, [hit_a]} =
+                     storage().search_vector(encode_vector([1.0, 0.0, 0.0, 0.0]), 10, nil)
+
+            assert hit_a.uri == a
+
+            assert {:ok, [hit_b]} = storage().search_vector(encode_vector([1.0, 0.0]), 10, nil)
+            assert hit_b.uri == b
+
+            # ...and a query from the other dim is refused, never misranked.
+            assert {:error, :dim_mismatch} =
+                     storage().search_vector(encode_vector([1.0, 0.0]), 10, nil)
+          else
+            # Without a vector index nothing routes anywhere.
+            assert {:error, :vector_index_unavailable} =
+                     storage().search_vector(encode_vector([1.0, 0.0, 0.0, 0.0]), 10, nil)
+          end
+        end
+
+        test "backfill enqueues only URIs missing in the active table" do
+          a = "viking://resources/contract/backfill/a.md"
+          b = "viking://resources/contract/backfill/b.md"
+          assert :ok = storage().put_document(a, "alpha", [])
+          assert :ok = storage().put_document(b, "beta", [])
+
+          :ok =
+            AgentDb.StorageContract.Helpers.store_vectors(storage(), %{
+              a => [1.0, 0.0, 0.0, 0.0]
+            })
+
+          assert {:ok, stats} = storage().vector_index_stats()
+
+          if stats.available and is_integer(stats.vectors) do
+            assert {:ok, 1} = storage().backfill_vector_index()
+            assert [claimed] = drain_jobs(storage(), [:embed])
+            assert claimed.payload["uri"] == b
+          else
+            # No active table, nothing to backfill into.
+            assert {:ok, 0} = storage().backfill_vector_index()
+          end
+        end
+
+        test "prune refuses the active dim and drops the rest" do
+          a = "viking://resources/contract/prune/a.md"
+          assert :ok = storage().put_document(a, "alpha", [])
+
+          :ok =
+            AgentDb.StorageContract.Helpers.store_vectors(storage(), %{
+              a => [1.0, 0.0, 0.0, 0.0]
+            })
+
+          assert {:ok, stats} = storage().vector_index_stats()
+
+          if stats.available and Map.get(stats, :active_dim) != :unknown and
+               not is_nil(Map.get(stats, :active_dim)) do
+            active = stats.active_dim
+            assert {:error, :active_dim} = storage().prune_vector_index(active)
+          else
+            # Nothing active, nothing to refuse.
+            assert :ok = storage().prune_vector_index(4)
+          end
+        end
+
+        test "coverage names the active dim and whether backfill is needed" do
+          a = "viking://resources/contract/coverage/a.md"
+          b = "viking://resources/contract/coverage/b.md"
+          assert :ok = storage().put_document(a, "alpha", [])
+          assert :ok = storage().put_document(b, "beta", [])
+
+          :ok =
+            AgentDb.StorageContract.Helpers.store_vectors(storage(), %{
+              a => [1.0, 0.0, 0.0, 0.0]
+            })
+
+          assert {:ok, stats} = storage().vector_index_stats()
+
+          if stats.available and is_integer(stats.vectors) do
+            assert is_integer(stats.active_dim)
+            assert stats.needs_backfill == true
+          else
+            assert stats.available == false
+          end
         end
       end
 

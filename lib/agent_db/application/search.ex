@@ -37,7 +37,7 @@ defmodule AgentDb.Application.Search do
     - `:mode` - `:keyword` (default), `:vector`, or `:hybrid`
     - `:scope` - a URI prefix to limit the search to one subtree
     - `:top_k` - maximum results (default 10)
-    - `:hybrid_weights` - `{keyword_weight, vector_weight}` (default `{0.5, 0.5}`)
+    - `:hybrid_weights` - `{keyword_weight, vector_weight}` or `[keyword: kw, vector: vw]` (default `{0.5, 0.5}`)
 
   A leg that cannot be served -- no vector index, or no embedding model -- is
   reported to the caller rather than raised, so a remote client gets an answer
@@ -219,7 +219,7 @@ defmodule AgentDb.Application.Search do
 
         with {:ok, keyword_results} <- keyword_result,
              {:ok, vector_results} <- vector_result do
-          weights = Keyword.get(opts, :hybrid_weights, @default_weights)
+          weights = normalize_weights(Keyword.get(opts, :hybrid_weights, @default_weights))
           {:ok, fuse(keyword_results, vector_results, weights) |> Enum.take(top_k(opts))}
         end
       end)
@@ -240,9 +240,27 @@ defmodule AgentDb.Application.Search do
     end
   end
 
+  # `hybrid_weights` accepts both `{kw, vw}` tuples and
+  # `[keyword: kw, vector: vw]` lists with identical meaning, normalized once
+  # here before fusion. Anything else falls back to the default rather than
+  # failing the search for a malformed weight.
+  defp normalize_weights({kw, vw})
+       when (is_number(kw) or is_float(kw) or is_integer(kw)) and
+              (is_number(vw) or is_float(vw) or is_integer(vw)) do
+    {kw, vw}
+  end
+
+  defp normalize_weights(weights) when is_list(weights) do
+    {Keyword.get(weights, :keyword, 0.5), Keyword.get(weights, :vector, 0.5)}
+  end
+
+  defp normalize_weights(_), do: @default_weights
+
   # Reciprocal rank fusion: each leg contributes 1/(rank + k), weighted. Ranking
   # is by position within a leg rather than by its score, so a keyword rank and
-  # a cosine distance are combined without having to be commensurable.
+  # a cosine distance are combined without having to be commensurable. The
+  # fused score is put rather than updated: a keyword-only hit carries no score
+  # of its own, and fusion must not crash on it.
   defp fuse(keyword_results, vector_results, {keyword_weight, vector_weight}) do
     keyword_ranks = ranks(keyword_results)
     vector_ranks = ranks(vector_results)
@@ -256,7 +274,7 @@ defmodule AgentDb.Application.Search do
         rank_score(keyword_ranks, uri, keyword_weight) +
           rank_score(vector_ranks, uri, vector_weight)
 
-      %{best(uri, keyword_results, vector_results) | score: score}
+      Map.put(best(uri, keyword_results, vector_results), :score, score)
     end)
     |> Enum.sort_by(&(-&1.score))
   end

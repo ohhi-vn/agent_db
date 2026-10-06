@@ -19,12 +19,12 @@ hand, so it cannot drift from the modules it describes.
 - **Keyword search** — Case-insensitive substring search over content/abstract/overview with subtree scoping and a bounded `top_k` (default 10, max 200; an out-of-range value is refused rather than ignored)
 - **Path discovery (`find`)** — Literal, case-insensitive URI-path match with subtree scoping and bounded results
 - **Content inspection (`grep`)** — Literal, case-insensitive L2-only line matches with subtree scoping and bounded excerpts
-- **Vector search** — Semantic similarity search via sqlite-vec (HNSW index) with 384-dim embeddings
-- **Hybrid search** — Reciprocal Rank Fusion of keyword + vector results
+- **Vector search** — Semantic similarity search via sqlite-vec (HNSW index) with dim-namespaced per-provider embedding tables; a query from a different dim is refused, never misranked
+- **Hybrid search** — Reciprocal Rank Fusion of keyword + vector results, weighted by `{keyword, vector}` tuple or `[keyword: _, vector: _]` list
 - **LLM summarization** — Auto-generates abstract/overview using a local model (Qwen3-0.6B by default, configurable)
 - **Async writes** — Immediate acknowledgement, background embedding/summarization jobs
 - **Sessions** — Append-only message lists with commit-to-context-tree
-- **Memory** — Typed, durable facts under `viking://user/memories/` with confidence, provenance, and supersession; recall and forgetting without a model
+- **Memory** — Typed, durable facts under `viking://user/memories/` with confidence, importance, provenance, and supersession; candidates awaiting promotion, read-only conflict surfacing, and decay-aware recall — all without a model
 - **Agent Skills** — Import a skill folder or tar archive into `viking://user/{id}/skills/`, from the console or a Mix task, replacing a same-named skill as a whole
 - **WebSocket API** — Phoenix Channel at `/api` with `v1.*` events, optional Bearer auth
 - **Fully local** — No external dependencies at runtime (models cached locally)
@@ -158,7 +158,9 @@ AgentDb.remember(uri, value, opts \\ [])
 ```
 
 - `:confidence` — 0.0..1.0, default `0.5` (`AgentDb.default_confidence/0`)
+- `:importance` — 0.0..1.0, default `0.5` (`AgentDb.Application.Memories.default_importance/0`)
 - `:source` — provenance, e.g. the originating session id
+- `:candidate` — record as a candidate awaiting promotion instead of active (default `false`); near-zero confidence and duplicate values also wait as candidates
 
 Returns `{:ok, uri}`, or an error naming the invalid type
 (`{:error, {:invalid_memory_type, type}}`), a URI outside the memories root
@@ -177,8 +179,38 @@ AgentDb.recall(uri: uri, include_superseded: true) # inspect a revision chain
 
 A scope matches the exact URI or anything beneath it, so
 `.../preferences` does not also reach a sibling named `preferences-extra`.
-Results are ordered by descending confidence; a recall matching nothing returns
-`{:ok, []}` rather than an error.
+Without a term, results are ordered by descending confidence; with a term,
+they are ordered by a blend of confidence and semantic similarity, with
+exact-substring matches boosted and stale, rarely-surfaced memories penalized.
+A recall matching nothing returns `{:ok, []}` rather than an error.
+
+Every recall records that its rows were surfaced. Entries carry `:importance`
+and `:last_surfaced_at` (`nil` means never surfaced) alongside the
+long-standing `:confidence`, `:source`, `:status`, and `:supersedes` chain.
+
+### Candidates, conflicts, and promotion
+
+```elixir
+{:ok, _} = AgentDb.remember("viking://user/memories/preferences/draft", "maybe Elixir", candidate: true)
+{:ok, []} = AgentDb.recall("viking://user/memories/preferences/draft")  # hidden until promoted
+
+{:ok, [waiting]} = AgentDb.pending_memory_candidates()   # review queue
+{:ok, _} = AgentDb.promote_memory("viking://user/memories/preferences/draft")
+
+{:ok, _} = AgentDb.remember("viking://user/memories/preferences/scratch", "maybe Go", candidate: true)
+:ok = AgentDb.reject_memory_candidate("viking://user/memories/preferences/scratch")  # no trace left
+```
+
+A rejected candidate removes its value, provenance, and history; beside an
+active belief the document is repaired to the active value, otherwise the
+whole subtree state goes. Possible contradictions between active memories at
+different URIs surface read-only, reusing stored vectors and running no
+inference:
+
+```elixir
+{:ok, [%{uri_a: _, uri_b: _, similarity: _}]} = AgentDb.memory_conflicts()
+{:error, :embeddings_unavailable} = AgentDb.memory_conflicts()  # nothing stored to compare
+```
 
 ### `forget/1`
 

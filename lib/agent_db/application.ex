@@ -45,6 +45,7 @@ defmodule AgentDb.Application do
     {:ok, supervisor} =
       Supervisor.start_link(children, strategy: :one_for_one, name: AgentDb.Supervisor)
 
+    AgentDb.Adapters.Inference.ObservedDim.reset()
     initialize()
 
     {:ok, supervisor}
@@ -131,7 +132,7 @@ defmodule AgentDb.Application do
 
   defp outstanding do
     case AgentDb.Runtime.storage().queue_stats() do
-      {:ok, stats} -> Map.get(stats, :pending, 0) + Map.get(stats, :running, 0)
+      {:ok, stats} -> Map.get(stats, :running, 0)
       {:error, _} -> 0
     end
   end
@@ -193,15 +194,33 @@ defmodule AgentDb.Application do
 
   defp boolean_env(name, default) do
     case System.get_env(name) do
-      nil -> default
-      value -> String.downcase(value) == "true"
+      nil ->
+        default
+
+      value ->
+        case String.downcase(String.trim(value)) do
+          "true" ->
+            true
+
+          "false" ->
+            false
+
+          _ ->
+            raise ArgumentError, "#{name} must be \"true\" or \"false\", got: #{inspect(value)}"
+        end
     end
   end
 
   defp integer_env(name, default) do
     case System.get_env(name) do
-      nil -> default
-      value -> String.to_integer(value)
+      nil ->
+        default
+
+      value ->
+        case Integer.parse(String.trim(value)) do
+          {int, ""} -> int
+          _ -> raise ArgumentError, "#{name} must be an integer, got: #{inspect(value)}"
+        end
     end
   end
 

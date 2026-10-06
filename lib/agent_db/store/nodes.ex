@@ -156,16 +156,50 @@ defmodule AgentDb.Store.Nodes do
     )
   end
 
-  # vec_nodes is a vec0 virtual table that only exists when sqlite-vec loaded.
+  # Vec tables only exist when sqlite-vec loaded. Every dim table plus legacy
+  # `vec_nodes` is purged so a removed URI leaves rows in none of them.
   defp delete_vec_nodes(conn, uri, prefix) do
     if SQLite.vec_available?(conn) do
-      SQLite.exec_write(
-        conn,
-        "DELETE FROM vec_nodes WHERE uri = ?1 OR uri LIKE ?2 ESCAPE '\\'",
-        [uri, prefix]
-      )
+      case SQLite.list_vec_dims(conn) do
+        {:ok, dims} ->
+          Enum.reduce_while(dims, :ok, fn dim, :ok ->
+            case SQLite.exec_write(
+                   conn,
+                   "DELETE FROM \"#{SQLite.vec_table(dim)}\" WHERE uri = ?1 OR uri LIKE ?2 ESCAPE '\\'",
+                   [uri, prefix]
+                 ) do
+              :ok -> {:cont, :ok}
+              {:error, _} = err -> {:halt, err}
+            end
+          end)
+          |> case do
+            :ok -> delete_legacy_vec_nodes(conn, uri, prefix)
+            {:error, _} = err -> err
+          end
+
+        {:error, _} = err ->
+          err
+      end
     else
       :ok
+    end
+  end
+
+  defp delete_legacy_vec_nodes(conn, uri, prefix) do
+    case SQLite.query_one(
+           conn,
+           "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'vec_nodes'",
+           []
+         ) do
+      {:ok, [1]} ->
+        SQLite.exec_write(
+          conn,
+          "DELETE FROM vec_nodes WHERE uri = ?1 OR uri LIKE ?2 ESCAPE '\\'",
+          [uri, prefix]
+        )
+
+      _ ->
+        :ok
     end
   end
 
@@ -278,9 +312,9 @@ defmodule AgentDb.Store.Nodes do
 
     sql =
       "SELECT uri, content FROM nodes WHERE kind = 'doc' AND lower(COALESCE(content, '')) LIKE ? ESCAPE '\\'" <>
-        scope_where <> " ORDER BY uri ASC"
+        scope_where <> " ORDER BY uri ASC LIMIT ?"
 
-    case SQLite.query(conn, sql, [pattern | scope_args]) do
+    case SQLite.query(conn, sql, [pattern | scope_args] ++ [limit]) do
       {:ok, rows} ->
         {:ok, line_hits(rows, query, limit)}
 

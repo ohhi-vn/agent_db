@@ -71,19 +71,20 @@ defmodule AgentDb.Observability do
   end
 
   @doc "Emits a job queue/execution measurement with queue-wait vs execution split."
-  @spec emit_job(atom(), :ok | :error | atom(), non_neg_integer(), non_neg_integer()) :: :ok
+  @spec emit_job(atom() | term(), :ok | :error | atom(), non_neg_integer(), non_neg_integer()) ::
+          :ok
   def emit_job(kind, outcome, queue_wait_ms, execution_ms) do
     safe_emit(@job_event, %{queue_wait_ms: queue_wait_ms, execution_ms: execution_ms}, %{
-      kind: kind,
+      kind: bounded_kind(kind),
       outcome: normalize_outcome(outcome)
     })
   end
 
   @doc "Emits a model load/inference measurement."
-  @spec emit_model(atom(), atom(), non_neg_integer()) :: :ok
+  @spec emit_model(atom() | term(), atom(), non_neg_integer()) :: :ok
   def emit_model(role, outcome, duration_ms) do
     safe_emit(@model_event, %{duration_ms: duration_ms}, %{
-      role: role,
+      role: bounded_kind(role),
       outcome: normalize_outcome(outcome)
     })
   end
@@ -211,6 +212,9 @@ defmodule AgentDb.Observability do
         :job_id
       ])
       |> Keyword.update(:reason, nil, &classify_reason/1)
+      |> Keyword.update(:kind, nil, &bounded_kind/1)
+      |> Keyword.update(:operation, nil, &bounded_kind/1)
+      |> Keyword.update(:role, nil, &bounded_kind/1)
 
     try do
       Logger.log(level, "agent_db", safe)
@@ -259,6 +263,7 @@ defmodule AgentDb.Observability do
     :invalid_scope,
     :invalid_json,
     :invalid_argument,
+    :invalid_payload,
     :not_a_memory_uri,
     :is_root,
     :missing_argument,
@@ -278,13 +283,32 @@ defmodule AgentDb.Observability do
   @spec http_status(term()) :: 400 | 401 | 404 | 413 | 422 | 429 | 500 | 503
   def http_status(reason) do
     case error_tag(reason) do
-      tag when tag in [:not_found, :no_memory] -> 404
-      :unauthorized -> 401
-      tag when tag in [:model_loading, :background_jobs_pending] -> 503
-      tag when tag in [:too_large, :too_big, :too_many_entries] -> 413
-      :rate_limited -> 429
-      tag when tag in @caller_error_tags -> 422
-      _ -> 500
+      tag when tag in [:not_found, :no_memory, :assertion_not_found] ->
+        404
+
+      :unauthorized ->
+        401
+
+      tag
+      when tag in [
+             :model_loading,
+             :background_jobs_pending,
+             :vector_index_unavailable,
+             :storage_busy
+           ] ->
+        503
+
+      tag when tag in [:too_large, :too_big, :too_many_entries] ->
+        413
+
+      :rate_limited ->
+        429
+
+      tag when tag in @caller_error_tags ->
+        422
+
+      _ ->
+        500
     end
   end
 
@@ -314,13 +338,14 @@ defmodule AgentDb.Observability do
   Always encodable (a plain string), so no error term can break an encoder.
   """
   @spec error_message(term()) :: String.t()
-  def error_message(:model_loading), do: "model_loading"
-  def error_message(reason) when is_binary(reason), do: reason
   def error_message(reason), do: Atom.to_string(error_tag(reason))
 
   defp error_tag({tag, _detail}) when is_atom(tag), do: tag
   defp error_tag(tag) when is_atom(tag), do: tag
   defp error_tag(_), do: :error
+
+  defp bounded_kind(kind) when is_atom(kind), do: kind
+  defp bounded_kind(_), do: :unknown
 
   defp emit_operation(operation, outcome, start, meta) do
     duration = System.monotonic_time(:millisecond) - start
@@ -328,7 +353,11 @@ defmodule AgentDb.Observability do
     safe_meta =
       meta
       |> Map.take([:kind, :role])
-      |> Map.merge(%{operation: operation, outcome: normalize_outcome(outcome)})
+      |> Map.new(fn {k, v} -> {k, bounded_kind(v)} end)
+      |> Map.merge(%{
+        operation: bounded_kind(operation),
+        outcome: normalize_outcome(outcome)
+      })
 
     safe_emit(@operation_event, %{duration_ms: duration}, safe_meta)
   end

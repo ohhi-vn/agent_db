@@ -206,32 +206,48 @@ defmodule AgentDb.Adapters.SQLite do
   end
 
   # Embedding is computed successfully but there may be nowhere to put it: the
-  # vec table exists only with the sqlite-vec extension. The work is finished,
+  # vec tables exist only with the sqlite-vec extension. The work is finished,
   # its result is simply not wanted, so the job completes rather than failing
-  # and retrying an outcome that can never differ.
+  # and retrying an outcome that can never differ. Routing is per-request from
+  # the blob itself (`dim = byte_size(blob)/4`); no cached pointer decides it.
   defp store_embedding(conn, job_id, uri, embedding) do
     if SQLite.vec_available?(conn) do
-      insert_embedding(conn, job_id, uri, embedding)
+      case SQLite.vec_dim(embedding) do
+        {:ok, dim} -> insert_embedding(conn, job_id, uri, embedding, dim)
+        {:error, _} = err -> err
+      end
     else
       discard(conn, job_id)
     end
   end
 
-  defp insert_embedding(conn, job_id, uri, embedding) do
-    result =
-      SQLite.exec_write(
-        conn,
-        """
-        INSERT INTO vec_nodes (embedding, uri)
-        VALUES (?1, ?2)
-        ON CONFLICT(uri) DO UPDATE SET embedding = excluded.embedding
-        """,
-        [embedding, uri]
-      )
+  defp insert_embedding(conn, job_id, uri, embedding, dim) do
+    with :ok <- SQLite.ensure_vec_table(conn, dim) do
+      table = SQLite.vec_table(dim)
 
-    finish(result, conn, job_id, fn ->
-      Nodes.update_updated_at(conn, uri, System.system_time(:millisecond))
-    end)
+      result =
+        SQLite.exec_write(
+          conn,
+          """
+          INSERT INTO "#{table}" (embedding, uri)
+          VALUES (?1, ?2)
+          ON CONFLICT(uri) DO UPDATE SET embedding = excluded.embedding
+          """,
+          [embedding, uri]
+        )
+
+      case result do
+        :ok ->
+          _ = SQLite.set_active_dim(conn, dim)
+
+          finish(result, conn, job_id, fn ->
+            Nodes.update_updated_at(conn, uri, System.system_time(:millisecond))
+          end)
+
+        {:error, _} = err ->
+          err
+      end
+    end
   end
 
   defp store_layer(conn, job_id, uri, layer, text) do
@@ -286,23 +302,48 @@ defmodule AgentDb.Adapters.SQLite do
     Reader.read(fn conn -> vector_search(conn, query, top_k, scope_prefix) end)
   end
 
-  # The vec table exists only when the sqlite-vec extension loaded, and a
-  # query against it without the extension fails with the engine's own SQL
+  # The vec tables exist only when the sqlite-vec extension loaded, and a
+  # query against them without the extension fails with the engine's own SQL
   # error text. That is not a reason a caller can act on, so the leg reports
-  # itself as unservable instead.
+  # itself as unservable instead. A query whose dim differs from the active
+  # table is refused, never misranked across dims.
   defp vector_search(conn, query, top_k, scope_prefix) do
     if SQLite.vec_available?(conn) do
-      run_vector_search(conn, query, top_k, scope_prefix)
+      with {:ok, query_dim} <- SQLite.vec_dim(query),
+           {:ok, active} <- SQLite.get_active_dim(conn) do
+        cond do
+          active != :unknown and query_dim != active ->
+            {:error, :dim_mismatch}
+
+          not vec_table_exists?(conn, SQLite.vec_table(query_dim)) ->
+            {:ok, []}
+
+          true ->
+            run_vector_search(conn, query, top_k, scope_prefix, SQLite.vec_table(query_dim))
+        end
+      else
+        {:error, {:invalid_dim, _}} = err -> err
+        {:error, _} = err -> err
+      end
     else
       {:error, :vector_index_unavailable}
     end
   end
 
-  defp run_vector_search(conn, query, top_k, scope_prefix) do
+  defp vec_table_exists?(conn, table) do
+    case SQLite.query_one(conn, "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1", [
+           table
+         ]) do
+      {:ok, [1]} -> true
+      _ -> false
+    end
+  end
+
+  defp run_vector_search(conn, query, top_k, scope_prefix, table) do
     base_query = """
       SELECT n.uri, n.parent_uri, n.name, n.kind, n.content, n.abstract, n.overview,
              vec_distance_cosine(v.embedding, ?1) as distance
-      FROM vec_nodes v
+      FROM "#{table}" v
       JOIN nodes n ON n.uri = v.uri
       WHERE n.kind = 'doc'
     """
@@ -397,13 +438,13 @@ defmodule AgentDb.Adapters.SQLite do
   # -- memories --
 
   @impl true
-  def put_memory(uri, value, confidence, source) do
+  def put_memory(uri, value, confidence, source, opts \\ []) do
     with {:ok, segments} <- AgentDb.URI.parse(uri) do
       Writer.call(fn conn ->
         with :ok <- ensure_parents(conn, segments),
              :ok <-
                Nodes.upsert_doc(conn, uri, parent_uri(segments), List.last(segments), value, []),
-             {:ok, _row} <- Memories.record(conn, uri, value, confidence, source) do
+             {:ok, _row} <- Memories.record(conn, uri, value, confidence, source, opts) do
           :ok
         else
           {:error, _} = err -> err
@@ -421,6 +462,126 @@ defmodule AgentDb.Adapters.SQLite do
   def memory_recorded?(uri) do
     Reader.read(fn conn -> Memories.exists_at?(conn, uri) end)
   end
+
+  @impl true
+  def promote_memory(uri) do
+    Writer.call(fn conn ->
+      case Memories.promote_candidate(conn, uri) do
+        {:ok, _row} -> {:ok, :promoted}
+        {:error, _} = err -> err
+      end
+    end)
+  end
+
+  # A rejected candidate leaves nothing behind. Recording it overwrote the
+  # node document with the candidate value, so with no assertion left the
+  # whole subtree state goes (the same purge a forget gets); with an active
+  # belief remaining, the document is repaired to the active value.
+  @impl true
+  def reject_memory_candidate(uri) do
+    with {:ok, segments} <- AgentDb.URI.parse(uri) do
+      Writer.call(fn conn -> reject_candidate_state(conn, segments, uri) end)
+    end
+  end
+
+  defp reject_candidate_state(conn, segments, uri) do
+    with :ok <- Memories.reject_candidate(conn, uri),
+         {:ok, active} <- Memories.active_at(conn, uri) do
+      if active == nil do
+        Nodes.purge_subtree(conn, uri)
+      else
+        Nodes.upsert_doc(conn, uri, parent_uri(segments), List.last(segments), active.value, [])
+      end
+    end
+  end
+
+  @impl true
+  def mark_memories_surfaced(ids) do
+    Writer.call(fn conn -> Memories.mark_surfaced(conn, ids, System.system_time(:millisecond)) end)
+  end
+
+  # Conflict detection reuses vectors already stored for memory URIs and runs
+  # no inference of its own. Only same-type pairs are compared, which bounds
+  # the quadratic scan by the taxonomy's own filing. A memory with no stored
+  # vector is skipped; when none has one there is nothing to compare, which
+  # is reported as unevaluable rather than as an empty verdict.
+  @conflict_similarity 0.9
+
+  @impl true
+  def memory_conflict_pairs(prefix) do
+    Reader.read(fn conn -> conflict_pairs(conn, prefix) end)
+  end
+
+  defp conflict_pairs(conn, prefix) do
+    if SQLite.vec_available?(conn) do
+      with {:ok, active_dim} <- SQLite.get_active_dim(conn),
+           {:ok, rows} <- Memories.list(conn, prefix, nil, [:active]) do
+        pairs_in_dim(conn, rows, active_dim)
+      end
+    else
+      {:error, :embeddings_unavailable}
+    end
+  end
+
+  defp pairs_in_dim(_conn, _rows, :unknown), do: {:error, :embeddings_unavailable}
+
+  defp pairs_in_dim(conn, rows, dim) do
+    table = SQLite.vec_table(dim)
+
+    with {:ok, vectors} <- vectors_for(conn, table, rows) do
+      if map_size(vectors) < 2 do
+        {:error, :embeddings_unavailable}
+      else
+        {:ok, similar_pairs(rows, vectors)}
+      end
+    end
+  end
+
+  defp vectors_for(conn, table, rows) do
+    Enum.reduce_while(rows, {:ok, %{}}, fn row, {:ok, acc} ->
+      case SQLite.query_one(conn, "SELECT embedding FROM \"#{table}\" WHERE uri = ?1", [row.uri]) do
+        {:ok, nil} -> {:cont, {:ok, acc}}
+        {:ok, [blob]} -> {:cont, {:ok, Map.put(acc, row.uri, blob)}}
+        {:error, _} = err -> {:halt, err}
+      end
+    end)
+  end
+
+  defp similar_pairs(rows, vectors) do
+    uris = rows |> Enum.map(& &1.uri) |> Enum.filter(&Map.has_key?(vectors, &1)) |> Enum.uniq()
+
+    for a <- uris,
+        b <- uris,
+        a < b,
+        same_memory_type?(a, b),
+        (sim = cosine(Map.fetch!(vectors, a), Map.fetch!(vectors, b))) >= @conflict_similarity do
+      %{uri_a: a, uri_b: b, similarity: sim}
+    end
+    |> Enum.sort_by(& &1.similarity, :desc)
+  end
+
+  defp same_memory_type?(a, b), do: memory_type(a) == memory_type(b) and memory_type(a) != nil
+
+  defp memory_type(uri) do
+    case AgentDb.URI.parse(uri) do
+      {:ok, ["user", "memories", type | _rest]} -> type
+      _ -> nil
+    end
+  end
+
+  defp cosine(a, b)
+       when is_binary(a) and is_binary(b) and byte_size(a) > 0 and
+              byte_size(a) == byte_size(b) and rem(byte_size(a), 4) == 0 do
+    xs = for <<x::float-32 <- a>>, do: x
+    ys = for <<y::float-32 <- b>>, do: y
+    dot = Enum.zip(xs, ys) |> Enum.map(fn {x, y} -> x * y end) |> Enum.sum()
+    nx = :math.sqrt(Enum.map(xs, &(&1 * &1)) |> Enum.sum())
+    ny = :math.sqrt(Enum.map(ys, &(&1 * &1)) |> Enum.sum())
+
+    if nx == 0.0 or ny == 0.0, do: 0.0, else: dot / (nx * ny)
+  end
+
+  defp cosine(_, _), do: 0.0
 
   # -- durable work --
 
@@ -495,15 +656,141 @@ defmodule AgentDb.Adapters.SQLite do
 
   # "The index is unavailable" and "the index holds nothing" are different
   # facts, and only the first of them means vector search cannot be served.
+  # Reports the active dim, its vector count, the document count, and whether
+  # URIs are missing from the active table.
   defp vector_counts(conn, documents) do
     if SQLite.vec_available?(conn) do
-      case SQLite.query_one(conn, "SELECT COUNT(*) FROM vec_nodes", []) do
-        {:ok, [vectors]} -> {:ok, %{available: true, vectors: vectors, documents: documents}}
+      with {:ok, active} <- SQLite.get_active_dim(conn) do
+        case active do
+          :unknown ->
+            {:ok,
+             %{
+               available: true,
+               active_dim: :unknown,
+               vectors: 0,
+               documents: documents,
+               needs_backfill: documents > 0
+             }}
+
+          dim ->
+            table = SQLite.vec_table(dim)
+
+            case SQLite.query_one(conn, "SELECT COUNT(*) FROM \"#{table}\"", []) do
+              {:ok, [vectors]} ->
+                {:ok,
+                 %{
+                   available: true,
+                   active_dim: dim,
+                   vectors: vectors,
+                   documents: documents,
+                   needs_backfill: needs_backfill?(conn, table)
+                 }}
+
+              {:error, _} ->
+                {:ok,
+                 %{
+                   available: true,
+                   active_dim: dim,
+                   vectors: 0,
+                   documents: documents,
+                   needs_backfill: documents > 0
+                 }}
+            end
+        end
+      end
+    else
+      {:ok,
+       %{
+         available: false,
+         active_dim: :unknown,
+         vectors: nil,
+         documents: documents,
+         needs_backfill: false
+       }}
+    end
+  end
+
+  defp needs_backfill?(conn, table) do
+    case SQLite.query_one(
+           conn,
+           "SELECT EXISTS(SELECT 1 FROM nodes WHERE kind = 'doc' AND uri NOT IN (SELECT uri FROM \"#{table}\"))",
+           []
+         ) do
+      {:ok, [1]} -> true
+      _ -> false
+    end
+  end
+
+  @doc """
+  Enqueues `:embed` jobs only for URIs missing in the active dim table.
+
+  Switching dims creates the new table if missing and backfills the diff;
+  URIs already covered are never re-enqueued, and older dim tables are
+  retained for cheap switch-back.
+  """
+  @spec backfill_vector_index() :: {:ok, non_neg_integer()} | {:error, term()}
+  def backfill_vector_index do
+    Reader.read(fn conn ->
+      with {:ok, active} <- SQLite.get_active_dim(conn),
+           {:ok, docs} <- missing_uris(conn, active) do
+        {:ok, {active, docs}}
+      end
+    end)
+    |> case do
+      {:ok, {:unknown, _}} -> {:ok, 0}
+      {:ok, {active, docs}} -> enqueue_backfill(active, docs)
+      {:error, _} = err -> err
+    end
+  end
+
+  defp missing_uris(_conn, :unknown), do: {:ok, []}
+
+  defp missing_uris(conn, dim) do
+    table = SQLite.vec_table(dim)
+
+    if vec_table_exists?(conn, table) do
+      case SQLite.query(
+             conn,
+             "SELECT uri, content FROM nodes WHERE kind = 'doc' AND uri NOT IN (SELECT uri FROM \"#{table}\")",
+             []
+           ) do
+        {:ok, rows} -> {:ok, Enum.map(rows, fn [uri, content] -> {uri, content} end)}
         {:error, _} = err -> err
       end
     else
-      {:ok, %{available: false, vectors: nil, documents: documents}}
+      case SQLite.query(conn, "SELECT uri, content FROM nodes WHERE kind = 'doc'", []) do
+        {:ok, rows} -> {:ok, Enum.map(rows, fn [uri, content] -> {uri, content} end)}
+        {:error, _} = err -> err
+      end
     end
+  end
+
+  defp enqueue_backfill(active, docs) do
+    # Ensure the active table exists before jobs land, so the first write does
+    # not race creation. Inert without the extension.
+    _ =
+      AgentDb.Store.Writer.call(fn conn ->
+        if SQLite.vec_available?(conn) and active != :unknown do
+          _ = SQLite.ensure_vec_table(conn, active)
+        end
+
+        :ok
+      end)
+
+    Enum.reduce_while(docs, {:ok, 0}, fn {uri, content}, {:ok, n} ->
+      case enqueue_job(:embed, %{uri: uri, content: content || ""}) do
+        {:ok, _} -> {:cont, {:ok, n + 1}}
+        {:error, _} = err -> {:halt, err}
+      end
+    end)
+  end
+
+  @doc """
+  Drops a non-active dim table. Refuses the active dim; boot never wipes.
+  """
+  @spec prune_vector_index(pos_integer()) :: :ok | {:error, term()}
+  def prune_vector_index(dim) do
+    AgentDb.Store.Writer.call(fn conn -> SQLite.prune_vec_table(conn, dim) end)
   end
 
   @impl true

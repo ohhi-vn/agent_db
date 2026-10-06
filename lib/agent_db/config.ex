@@ -165,6 +165,18 @@ defmodule AgentDb.Config do
     Application.get_env(:agent_db, :openai_api_key) || System.get_env("AGENT_DB_OPENAI_API_KEY")
   end
 
+  @spec openai_embed_model() :: String.t()
+  def openai_embed_model do
+    Application.get_env(:agent_db, :openai_embed_model) ||
+      System.get_env("AGENT_DB_OPENAI_EMBED_MODEL") || "openai-compatible"
+  end
+
+  @spec openai_llm_model() :: String.t()
+  def openai_llm_model do
+    Application.get_env(:agent_db, :openai_llm_model) ||
+      System.get_env("AGENT_DB_OPENAI_LLM_MODEL") || "openai-compatible"
+  end
+
   @spec http_enabled() :: boolean()
   def http_enabled do
     Application.get_env(:agent_db, :http_enabled, true)

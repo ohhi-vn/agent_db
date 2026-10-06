@@ -109,10 +109,22 @@ defmodule AgentDb.Cache do
   end
 
   defp matching_keys(table, prefix) do
-    for {key, _value} <- :ets.tab2list(table),
-        is_binary(key),
-        String.starts_with?(key, prefix),
-        do: key
+    case :ets.whereis(table) do
+      :undefined ->
+        []
+
+      _ ->
+        keys =
+          try do
+            :ets.select(table, [{{:"$1", :_}, [], [:"$1"]}])
+          rescue
+            _ -> []
+          catch
+            _, _ -> []
+          end
+
+        Enum.filter(keys, &(is_binary(&1) and String.starts_with?(&1, prefix)))
+    end
   end
 
   # -- whole-cache operations --

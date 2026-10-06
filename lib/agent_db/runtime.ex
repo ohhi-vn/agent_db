@@ -116,6 +116,32 @@ defmodule AgentDb.Runtime do
       end
     end)
 
+    validate_numeric_config!()
+
+    :ok
+  end
+
+  defp validate_numeric_config! do
+    workers = Config.job_workers()
+
+    unless is_integer(workers) and workers > 0 do
+      raise ArgumentError, "job_workers must be a positive integer, got: #{inspect(workers)}"
+    end
+
+    grace = Config.shutdown_grace_ms()
+
+    unless is_integer(grace) and grace >= 0 do
+      raise ArgumentError,
+            "shutdown_grace_ms must be a non-negative integer, got: #{inspect(grace)}"
+    end
+
+    concurrency = Config.inference_concurrency()
+
+    unless is_integer(concurrency) and concurrency > 0 do
+      raise ArgumentError,
+            "inference_concurrency must be a positive integer, got: #{inspect(concurrency)}"
+    end
+
     :ok
   end
 

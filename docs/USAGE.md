@@ -45,7 +45,8 @@ non-empty line for abstract, first 280 chars for overview).
 ```
 
 - Default `mode: :keyword` (no model needed). `:vector` needs embeddings;
-  `:hybrid` fuses both with `hybrid_weights: {0.5, 0.5}`.
+  `:hybrid` fuses both with `hybrid_weights: {0.5, 0.5}` (or the identical
+  `[keyword: 0.5, vector: 0.5]` list shape).
 - `scope:` limits to a subtree (exact URI or descendants only).
 - `top_k:` caps results. Default 10, maximum 200; an out-of-range value
   returns `{:error, {:invalid_limit, value}}` rather than silently answering a
@@ -86,10 +87,19 @@ deterministic.
 :ok = AgentDb.forget("viking://user/memories/preferences/language")
 ```
 
-- `confidence:` 0.0–1.0, default `0.5` (`AgentDb.default_confidence/0`).
+- `confidence:` 0.0–1.0, default `0.5` (`AgentDb.default_confidence/0`);
+  `importance:` 0.0–1.0, default `0.5`. `candidate: true` records awaiting
+  promotion (also forced by near-zero confidence or duplicate values);
+  `promote_memory/1` activates, `reject_memory_candidate/1` removes without a
+  trace, `pending_memory_candidates/0` lists the review queue.
 - `recall()` with no args returns everything active; `type:` / `term:` /
-  subtree URI filter; results order by descending confidence; no match →
-  `{:ok, []}`.
+  subtree URI filter; without a term results order by descending confidence,
+  with a term by confidence + semantic similarity (exact matches boosted,
+  stale memories penalized); no match → `{:ok, []}`. Every recall records
+  surfacing on the rows it returns.
+- `memory_conflicts/0` reports similar active memories at distinct URIs
+  read-only (no inference of its own); `{:error, :embeddings_unavailable}`
+  when there is nothing stored to compare.
 - `forget/1` on a missing memory → `{:error, :no_memory}`; it removes value
   plus provenance including superseded assertions. A plain document at the URI
   is left alone.

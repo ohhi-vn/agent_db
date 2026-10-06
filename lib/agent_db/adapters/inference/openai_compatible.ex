@@ -23,14 +23,17 @@ defmodule AgentDb.Adapters.Inference.OpenAICompatible do
     with {:ok, base} <- base_url() do
       url = String.trim_trailing(base, "/") <> "/embeddings"
       headers = auth_headers()
+      model = AgentDb.Config.openai_embed_model()
 
       case Req.post(url,
-             json: %{input: texts},
+             json: %{model: model, input: texts},
              headers: headers,
              receive_timeout: @receive_timeout
            ) do
         {:ok, %Req.Response{status: 200, body: %{"data" => items}}} ->
-          {:ok, Enum.map(items, fn %{"embedding" => vec} -> encode(vec) end)}
+          vectors = Enum.map(items, fn %{"embedding" => vec} -> encode(vec) end)
+          Enum.each(vectors, &AgentDb.Adapters.Inference.ObservedDim.observe(:openai_compatible, &1))
+          {:ok, vectors}
 
         {:ok, %Req.Response{status: 401}} ->
           {:error, :unauthorized}
@@ -61,7 +64,7 @@ defmodule AgentDb.Adapters.Inference.OpenAICompatible do
       url = String.trim_trailing(base, "/") <> "/chat/completions"
       headers = auth_headers()
 
-      body = %{messages: [%{role: "user", content: prompt}]}
+      body = %{model: AgentDb.Config.openai_llm_model(), messages: [%{role: "user", content: prompt}]}
 
       case Req.post(url, json: body, headers: headers, receive_timeout: @receive_timeout) do
         {:ok,
@@ -102,14 +105,14 @@ defmodule AgentDb.Adapters.Inference.OpenAICompatible do
       embedding: %{
         loaded: false,
         state: served_state(health),
-        model: "openai-compatible",
-        dim: 1536,
+        model: AgentDb.Config.openai_embed_model(),
+        dim: AgentDb.Adapters.Inference.ObservedDim.get(:openai_compatible),
         provider: :openai_compatible
       },
       llm: %{
         loaded: false,
         state: served_state(health),
-        model: "openai-compatible",
+        model: AgentDb.Config.openai_llm_model(),
         params: "remote",
         provider: :openai_compatible
       },

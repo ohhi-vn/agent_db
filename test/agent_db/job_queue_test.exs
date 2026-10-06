@@ -178,13 +178,13 @@ defmodule AgentDb.JobQueueTest do
       assert {:ok, _job} = storage().dequeue_job([:embed])
 
       # A process that died mid-job leaves the row running. Recovery returns it
-      # to pending with its attempts reset, because the work was never
-      # attempted to completion.
+      # to pending with its attempts preserved, so a poison pill cannot retry
+      # forever across restarts.
       assert :ok = storage().reset_running_jobs()
 
       assert {:ok, job} = storage().dequeue_job([:embed])
       assert job.id == job_id
-      assert job.attempts == 1
+      assert job.attempts == 2
     end
 
     test "a deferred job is left alone by recovery" do

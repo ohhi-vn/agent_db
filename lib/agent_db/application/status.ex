@@ -112,10 +112,18 @@ defmodule AgentDb.Application.Status do
 
   # Without a model the store is still a working store: documents, search by
   # keyword, sessions and memories all work, so an unloaded embedding model is
-  # a reduction rather than a failure.
+  # a reduction rather than a failure. A remote provider holds no local model,
+  # so `loaded` stays false for it; readiness is what says it can serve.
   defp embedding_ready? do
-    %{embedding: %{loaded: loaded}} = models()
-    loaded == true
+    case models() do
+      %{embedding: %{loaded: true}} -> true
+      %{embedding: %{state: :ready}} -> true
+      _ -> false
+    end
+  rescue
+    _ -> false
+  catch
+    _, _ -> false
   end
 
   # The provider kind the answering adapter reports about itself, so a

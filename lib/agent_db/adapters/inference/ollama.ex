@@ -67,7 +67,7 @@ defmodule AgentDb.Adapters.Inference.Ollama do
         loaded: false,
         state: served_state(health),
         model: AgentDb.Config.ollama_embed_model(),
-        dim: 768,
+        dim: AgentDb.Adapters.Inference.ObservedDim.get(:ollama),
         provider: :ollama
       },
       llm: %{
@@ -107,9 +107,67 @@ defmodule AgentDb.Adapters.Inference.Ollama do
   defp served_state(:ok), do: :ready
   defp served_state(_), do: :unreachable
 
+  defp embed_all(_base, _model, []), do: {:ok, []}
+
   defp embed_all(base, model, texts) do
     url = String.trim_trailing(base, "/") <> "/api/embed"
 
+    case try_batch(url, model, texts) do
+      {:ok, vectors} ->
+        observe_all(vectors)
+        {:ok, vectors}
+
+      {:error, :batch_rejected} ->
+        case embed_one_by_one(url, model, texts) do
+          {:ok, vectors} ->
+            observe_all(vectors)
+            {:ok, vectors}
+
+          {:error, _} = err ->
+            err
+        end
+
+      {:error, _} = err ->
+        err
+    end
+  rescue
+    e -> {:error, {:inference_failed, e}}
+  catch
+    :exit, reason -> {:error, {:inference_timeout, reason}}
+    _, reason -> {:error, {:inference_failed, reason}}
+  end
+
+  # One batched call preserving input order. A server that does not accept a
+  # list input rejects the batch; that rejection is a fallback signal, not a
+  # failure, so it returns `:batch_rejected` for the caller to retry per-text.
+  defp try_batch(url, model, texts) do
+    case Req.post(url, json: %{model: model, input: texts}, receive_timeout: @receive_timeout) do
+      {:ok, %Req.Response{status: 200, body: %{"embeddings" => vecs}}}
+      when is_list(vecs) and length(vecs) == length(texts) ->
+        {:ok, Enum.map(vecs, &encode/1)}
+
+      {:ok, %Req.Response{status: 200, body: %{"embedding" => vec}}}
+      when length(texts) == 1 ->
+        {:ok, [encode(vec)]}
+
+      {:ok, %Req.Response{status: status}} when status in [400, 404, 422] ->
+        {:error, :batch_rejected}
+
+      {:ok, %Req.Response{status: 200}} ->
+        {:error, :batch_rejected}
+
+      {:ok, %Req.Response{status: status}} ->
+        {:error, {:inference_failed, status}}
+
+      {:error, %Req.TransportError{reason: reason}} ->
+        {:error, {:inference_timeout, reason}}
+
+      {:error, reason} ->
+        {:error, {:inference_failed, reason}}
+    end
+  end
+
+  defp embed_one_by_one(url, model, texts) do
     Enum.reduce_while(texts, {:ok, []}, fn text, {:ok, acc} ->
       case Req.post(url, json: %{model: model, input: text}, receive_timeout: @receive_timeout) do
         {:ok, %Req.Response{status: 200, body: %{"embeddings" => [vec | _]}}} ->
@@ -132,11 +190,10 @@ defmodule AgentDb.Adapters.Inference.Ollama do
       {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
       {:error, _} = err -> err
     end
-  rescue
-    e -> {:error, {:inference_failed, e}}
-  catch
-    :exit, reason -> {:error, {:inference_timeout, reason}}
-    _, reason -> {:error, {:inference_failed, reason}}
+  end
+
+  defp observe_all(vectors) do
+    Enum.each(vectors, &AgentDb.Adapters.Inference.ObservedDim.observe(:ollama, &1))
   end
 
   defp encode(vec) when is_list(vec) do

@@ -56,7 +56,46 @@ defmodule AgentDb.Store.Writer do
 
   @impl true
   def handle_call({:write, fun}, _from, state) do
-    {:reply, fun.(state.conn), state}
+    {:reply, run_with_busy_retry(fun, state.conn), state}
+  end
+
+  defp run_with_busy_retry(fun, conn) do
+    case run_callback(fun, conn) do
+      {:error, _} = err when is_tuple(err) ->
+        if busy_error?(err) do
+          Process.sleep(10 + :rand.uniform(40))
+
+          case run_callback(fun, conn) do
+            {:error, _} = err2 ->
+              if busy_error?(err2), do: {:error, :storage_busy}, else: err2
+
+            other ->
+              other
+          end
+        else
+          err
+        end
+
+      other ->
+        other
+    end
+  end
+
+  defp run_callback(fun, conn) do
+    fun.(conn)
+  rescue
+    error -> {:error, {:callback_failed, error.__struct__, Exception.message(error)}}
+  catch
+    kind, reason -> {:error, {:callback_failed, kind, reason}}
+  end
+
+  defp busy_error?({:error, :storage_busy}), do: true
+  defp busy_error?({:error, reason}), do: busy_text?(inspect(reason))
+  defp busy_error?(_), do: false
+
+  defp busy_text?(text) do
+    down = String.downcase(text)
+    String.contains?(down, "busy") or String.contains?(down, "locked")
   end
 
   @impl true

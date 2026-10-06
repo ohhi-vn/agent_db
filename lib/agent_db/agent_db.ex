@@ -104,7 +104,7 @@ defmodule AgentDb do
     - `:mode` - `:keyword`, `:vector`, or `:hybrid`
     - `:scope` - a URI prefix to limit the search to one subtree
     - `:top_k` - maximum results (default 10)
-    - `:hybrid_weights` - `{keyword_weight, vector_weight}` (default `{0.5, 0.5}`)
+    - `:hybrid_weights` - `{keyword_weight, vector_weight}` or `[keyword: kw, vector: vw]` (default `{0.5, 0.5}`)
   """
   @spec search(String.t(), keyword()) :: {:ok, [map()]} | {:error, term()}
   defdelegate search(term, opts \\ []), to: Search
@@ -194,6 +194,40 @@ defmodule AgentDb do
         err
     end
   end
+
+  @doc "Promotes the waiting candidate at `uri` to the active memory."
+  @spec promote_memory(uri()) :: {:ok, uri()} | {:error, term()}
+  def promote_memory(uri) do
+    case Memories.promote(uri) do
+      {:ok, stored} ->
+        notify(stored, :written)
+        {:ok, stored}
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  @doc "Rejects the waiting candidate at `uri`, leaving no trace of it."
+  @spec reject_memory_candidate(uri()) :: :ok | {:error, term()}
+  def reject_memory_candidate(uri) do
+    case Memories.reject_candidate(uri) do
+      :ok ->
+        notify(uri, :removed)
+        :ok
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  @doc "Candidates waiting for promotion review. See AgentDb.Application.Memories.pending_candidates/1."
+  @spec pending_memory_candidates(keyword()) :: {:ok, [map()]} | {:error, term()}
+  defdelegate pending_memory_candidates(opts \\ []), to: Memories, as: :pending_candidates
+
+  @doc "Possible conflicts between active memories. See AgentDb.Application.Memories.conflicts/1."
+  @spec memory_conflicts(keyword()) :: {:ok, [map()]} | {:error, term()}
+  defdelegate memory_conflicts(opts \\ []), to: Memories, as: :conflicts
 
   @doc "The memory types, for callers that need to enumerate the taxonomy."
   @spec memory_types() :: [String.t()]
@@ -362,7 +396,8 @@ defmodule AgentDb do
 
   Vector index availability and row count against the document count, plus the
   documents under each index's own roots. An index that cannot be queried
-  reports unavailable rather than reporting zero.
+  reports unavailable rather than reporting zero. The vector leg additionally
+  reports `active_dim` and `needs_backfill` when the provider serves them.
   """
   @spec index_coverage() :: map()
   def index_coverage do
@@ -372,6 +407,40 @@ defmodule AgentDb do
       hex_documents: AgentDb.HexDocs.coverage().documents,
       hex_packages: AgentDb.HexDocs.coverage().packages
     })
+  end
+
+  @doc """
+  Drops a non-active vector dim table (`vec_nodes_<dim>`).
+
+  Refuses the active dim; boot never wipes. An operator action for reclaiming
+  disk after a provider switch, not part of any write path.
+  """
+  @spec prune_vector_index(pos_integer()) :: :ok | {:error, term()}
+  def prune_vector_index(dim) do
+    storage = AgentDb.Runtime.storage()
+
+    if function_exported?(storage, :prune_vector_index, 1) do
+      storage.prune_vector_index(dim)
+    else
+      {:error, :unsupported}
+    end
+  end
+
+  @doc """
+  Enqueues `:embed` jobs only for URIs missing in the active dim table.
+
+  Switching providers creates the new table if missing and backfills the diff;
+  URIs already covered are never re-enqueued.
+  """
+  @spec backfill_vector_index() :: {:ok, non_neg_integer()} | {:error, term()}
+  def backfill_vector_index do
+    storage = AgentDb.Runtime.storage()
+
+    if function_exported?(storage, :backfill_vector_index, 0) do
+      storage.backfill_vector_index()
+    else
+      {:error, :unsupported}
+    end
   end
 
   @doc """
