@@ -50,9 +50,16 @@ defmodule AgentDb.Store.Reader do
 
   defp checkout_with_retry(left) do
     case checkout() do
-      {:ok, _} = ok -> ok
-      {:error, :storage_busy} when left > 1 -> Process.sleep(10) && checkout_with_retry(left - 1)
-      other -> other
+      {:ok, _} = ok ->
+        ok
+
+      {:error, :storage_busy} = err ->
+        if left > 1 do
+          Process.sleep(10)
+          checkout_with_retry(left - 1)
+        else
+          err
+        end
     end
   end
 

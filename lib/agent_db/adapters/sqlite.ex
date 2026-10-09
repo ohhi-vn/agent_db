@@ -331,9 +331,13 @@ defmodule AgentDb.Adapters.SQLite do
   end
 
   defp vec_table_exists?(conn, table) do
-    case SQLite.query_one(conn, "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1", [
-           table
-         ]) do
+    case SQLite.query_one(
+           conn,
+           "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+           [
+             table
+           ]
+         ) do
       {:ok, [1]} -> true
       _ -> false
     end
@@ -497,7 +501,9 @@ defmodule AgentDb.Adapters.SQLite do
 
   @impl true
   def mark_memories_surfaced(ids) do
-    Writer.call(fn conn -> Memories.mark_surfaced(conn, ids, System.system_time(:millisecond)) end)
+    Writer.call(fn conn ->
+      Memories.mark_surfaced(conn, ids, System.system_time(:millisecond))
+    end)
   end
 
   # Conflict detection reuses vectors already stored for memory URIs and runs

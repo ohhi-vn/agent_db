@@ -8,7 +8,7 @@ defmodule AgentDb.ML.ModelManager.Backend.Exla do
 
   @behaviour AgentDb.ML.ModelManager.Backend
 
-  require Logger
+  alias AgentDb.Observability
 
   @impl true
   def load_embedding(config), do: load_model(config, config.embedding_model, :embedding)
@@ -79,24 +79,59 @@ defmodule AgentDb.ML.ModelManager.Backend.Exla do
        }}
     else
       {:error, reason} ->
-        Logger.error("Failed to load #{inspect(role)} model: #{inspect(reason)}")
+        Observability.log(:error,
+          component: :model,
+          operation: :load,
+          role: role,
+          outcome: :error,
+          reason: reason
+        )
+
         {:error, wrap(reason)}
 
       unexpected ->
-        Logger.error("Unexpected #{inspect(role)} load result: #{inspect(unexpected)}")
+        Observability.log(:error,
+          component: :model,
+          operation: :load,
+          role: role,
+          outcome: :error,
+          reason: {:model_load_failed, :unexpected}
+        )
+
         {:error, wrap(unexpected)}
     end
   rescue
     error ->
-      Logger.error("Raised while loading #{inspect(role)} model: #{inspect(error)}")
+      Observability.log(:error,
+        component: :model,
+        operation: :load,
+        role: role,
+        outcome: :error,
+        reason: {:model_load_failed, :raised}
+      )
+
       {:error, wrap(error)}
   catch
     :exit, reason ->
-      Logger.error("Exited while loading #{inspect(role)} model: #{inspect(reason)}")
+      Observability.log(:error,
+        component: :model,
+        operation: :load,
+        role: role,
+        outcome: :error,
+        reason: {:model_load_failed, :exit}
+      )
+
       {:error, wrap({:exit, reason})}
 
     :throw, value ->
-      Logger.error("Threw while loading #{inspect(role)} model: #{inspect(value)}")
+      Observability.log(:error,
+        component: :model,
+        operation: :load,
+        role: role,
+        outcome: :error,
+        reason: {:model_load_failed, :throw}
+      )
+
       {:error, wrap({:throw, value})}
   end
 

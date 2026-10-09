@@ -272,7 +272,12 @@ defmodule AgentDb.Test.Fakes.Storage do
     if not Map.has_key?(maps, dim) and map_size(maps) >= @max_vec_dims do
       {:error, :too_many_dims}
     else
-      put(:embeddings, Map.update(maps, dim, %{uri => embedding}, &Map.put(&1, uri, embedding)), [])
+      put(
+        :embeddings,
+        Map.update(maps, dim, %{uri => embedding}, &Map.put(&1, uri, embedding)),
+        []
+      )
+
       put(:vec_active, dim, [])
       finish(job_id, :stored)
     end
@@ -601,8 +606,11 @@ defmodule AgentDb.Test.Fakes.Storage do
         # the document, vector and queued work go too, otherwise the document
         # is repaired to the surviving active value.
         case Enum.find(remaining, &(&1.status == :active)) do
-          nil -> drop_uri_state(uri)
-          active -> put(:documents, Map.update!(documents(), uri, &%{&1 | content: active.value}), :ok)
+          nil ->
+            drop_uri_state(uri)
+
+          active ->
+            put(:documents, Map.update!(documents(), uri, &%{&1 | content: active.value}), :ok)
         end
     end
   end
@@ -675,7 +683,8 @@ defmodule AgentDb.Test.Fakes.Storage do
     |> Enum.sort_by(& &1.similarity, :desc)
   end
 
-  defp fake_same_type?(a, b), do: fake_memory_type(a) == fake_memory_type(b) and fake_memory_type(a) != nil
+  defp fake_same_type?(a, b),
+    do: fake_memory_type(a) == fake_memory_type(b) and fake_memory_type(a) != nil
 
   defp fake_memory_type(uri) do
     case VikingURI.parse(uri) do
@@ -799,15 +808,29 @@ defmodule AgentDb.Test.Fakes.Storage do
 
     case vec_active() do
       nil ->
-        %{available: true, active_dim: :unknown, vectors: 0, documents: docs, needs_backfill: docs > 0}
+        %{
+          available: true,
+          active_dim: :unknown,
+          vectors: 0,
+          documents: docs,
+          needs_backfill: docs > 0
+        }
 
       dim ->
         vecs = Map.get(embeddings(), dim, %{})
-        missing? = Enum.any?(documents(), fn {uri, node} ->
-          is_map(node) and node[:kind] == :doc and not Map.has_key?(vecs, uri)
-        end)
 
-        %{available: true, active_dim: dim, vectors: map_size(vecs), documents: docs, needs_backfill: missing?}
+        missing? =
+          Enum.any?(documents(), fn {uri, node} ->
+            is_map(node) and node[:kind] == :doc and not Map.has_key?(vecs, uri)
+          end)
+
+        %{
+          available: true,
+          active_dim: dim,
+          vectors: map_size(vecs),
+          documents: docs,
+          needs_backfill: missing?
+        }
     end
   end
 

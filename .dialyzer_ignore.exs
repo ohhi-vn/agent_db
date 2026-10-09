@@ -14,7 +14,16 @@
   # reports the guard as unreachable. The value comes from application
   # environment, which is outside the type system, so the check stays: it is
   # validation of external configuration, not dead code.
-  {"lib/agent_db/application.ex", :pattern_match, 82},
+  {"lib/agent_db/application.ex", :pattern_match, 83},
+
+  # `AgentDb.Runtime.validate_numeric_config!/0` re-checks the worker count,
+  # the shutdown grace period, and the inference concurrency before the node
+  # starts. Dialyzer trusts the `Config.*` specs (`pos_integer()`) and reports
+  # each guard as unreachable, for the same reason as the entry above: these are
+  # validations of values read from application environment, not dead code.
+  {"lib/agent_db/runtime.ex", :pattern_match, 128},
+  {"lib/agent_db/runtime.ex", :pattern_match, 134},
+  {"lib/agent_db/runtime.ex", :pattern_match, 141},
 
   # A module-level `false` pattern that can never match a `true` value, reported
   # against `AgentDb.Application` and `AgentDb.Runtime` with no line or column.

@@ -229,4 +229,66 @@ defmodule AgentDb.ObservabilityTest do
       refute Observability.redact_url(url) =~ "secret123"
     end
   end
+
+  describe "structured logs carry correlation" do
+    test "a log inside a context carries its trace and job ids, and clears after" do
+      log =
+        capture_log(fn ->
+          Observability.with_correlation(%{trace_id: "trace-abc", job_id: 7}, fn ->
+            Observability.log(:error, component: :worker, outcome: :failed)
+          end)
+        end)
+
+      assert log =~ "trace-abc"
+      assert log =~ "job_id"
+      assert Observability.correlation() == %{}
+    end
+
+    test "a nested context adds to the outer one and restores it" do
+      log =
+        capture_log(fn ->
+          Observability.with_correlation(%{trace_id: "trace-outer"}, fn ->
+            Observability.with_correlation(%{span_id: "span-inner"}, fn ->
+              Observability.log(:error, component: :worker, outcome: :failed)
+            end)
+
+            Observability.log(:error, component: :worker, outcome: :ok)
+          end)
+        end)
+
+      assert log =~ "trace-outer"
+      assert log =~ "span-inner"
+      assert Observability.correlation() == %{}
+    end
+
+    test "classifies the reason and never emits the raw failure term" do
+      log =
+        capture_log(fn ->
+          Observability.log(:error,
+            component: :storage,
+            operation: :write,
+            outcome: :error,
+            reason: {:invalid_uri, "viking://secret/doc"}
+          )
+        end)
+
+      assert log =~ "invalid_uri"
+      refute log =~ "secret"
+    end
+  end
+
+  describe "one structured logging entry point" do
+    test "only AgentDb.Observability calls Logger directly" do
+      offenders =
+        Path.wildcard(Path.join([File.cwd!(), "lib", "**", "*.ex"]))
+        |> Enum.reject(&(Path.relative_to_cwd(&1) == "lib/agent_db/observability.ex"))
+        |> Enum.filter(
+          &Regex.match?(~r/Logger\.(debug|info|notice|warning|error|log)\(/, File.read!(&1))
+        )
+        |> Enum.map(&Path.relative_to_cwd/1)
+
+      assert offenders == [],
+             "these modules log outside Observability: #{inspect(offenders)}"
+    end
+  end
 end

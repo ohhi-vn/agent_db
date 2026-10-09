@@ -4,9 +4,8 @@ defmodule AgentDb.Store.SQLite do
   # Direct SQLite access via exqlite. All functions are pure wrappers over
   # Exqlite.Sqlite3 with explicit connection passing - no process ownership here.
 
+  alias AgentDb.Observability
   alias Exqlite.Sqlite3
-
-  require Logger
 
   @type conn :: Exqlite.Sqlite3.db()
   @type ok_err :: :ok | {:error, term()}
@@ -29,11 +28,13 @@ defmodule AgentDb.Store.SQLite do
         :ok
 
       {:error, :vector_index_unavailable} ->
-        Logger.warning("sqlite-vec extension not available, vector search disabled")
-        :ok
+        Observability.log(:warning,
+          component: :storage,
+          operation: :vector_index,
+          outcome: :unavailable
+        )
 
-      {:error, _} = err ->
-        err
+        :ok
     end
   end
 
@@ -160,7 +161,13 @@ defmodule AgentDb.Store.SQLite do
         :ok
 
       {:error, reason} ->
-        Logger.error("Transaction rollback failed, connection state unknown: #{inspect(reason)}")
+        Observability.log(:error,
+          component: :storage,
+          operation: :rollback,
+          outcome: :error,
+          reason: reason
+        )
+
         {:error, reason}
     end
   end
@@ -296,7 +303,13 @@ defmodule AgentDb.Store.SQLite do
         case list_vec_dims(conn) do
           {:ok, dims} ->
             if length(dims) >= @max_vec_tables and dim not in dims do
-              Logger.warning("Refusing vec table for dim #{dim}: too many dims (#{length(dims)})")
+              Observability.log(:warning,
+                component: :storage,
+                operation: :vector_index,
+                outcome: :refused,
+                reason: :too_many_dims
+              )
+
               {:error, :too_many_dims}
             else
               exec(conn, vec_ddl(dim))
@@ -575,11 +588,22 @@ defmodule AgentDb.Store.SQLite do
       end)
       |> case do
         :ok ->
-          Logger.info("Rebuilt memory_meta with the candidate status")
+          Observability.log(:info,
+            component: :storage,
+            operation: :rebuild_memory_meta,
+            outcome: :ok
+          )
+
           :ok
 
         {:error, reason} ->
-          Logger.warning("Could not rebuild memory_meta: #{inspect(reason)}")
+          Observability.log(:warning,
+            component: :storage,
+            operation: :rebuild_memory_meta,
+            outcome: :error,
+            reason: reason
+          )
+
           {:error, reason}
       end
     end
@@ -624,11 +648,22 @@ defmodule AgentDb.Store.SQLite do
                "DELETE FROM \"#{table}\" WHERE uri IN (SELECT v.uri FROM \"#{table}\" v LEFT JOIN nodes n ON n.uri = v.uri WHERE n.uri IS NULL)"
              ) do
           :ok ->
-            Logger.info("Reclaimed orphaned #{table} rows for removed URIs")
+            Observability.log(:info,
+              component: :storage,
+              operation: :reclaim_orphans,
+              outcome: :ok
+            )
+
             :ok
 
           {:error, reason} ->
-            Logger.warning("Could not reclaim orphaned #{table} rows: #{inspect(reason)}")
+            Observability.log(:warning,
+              component: :storage,
+              operation: :reclaim_orphans,
+              outcome: :error,
+              reason: reason
+            )
+
             :ok
         end
 
@@ -655,7 +690,12 @@ defmodule AgentDb.Store.SQLite do
                  []
                ),
              {:ok, _} <- set_active_dim_if_unset(conn, 384) do
-          Logger.info("Migrated legacy vec_nodes rows into #{vec_table(384)}")
+          Observability.log(:info,
+            component: :storage,
+            operation: :migrate_vec_nodes,
+            outcome: :ok
+          )
+
           :ok
         else
           _ -> :ok
@@ -762,7 +802,12 @@ defmodule AgentDb.Store.SQLite do
 
       {:error, _} ->
         # sqlite-vec extension not available, continue without vector search
-        Logger.info("sqlite-vec extension not available, vector search disabled")
+        Observability.log(:info,
+          component: :storage,
+          operation: :vector_index,
+          outcome: :unavailable
+        )
+
         :ok
     end
   end

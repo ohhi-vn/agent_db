@@ -11,9 +11,8 @@ defmodule AgentDb.ML.ModelManager.Backend.Emlx do
 
   @behaviour AgentDb.ML.ModelManager.Backend
 
-  require Logger
-
   alias AgentDb.ML.ModelManager.Backend.Exla
+  alias AgentDb.Observability
 
   @impl true
   def load_embedding(config), do: load(config, :embedding, config.embedding_model)
@@ -42,7 +41,14 @@ defmodule AgentDb.ML.ModelManager.Backend.Emlx do
          }}
       else
         {:error, reason} ->
-          Logger.warning("EMLX #{role} load failed, falling back: #{inspect(reason)}")
+          Observability.log(:error,
+            component: :model,
+            operation: :load,
+            role: role,
+            outcome: :error,
+            reason: reason
+          )
+
           {:error, reason}
 
         unexpected ->

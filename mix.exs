@@ -34,7 +34,20 @@ defmodule AgentDb.MixProject do
   defp aliases do
     [
       lint: ["format --check-formatted", "credo --strict", "dialyzer"],
-      "lint:quick": ["format --check-formatted", "credo --strict"]
+      "lint:quick": ["format --check-formatted", "credo --strict"],
+      # The console's stylesheet is generated from the LiveView markup and
+      # committed under priv/static, so the one command that reproduces it is
+      # named here rather than left to the individual Tailwind/esbuild tasks.
+      "assets.build": ["tailwind default", "esbuild default"],
+      # The production counterpart: the same profiles minified, then digested,
+      # writing the manifest `config/prod.exs` names. A deploy that skips this
+      # serves no assets, and the endpoint refuses to boot on the missing
+      # manifest rather than serving stale files.
+      "assets.deploy": [
+        "tailwind default --minify",
+        "esbuild default --minify",
+        "phx.digest"
+      ]
     ]
   end
 
@@ -110,7 +123,7 @@ defmodule AgentDb.MixProject do
       {:phoenix_html, "~> 4.3"},
       {:phoenix_pubsub, "~> 2.3"},
       {:phoenix_view, "~> 2.0"},
-      {:plug_cowboy, "~> 2.6"},
+      {:bandit, "~> 1.12"},
       {:jason, "~> 1.4"},
       {:req, "~> 0.7"},
       {:telemetry, "~> 1.0"},

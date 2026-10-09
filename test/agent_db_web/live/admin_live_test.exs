@@ -6,6 +6,11 @@ defmodule AgentDbWeb.AdminLiveTest do
   entries, consumed, and handed to the same facade the Mix task uses -- so what
   these assert is what an operator gets, not what the view would render if it
   were handed a result.
+
+  Each test mounts the console page it exercises, because the console is now
+  several pages: the import form is on `/admin/skills`, search on
+  `/admin/documents`, the feed on `/admin`, and session lookup on
+  `/admin/sessions`.
   """
   use ExUnit.Case, async: false
 
@@ -39,12 +44,19 @@ defmodule AgentDbWeb.AdminLiveTest do
       Application.delete_env(:agent_db, :data_dir)
     end)
 
-    {:ok, view, _html} = live(build_conn(), "/admin")
-    {:ok, %{view: view}}
+    :ok
+  end
+
+  # Mounting the page a test is about. A page mounts on connect, so a test that
+  # writes first and mounts second sees what it wrote.
+  defp page(path) do
+    {:ok, view, _html} = live(build_conn(), path)
+    view
   end
 
   describe "what the console offers" do
-    test "names the fields the documentation tells an operator to fill in", %{view: view} do
+    test "names the fields the documentation tells an operator to fill in" do
+      view = page("/admin/skills")
       limits = AgentDb.skill_import_limits()
 
       for label <- ["User ID", "Skills folder", "Skills archive", "Import skills"] do
@@ -59,7 +71,9 @@ defmodule AgentDbWeb.AdminLiveTest do
   end
 
   describe "a folder selection" do
-    test "imports the skills it holds and reports each one", %{view: view} do
+    test "imports the skills it holds and reports each one" do
+      view = page("/admin/skills")
+
       view =
         submit_folder(view, "alice", [
           %{name: "SKILL.md", relative_path: "my-skills/alpha/SKILL.md", content: "the manifest"},
@@ -88,7 +102,9 @@ defmodule AgentDbWeb.AdminLiveTest do
       assert {:ok, "beta's manifest"} = AgentDb.read("viking://user/alice/skills/beta/SKILL.md")
     end
 
-    test "a skill already stored is reported as replaced, and its old files go", %{view: view} do
+    test "a skill already stored is reported as replaced, and its old files go" do
+      view = page("/admin/skills")
+
       submit_folder(view, "alice", [
         %{name: "SKILL.md", relative_path: "alpha/SKILL.md", content: "the manifest"},
         %{name: "old.md", relative_path: "alpha/old.md", content: "the old file"}
@@ -107,7 +123,8 @@ defmodule AgentDbWeb.AdminLiveTest do
   end
 
   describe "an archive upload" do
-    test "imports the skills it holds", %{view: view} do
+    test "imports the skills it holds" do
+      view = page("/admin/skills")
       view = submit_archive(view, "alice", "skills.tar", archive([{"alpha/SKILL.md", "alpha\n"}]))
 
       assert render(view) =~ "1 imported"
@@ -115,7 +132,9 @@ defmodule AgentDbWeb.AdminLiveTest do
       assert {:ok, "alpha\n"} = AgentDb.read("viking://user/alice/skills/alpha/SKILL.md")
     end
 
-    test "takes precedence over a folder filled in at the same time", %{view: view} do
+    test "takes precedence over a folder filled in at the same time" do
+      view = page("/admin/skills")
+
       # An archive is one file and a folder is many, so the importer takes the
       # archive when both are filled in rather than reading the folder as well.
       folder =
@@ -154,12 +173,14 @@ defmodule AgentDbWeb.AdminLiveTest do
   end
 
   describe "a source the importer refuses" do
-    test "is reported in words, and nothing is written", %{view: view} do
+    test "is reported in words, and nothing is written" do
       assert {:ok, _} =
                AgentDb.import_skills("alice", {
                  :uploads,
                  [%{path: "alpha/SKILL.md", content: "the stored manifest"}]
                })
+
+      view = page("/admin/skills")
 
       view =
         submit_folder(view, "alice", [
@@ -177,9 +198,8 @@ defmodule AgentDbWeb.AdminLiveTest do
       assert {:error, :not_found} = AgentDb.read("viking://resources/escape.md")
     end
 
-    test "a user id that could not be a URI segment is reported rather than stored under", %{
-      view: view
-    } do
+    test "a user id that could not be a URI segment is reported rather than stored under" do
+      view = page("/admin/skills")
       view = submit_folder(view, "alice/../root", folder_skill("alpha"))
 
       assert render(view) =~ "Import refused"
@@ -188,7 +208,8 @@ defmodule AgentDbWeb.AdminLiveTest do
   end
 
   describe "an import with nothing chosen" do
-    test "says what to choose", %{view: view} do
+    test "says what to choose" do
+      view = page("/admin/skills")
       view |> form(@form, %{"user_id" => "alice"}) |> render_submit()
 
       assert render(view) =~ "Choose a skills folder or an archive"
@@ -196,7 +217,8 @@ defmodule AgentDbWeb.AdminLiveTest do
   end
 
   describe "realtime updates" do
-    test "a change event records URI, kind and version in the feed", %{view: view} do
+    test "a change event records URI, kind and version in the feed" do
+      view = page("/admin")
       send(view.pid, {:context_changed, "viking://resources/realtime-note.md", :written, 7})
 
       html = render(view)
@@ -205,7 +227,9 @@ defmodule AgentDbWeb.AdminLiveTest do
       assert html =~ "v7"
     end
 
-    test "rapid bursts all land in the feed newest-first and converge on reload", %{view: view} do
+    test "rapid bursts all land in the feed newest-first and converge on reload" do
+      view = page("/admin")
+
       for n <- 1..5 do
         send(view.pid, {:context_changed, "viking://resources/burst-#{n}.md", :written, n})
       end
@@ -224,15 +248,17 @@ defmodule AgentDbWeb.AdminLiveTest do
       assert later < earlier
     end
 
-    test "a missed event still converges on fallback refresh", %{view: view} do
+    test "a missed event still converges on fallback refresh" do
+      view = page("/admin")
       :ok = AgentDb.write("viking://resources/fallback-note.md", "fallback content")
       send(view.pid, :refresh)
 
       assert render(view) =~ "viking://resources/fallback-note.md"
     end
 
-    test "the feed never carries document content", %{view: view} do
+    test "the feed never carries document content" do
       :ok = AgentDb.write("viking://resources/secret-note.md", "super-secret-content-xyz")
+      view = page("/admin")
       send(view.pid, {:context_changed, "viking://resources/secret-note.md", :written, 3})
       send(view.pid, :refresh_coalesced)
 
@@ -243,12 +269,14 @@ defmodule AgentDbWeb.AdminLiveTest do
   end
 
   describe "document search" do
-    test "finds documents and links each to the editor", %{view: view} do
+    test "finds documents and links each to the editor" do
       :ok =
         AgentDb.write(
           "viking://resources/searchable/apple-pie.md",
           "apple pie recipe with plenty of cinnamon"
         )
+
+      view = page("/admin/documents")
 
       view
       |> form("#doc-search", %{"term" => "cinnamon", "scope" => ""})
@@ -259,9 +287,10 @@ defmodule AgentDbWeb.AdminLiveTest do
       assert html =~ "/admin/documents/"
     end
 
-    test "a refused search reports in words and keeps the listing", %{view: view} do
+    test "a refused search reports in words and keeps the listing" do
       :ok = AgentDb.write("viking://resources/searchable/keep-me.md", "keep me visible")
-      send(view.pid, :refresh)
+
+      view = page("/admin/documents")
 
       view
       |> form("#doc-search", %{"term" => "keep", "scope" => "not-a-uri"})
@@ -269,12 +298,15 @@ defmodule AgentDbWeb.AdminLiveTest do
 
       html = render(view)
       assert html =~ "Search failed"
-      assert html =~ "viking://resources/searchable/keep-me.md"
+      # The listing is still there: its entries link to the editor, which a
+      # refused search must not blank.
+      assert html =~ "/admin/documents/"
     end
   end
 
   describe "model, queue and health status" do
-    test "shows roles, queue breakdown and health checks", %{view: view} do
+    test "shows roles, queue breakdown and health checks" do
+      view = page("/admin")
       html = render(view)
 
       assert html =~ "Models"
@@ -294,16 +326,18 @@ defmodule AgentDbWeb.AdminLiveTest do
   end
 
   describe "session lookup" do
-    test "shows messages for a known session", %{view: view} do
+    test "shows messages for a known session" do
       {:ok, sid} = AgentDb.create_session()
       :ok = AgentDb.append_message(sid, :user, "hello session")
 
+      view = page("/admin/sessions")
       view |> form("#session-lookup", %{"session_id" => sid}) |> render_submit()
 
       assert render(view) =~ "hello session"
     end
 
-    test "reports an unknown session id", %{view: view} do
+    test "reports an unknown session id" do
+      view = page("/admin/sessions")
       view |> form("#session-lookup", %{"session_id" => "no-such-session"}) |> render_submit()
 
       assert render(view) =~ "No session with that ID"

@@ -1,10 +1,10 @@
 defmodule AgentDb.MemoryRecallRankingTest do
   use ExUnit.Case, async: false
 
+  alias AgentDb.Application.Memories
   alias AgentDb.Cache
   alias AgentDb.Test.Fakes
   alias AgentDb.Test.Support.MemoryRankingFixture, as: Fixture
-  alias AgentDb.Application.Memories
 
   defmodule FixtureEmbedder do
     @moduledoc false

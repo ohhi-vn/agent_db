@@ -98,7 +98,7 @@ defmodule AgentDb.Test.Support.MemoryRankingFixture do
 
   @doc "Cosine similarity of two float lists (-1..1, 0 when degenerate)."
   @spec cosine([float()], [float()]) :: float()
-  def cosine(a, b) when length(a) == length(b) and length(a) > 0 do
+  def cosine(a, b) when length(a) == length(b) and a != [] do
     dot = Enum.zip(a, b) |> Enum.map(fn {x, y} -> x * y end) |> Enum.sum()
     na = :math.sqrt(Enum.map(a, &(&1 * &1)) |> Enum.sum())
     nb = :math.sqrt(Enum.map(b, &(&1 * &1)) |> Enum.sum())
@@ -170,7 +170,13 @@ defmodule AgentDb.Test.Support.MemoryRankingFixture do
   end
 
   @doc "Blended order with decay: stale rows rank below fresh equals."
-  @spec rank_blended_decay([candidate()], String.t(), [float()], %{String.t() => [float()]}, integer()) ::
+  @spec rank_blended_decay(
+          [candidate()],
+          String.t(),
+          [float()],
+          %{String.t() => [float()]},
+          integer()
+        ) ::
           [candidate()]
   def rank_blended_decay(rows, term, query_vec, vecs, now_ms) do
     needle = String.downcase(term)
@@ -180,8 +186,13 @@ defmodule AgentDb.Test.Support.MemoryRankingFixture do
       sim = cosine(query_vec, Map.fetch!(vecs, row.value))
       sim01 = (sim + 1.0) / 2.0
       exact? = String.contains?(String.downcase(row.value), needle)
-      {blend_score(row.confidence, sim01, exact?, staleness(Map.get(row, :last_surfaced_at), now_ms)),
-       row}
+
+      {blend_score(
+         row.confidence,
+         sim01,
+         exact?,
+         staleness(Map.get(row, :last_surfaced_at), now_ms)
+       ), row}
     end)
     |> Enum.sort_by(fn {score, row} -> {-score, -row.confidence, row.uri, row.id} end)
     |> Enum.map(&elem(&1, 1))

@@ -56,6 +56,21 @@ defmodule AgentDbWeb.AdminConsoleTest do
     {view, html}
   end
 
+  defp documents_console(params \\ "") do
+    {:ok, view, html} = live(build_conn(), "/admin/documents" <> params)
+    {view, html}
+  end
+
+  defp storage_console(params \\ "") do
+    {:ok, view, html} = live(build_conn(), "/admin/storage" <> params)
+    {view, html}
+  end
+
+  defp sessions_console(params \\ "") do
+    {:ok, view, html} = live(build_conn(), "/admin/sessions" <> params)
+    {view, html}
+  end
+
   defp exhaust_retries(job_id) do
     for _attempt <- 1..5 do
       assert {:ok, _job} = SQLite.dequeue_job([:embed])
@@ -82,7 +97,7 @@ defmodule AgentDbWeb.AdminConsoleTest do
         :ok = AgentDb.write("viking://resources/count/doc#{n}.md", "body #{n}")
       end
 
-      {_view, html} = console()
+      {_view, html} = documents_console()
 
       assert html =~ "3 documents"
     end
@@ -91,13 +106,13 @@ defmodule AgentDbWeb.AdminConsoleTest do
       :ok = AgentDb.write("viking://resources/count/deep/inner/a.md", "a")
       :ok = AgentDb.write("viking://resources/count/deep/inner/b.md", "b")
 
-      {_view, html} = console()
+      {_view, html} = documents_console()
 
       assert html =~ "2 documents"
     end
 
     test "an empty store reports no documents rather than failing" do
-      {_view, html} = console()
+      {_view, html} = documents_console()
 
       assert html =~ "0 documents"
     end
@@ -110,7 +125,7 @@ defmodule AgentDbWeb.AdminConsoleTest do
       # Each of these is a request a browser could produce: a page that is not a
       # number, one before the first, one past the last, one empty.
       for page <- ["abc", "0", "-1", "99", ""] do
-        assert {:ok, _view, html} = live(build_conn(), "/admin?page=#{page}")
+        assert {:ok, _view, html} = live(build_conn(), "/admin/documents?page=#{page}")
         assert html =~ "Documents"
       end
     end
@@ -121,7 +136,7 @@ defmodule AgentDbWeb.AdminConsoleTest do
       # The listing is of names at the tree root, so a store with content under
       # `resources` lists `resources` -- and must still list it when the page
       # asked for could not be served.
-      assert {:ok, _view, html} = live(build_conn(), "/admin?page=not-a-number")
+      assert {:ok, _view, html} = live(build_conn(), "/admin/documents?page=not-a-number")
       assert html =~ "resources"
       assert html =~ "1 documents"
     end
@@ -131,7 +146,7 @@ defmodule AgentDbWeb.AdminConsoleTest do
     test "report storage composition" do
       :ok = AgentDb.write("viking://resources/section/a.md", "a")
 
-      {_view, html} = console()
+      {_view, html} = storage_console()
 
       assert html =~ "Storage"
       assert html =~ "documents"
@@ -139,14 +154,14 @@ defmodule AgentDbWeb.AdminConsoleTest do
     end
 
     test "report cache size" do
-      {_view, html} = console()
+      {_view, html} = storage_console()
 
       assert html =~ "Cache"
       assert html =~ "listings"
     end
 
     test "report index coverage" do
-      {_view, html} = console()
+      {_view, html} = storage_console()
 
       assert html =~ "Indexes"
       assert html =~ "vector"
@@ -177,7 +192,7 @@ defmodule AgentDbWeb.AdminConsoleTest do
     end
 
     test "an unavailable vector index reads as unavailable, not as empty" do
-      {_view, html} = console()
+      {_view, html} = storage_console()
 
       # sqlite-vec is optional at runtime. "Not available" and "nothing indexed"
       # are different facts, and the section has to be able to tell them apart.
@@ -212,7 +227,7 @@ defmodule AgentDbWeb.AdminConsoleTest do
 
   describe "how a failure is described" do
     test "a refused search shows a classified reason rather than a raw term" do
-      {view, _html} = console()
+      {view, _html} = documents_console()
 
       html =
         view
@@ -226,7 +241,7 @@ defmodule AgentDbWeb.AdminConsoleTest do
     end
 
     test "an unknown session reports that rather than showing an error term" do
-      {view, _html} = console()
+      {view, _html} = sessions_console()
 
       html =
         view
@@ -239,7 +254,7 @@ defmodule AgentDbWeb.AdminConsoleTest do
 
     test "removing a listed entry says what happened, without a raw failure term" do
       :ok = AgentDb.write("viking://resources/gone.md", "x")
-      {view, _html} = console()
+      {view, _html} = documents_console()
 
       # The button carries the full URI of the listed entry, which is what the
       # store can resolve -- a bare name would report `invalid_uri` for an entry

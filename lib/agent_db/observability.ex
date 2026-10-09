@@ -14,6 +14,12 @@ defmodule AgentDb.Observability do
   @job_event [:agent_db, :job, :stop]
   @model_event [:agent_db, :model, :stop]
 
+  # Correlation travels with the process rather than through every call site, so
+  # a log deep inside an operation carries the trace it belongs to without that
+  # operation threading it through each function.
+  @correlation_key :agent_db_correlation
+  @correlation_fields [:trace_id, :span_id, :job_id]
+
   @doc """
   Recent failures, newest first, each with the operation it happened in and its
   classified reason.
@@ -52,7 +58,7 @@ defmodule AgentDb.Observability do
     start = System.monotonic_time(:millisecond)
 
     try do
-      result = fun.()
+      result = with_correlation(otel_correlation(), fun)
       emit_operation(operation, outcome_of(result), start, meta)
       result
     rescue
@@ -145,9 +151,13 @@ defmodule AgentDb.Observability do
   @doc "Runs `fun` inside an OTel span when available, otherwise runs directly."
   @spec with_span(String.t(), map(), (-> result)) :: result when result: var
   def with_span(name, attrs \\ %{}, fun) when is_function(fun, 0) do
-    if Code.ensure_loaded?(:otel_tracer) and function_exported?(:otel_tracer, :with_span, 3) do
+    if otel?() do
       try do
-        apply(:otel_tracer, :with_span, [name, %{attributes: attrs}, fun])
+        apply(:otel_tracer, :with_span, [
+          name,
+          %{attributes: attrs},
+          fn -> with_correlation(otel_correlation(), fun) end
+        ])
       rescue
         _ -> fun.()
       catch
@@ -156,6 +166,68 @@ defmodule AgentDb.Observability do
     else
       fun.()
     end
+  end
+
+  @doc """
+  Runs `fun` with `correlation` added to this process's log correlation.
+
+  Correlation is process-scoped and additive: a nested context adds to what is
+  already there, and the previous value is restored when `fun` returns, raises,
+  or exits. Long-lived processes — workers, channels — rely on that restore so a
+  correlation never attaches to an unrelated later operation. Only the bounded
+  correlation fields are kept, and a nil entry never clears one already set.
+  """
+  @spec with_correlation(map(), (-> result)) :: result when result: var
+  def with_correlation(correlation, fun) when is_map(correlation) and is_function(fun, 0) do
+    previous = Process.get(@correlation_key)
+
+    clean =
+      for {key, value} <- correlation,
+          key in @correlation_fields,
+          not is_nil(value),
+          into: %{},
+          do: {key, value}
+
+    Process.put(@correlation_key, Map.merge(correlation(), clean))
+
+    try do
+      fun.()
+    after
+      restore_correlation(previous)
+    end
+  end
+
+  @doc false
+  @spec correlation() :: map()
+  def correlation, do: Process.get(@correlation_key) || %{}
+
+  defp restore_correlation(nil), do: Process.delete(@correlation_key)
+  defp restore_correlation(previous), do: Process.put(@correlation_key, previous)
+
+  defp otel? do
+    Code.ensure_loaded?(:otel_tracer) and function_exported?(:otel_tracer, :with_span, 3)
+  end
+
+  # The active OpenTelemetry span's identifiers, when a tracer is live. Without
+  # a host SDK the tracer is a no-op and this contributes nothing, so no trace
+  # id is invented here.
+  defp otel_correlation do
+    with true <- Code.ensure_loaded?(:otel_tracer),
+         true <- function_exported?(:otel_tracer, :current_span_ctx, 0),
+         ctx when ctx != :undefined <- :otel_tracer.current_span_ctx(),
+         true <- Code.ensure_loaded?(:otel_span),
+         true <- function_exported?(:otel_span, :hex_trace_id, 1) do
+      %{
+        trace_id: :otel_span.hex_trace_id(ctx),
+        span_id: :otel_span.hex_span_id(ctx)
+      }
+    else
+      _ -> %{}
+    end
+  rescue
+    _ -> %{}
+  catch
+    _, _ -> %{}
   end
 
   @doc """
@@ -209,12 +281,14 @@ defmodule AgentDb.Observability do
         :outcome,
         :reason,
         :trace_id,
+        :span_id,
         :job_id
       ])
       |> Keyword.update(:reason, nil, &classify_reason/1)
       |> Keyword.update(:kind, nil, &bounded_kind/1)
       |> Keyword.update(:operation, nil, &bounded_kind/1)
       |> Keyword.update(:role, nil, &bounded_kind/1)
+      |> merge_correlation()
 
     try do
       Logger.log(level, "agent_db", safe)
@@ -225,6 +299,17 @@ defmodule AgentDb.Observability do
     end
 
     :ok
+  end
+
+  # A field the caller passed wins; the correlation fills what it did not, and a
+  # nil on either side is dropped rather than emitted as a value.
+  defp merge_correlation(fields) do
+    provided = for {key, value} <- fields, not is_nil(value), into: %{}, do: {key, value}
+
+    correlation()
+    |> Map.take(@correlation_fields)
+    |> Map.merge(provided)
+    |> Enum.into([])
   end
 
   @doc false

@@ -6,7 +6,7 @@ defmodule AgentDbWeb.DocumentEditorLive do
   edit is visible before it is published and a reload before publishing loses
   nothing the operator can see they have written.
   """
-  use Phoenix.LiveView, layout: {AgentDbWeb.Layouts, :live}
+  use Phoenix.LiveView, layout: {AgentDbWeb.Layouts, :admin}
 
   import Phoenix.LiveView
   import Phoenix.Component
@@ -19,7 +19,7 @@ defmodule AgentDbWeb.DocumentEditorLive do
       {:ok, content} ->
         {:ok,
          socket
-         |> assign(uri: uri, content: content, draft: content, saved: true)
+         |> assign(active: :documents, uri: uri, content: content, draft: content, saved: true)
          |> assign_layers()}
 
       {:error, _reason} ->
@@ -89,7 +89,8 @@ defmodule AgentDbWeb.DocumentEditorLive do
          |> assign_layers()}
 
       {:error, reason} ->
-        {:noreply, put_flash(socket, :error, "Could not publish: #{inspect(reason)}")}
+        {:noreply,
+         put_flash(socket, :error, "Could not publish: #{Context.error_message(reason)}")}
     end
   end
 

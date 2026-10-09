@@ -17,6 +17,73 @@ defmodule AgentDbWeb.AdminComponents do
 
   alias AgentDbWeb.Context
 
+  # -- flash --
+
+  attr(:flash, :map, required: true)
+
+  @doc """
+  The feedback a page set for the operator, one entry per kind.
+
+  A LiveView sets feedback with `put_flash`, but it only reaches the operator if
+  a layout renders it. Every console page shares this shell, so rendering it here
+  is what makes the outcome of an action visible without leaving the page. The
+  host is always present -- an empty one measures nothing -- so the live region
+  exists before any message arrives.
+  """
+  def flash_group(assigns) do
+    ~H"""
+    <div id="flash" aria-live="polite">
+      <div
+        :for={{kind, message} <- @flash}
+        class={["m-4 rounded border px-3 py-2 text-sm", flash_class(kind)]}
+      >
+        <%= message %>
+      </div>
+    </div>
+    """
+  end
+
+  defp flash_class("error"), do: "border-red-300 bg-red-50 text-red-800"
+  defp flash_class("info"), do: "border-green-300 bg-green-50 text-green-800"
+  defp flash_class(_other), do: "border-gray-300 bg-gray-50 text-gray-800"
+
+  # -- navigation --
+
+  attr(:active, :atom, required: true)
+
+  @doc "The console's sidebar navigation, marking the page currently shown."
+  def sidebar(assigns) do
+    ~H"""
+    <nav class="flex flex-col gap-1 px-2" aria-label="Console">
+      <.nav_link page={:overview} label="Overview" href="/admin" active={@active} />
+      <.nav_link page={:documents} label="Documents" href="/admin/documents" active={@active} />
+      <.nav_link page={:storage} label="Storage" href="/admin/storage" active={@active} />
+      <.nav_link page={:skills} label="Skills" href="/admin/skills" active={@active} />
+      <.nav_link page={:sessions} label="Sessions" href="/admin/sessions" active={@active} />
+    </nav>
+    """
+  end
+
+  attr(:page, :atom, required: true)
+  attr(:label, :string, required: true)
+  attr(:href, :string, required: true)
+  attr(:active, :atom, required: true)
+
+  defp nav_link(assigns) do
+    ~H"""
+    <.link
+      navigate={@href}
+      data-active={@active == @page}
+      class={["block rounded px-3 py-2 text-sm", nav_class(@active == @page)]}
+    >
+      <%= @label %>
+    </.link>
+    """
+  end
+
+  defp nav_class(true), do: "bg-blue-50 font-medium text-blue-700"
+  defp nav_class(false), do: "text-gray-700 hover:bg-gray-100"
+
   # -- recent changes --
 
   attr(:changes, :list, required: true)

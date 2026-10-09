@@ -47,10 +47,10 @@ defmodule AgentDb.Application.Search do
   def search(term, opts \\ []) do
     # Malformed trace context never rejects: it is ignored and a new trace
     # begins, preserving the existing result contract.
-    _ = trace_context(opts)
-
-    Observability.timed(:search, %{kind: Keyword.get(opts, :mode, :keyword)}, fn ->
-      Observability.with_span("agent_db.search", %{}, fn -> do_search(term, opts) end)
+    Observability.with_correlation(trace_context(opts) || %{}, fn ->
+      Observability.timed(:search, %{kind: Keyword.get(opts, :mode, :keyword)}, fn ->
+        Observability.with_span("agent_db.search", %{}, fn -> do_search(term, opts) end)
+      end)
     end)
   end
 

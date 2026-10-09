@@ -43,10 +43,13 @@ defmodule AgentDb.VectorIndexSafetyTest do
     # Rewriting dim 4 flips the active table; the dim-2 row is untouched.
     :ok = Helpers.store_vectors(Storage, %{a => [1.0, 0.0, 0.0, 0.0]})
 
-    assert {:ok, [hit_a]} = Storage.search_vector(Helpers.encode_vector([1.0, 0.0, 0.0, 0.0]), 10, nil)
+    assert {:ok, [hit_a]} =
+             Storage.search_vector(Helpers.encode_vector([1.0, 0.0, 0.0, 0.0]), 10, nil)
+
     assert hit_a.uri == a
 
-    assert {:error, :dim_mismatch} = Storage.search_vector(Helpers.encode_vector([1.0, 0.0]), 10, nil)
+    assert {:error, :dim_mismatch} =
+             Storage.search_vector(Helpers.encode_vector([1.0, 0.0]), 10, nil)
 
     # Backfill for the active dim still wants b: proof b never leaked into it.
     assert {:ok, 1} = Storage.backfill_vector_index()
@@ -101,7 +104,14 @@ defmodule AgentDb.VectorIndexSafetyTest do
 
   test "coverage tracks active dim, counts, and backfill need" do
     assert {:ok, fresh} = Storage.vector_index_stats()
-    assert fresh == %{available: true, active_dim: :unknown, vectors: 0, documents: 0, needs_backfill: false}
+
+    assert fresh == %{
+             available: true,
+             active_dim: :unknown,
+             vectors: 0,
+             documents: 0,
+             needs_backfill: false
+           }
 
     a = "viking://resources/coverage/a.md"
     b = "viking://resources/coverage/b.md"
@@ -114,7 +124,14 @@ defmodule AgentDb.VectorIndexSafetyTest do
 
     :ok = Helpers.store_vectors(Storage, %{a => [1.0, 0.0, 0.0, 0.0]})
     assert {:ok, partial} = Storage.vector_index_stats()
-    assert partial == %{available: true, active_dim: 4, vectors: 1, documents: 2, needs_backfill: true}
+
+    assert partial == %{
+             available: true,
+             active_dim: 4,
+             vectors: 1,
+             documents: 2,
+             needs_backfill: true
+           }
 
     :ok = Helpers.store_vectors(Storage, %{b => [0.0, 1.0, 0.0, 0.0]})
     assert {:ok, full} = Storage.vector_index_stats()

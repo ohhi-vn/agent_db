@@ -118,6 +118,14 @@ defmodule AgentDbWeb.EndpointTest do
       # Distinguishes a served surface from an open port that answers nothing.
       assert {:ok, 404, _body} = get("/api/v1/no-such-route-at-all")
     end
+
+    test "serves the console's stylesheet and script rather than 404" do
+      # Every console page links these two paths. Without the endpoint's static
+      # plug they match no route and answer 404, so the page renders unstyled
+      # however current the committed stylesheet is.
+      assert {:ok, 200, _body} = get("/assets/app.css")
+      assert {:ok, 200, _body} = get("/assets/app.js")
+    end
   end
 
   describe "authentication" do
@@ -151,6 +159,21 @@ defmodule AgentDbWeb.EndpointTest do
   end
 
   describe "the listener's lifecycle" do
+    test "is not opened by default in the test environment" do
+      # The suite restarts the application from many setup blocks, so the
+      # default must be no listener. That default is the `http_enabled` gate in
+      # `AgentDb.Application`, not a `server: false` in the endpoint config --
+      # which is why the endpoint still reports serving above.
+      System.delete_env("AGENT_DB_HTTP_ENABLED")
+      :ok = restart_app()
+
+      refute AgentDb.Config.http_enabled(),
+             "the test environment must not enable the HTTP surface by default"
+
+      refute Process.whereis(AgentDbWeb.Endpoint),
+             "the endpoint must not be started in the test environment by default"
+    end
+
     test "is not opened when HTTP is disabled" do
       System.put_env("AGENT_DB_HTTP_ENABLED", "false")
       :ok = restart_app()

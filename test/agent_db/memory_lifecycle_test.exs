@@ -162,17 +162,23 @@ defmodule AgentDb.MemoryLifecycleTest do
     assert {:ok, _} = AgentDb.remember(@name, "ada lovelace", confidence: 0.9)
 
     assert {:ok, _} =
-             AgentDb.remember("viking://user/memories/profile/alias", "ada lovelace", confidence: 0.9)
+             AgentDb.remember("viking://user/memories/profile/alias", "ada lovelace",
+               confidence: 0.9
+             )
 
     assert {:ok, []} = AgentDb.recall("viking://user/memories/profile/alias")
 
     assert {:ok, _} =
-             AgentDb.remember("viking://user/memories/events/whisper", "barely held", confidence: 0.05)
+             AgentDb.remember("viking://user/memories/events/whisper", "barely held",
+               confidence: 0.05
+             )
 
     assert {:ok, []} = AgentDb.recall("viking://user/memories/events/whisper")
 
     assert {:ok, _} =
-             AgentDb.remember("viking://user/memories/events/loud", "firmly held", confidence: 0.9)
+             AgentDb.remember("viking://user/memories/events/loud", "firmly held",
+               confidence: 0.9
+             )
 
     assert {:ok, [_]} = AgentDb.recall("viking://user/memories/events/loud")
   end
@@ -288,10 +294,25 @@ defmodule AgentDb.MemoryLifecycleTest do
     value = "prefers Elixir over Go"
     query_vec = Map.fetch!(vecs, "likes Elixir")
 
-    fresh = %{id: 1, uri: "viking://user/memories/preferences/fresh", value: value, confidence: 0.9, last_surfaced_at: now}
-    stale = %{id: 2, uri: "viking://user/memories/preferences/stale", value: value, confidence: 0.9, last_surfaced_at: nil}
+    fresh = %{
+      id: 1,
+      uri: "viking://user/memories/preferences/fresh",
+      value: value,
+      confidence: 0.9,
+      last_surfaced_at: now
+    }
 
-    assert [first, second] = Fixture.rank_blended_decay([stale, fresh], "likes Elixir", query_vec, vecs, now)
+    stale = %{
+      id: 2,
+      uri: "viking://user/memories/preferences/stale",
+      value: value,
+      confidence: 0.9,
+      last_surfaced_at: nil
+    }
+
+    assert [first, second] =
+             Fixture.rank_blended_decay([stale, fresh], "likes Elixir", query_vec, vecs, now)
+
     assert first.uri == fresh.uri
     assert second.uri == stale.uri
 

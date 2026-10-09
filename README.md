@@ -33,7 +33,7 @@ hand, so it cannot drift from the modules it describes.
 - **Hex docs** — Locked-version-aware docs under `viking://resources/hex/<package>/<version>/` discovered offline from `mix.lock`
 - **BEAM runtime snapshots** — Read-only AgentDb.RuntimeContext.snapshot/0 (apps, supervisors, processes, ETS, memory) with bounds and redaction; never auto-writes
 - **Pluggable inference** — Local Nx/Bumblebee default plus opt-in Ollama and OpenAI-compatible adapters behind `AgentDb.Core.Inference`; one `inference_provider` key chooses both which provider serves and the provider kind `model_status/0` reports, and an unreachable remote provider is reported as such rather than as loaded
-- **Operations console** — `/admin` reports storage footprint and tree composition, cache and BEAM memory sizes, vector-index coverage, per-role model state (load duration, latency, in-flight, provider health), durable queue depth with failed jobs and their classified reasons, node uptime and process counts, and a bounded list of recent operational errors
+- **Operations console** — a navigable console under `/admin` with a persistent sidebar: an **Overview** (health, models, queue, runtime, recent changes), **Documents** (paged listing and search), **Storage** (footprint, cache, index coverage), **Skills** (import), and **Sessions** (lookup). It reports storage footprint and tree composition, cache and BEAM memory sizes, vector-index coverage, per-role model state (load duration, latency, in-flight, provider health), durable queue depth with failed jobs and their classified reasons, node uptime and process counts, and a bounded list of recent operational errors
 
 ## Installation
 
@@ -260,7 +260,7 @@ my-skills/code-review/
 {:ok, content} = AgentDb.read("viking://user/alice/skills/code-review/references/checklist.md")
 ```
 
-The same import is available from the operations console at `/admin` and from
+The same import is available from the operations console at `/admin/skills` and from
 the command line, and both go through one workflow: what a bundle may look like,
 what is refused, and where a skill lands are decided once
 (`AgentDb.Skills.Source` and the skills workflow).
@@ -284,7 +284,7 @@ read as text, so a file that is not valid UTF-8 is refused rather than mangled.
 
 ### From the console
 
-Open `/admin`, fill in the **User ID**, then either
+Open `/admin/skills`, fill in the **User ID**, then either
 
 - choose a **Skills folder** — the browser is asked for a whole directory, and
   every file inside it is uploaded with the path it had there, or
@@ -524,6 +524,51 @@ Connect to `ws://localhost:6060/api`; with auth enabled, include
   scenarios (reads, tree, keyword/hybrid, writes, queue) on isolated SQLite
   data; baselines live in `bench/baseline.md`. No absolute latency is
   asserted in CI; only repeatable measured deltas justify optimization.
+
+### Console assets (development)
+
+The console's stylesheet is generated from the LiveView markup and committed
+under `priv/static/assets`. It includes Tailwind's base reset, so browser
+default body margins, list markers, and form controls do not leak into the
+pages. After changing console markup, regenerate it with:
+
+```bash
+mix assets.build
+```
+
+The `assets.build` alias runs the Tailwind and esbuild profiles configured in
+`config/config.exs`, which point at `assets/css/app.css` and
+`priv/static/assets/app.css`. In development the endpoint's asset watchers run
+the same profiles, so the stylesheet is rebuilt as markup changes; see
+[Development](#development).
+
+For a production build, `mix assets.deploy` runs the same profiles minified and
+then digests `priv/static`, writing `priv/static/cache_manifest.json`. The
+endpoint serves the files through `Plug.Static`, and `config/prod.exs` names that
+manifest so the pages' asset URLs resolve to the digested filenames. A deploy
+that skips the step still serves the committed assets, but logs a warning that
+the static manifest could not be warmed up.
+
+### Development
+
+Run the web surface locally with `mix phx.server` (or `iex -S mix`). It binds
+loopback on `AGENT_DB_HTTP_PORT` (default `6060`), so `/admin` is at
+`http://127.0.0.1:6060/admin`.
+
+In development the endpoint is configured in `config/dev.exs` to:
+
+- reload changed project source (`code_reloader`), so a source edit is served
+  without restarting the server;
+- reload the browser when a template or an asset changes (`live_reload`);
+- run the Tailwind and esbuild profiles as `watchers`, so the console's
+  stylesheet and scripts are rebuilt as their sources change;
+- expose the node dashboard at `/dev/dashboard`.
+
+The test environment (`config/test.exs`) does not start the endpoint at all:
+`AgentDb.Application` defaults `http_enabled` to false under `Mix.env() ==
+:test`, and a test that needs the endpoint starts it explicitly. This keeps the
+serial suite from binding a port on every restart. Per-environment settings are
+imported from `config/config.exs` via `import_config "#{config_env()}.exs"`.
 
 ## Architecture
 

@@ -31,8 +31,18 @@ defmodule AgentDbWeb.Router do
 
   scope "/", AgentDbWeb do
     pipe_through(:browser)
-    live("/admin", AdminLive, :index)
-    live("/admin/documents/:id/edit", DocumentEditorLive, :edit)
+
+    # One session for the console, so navigating between its pages and the
+    # editor is a live redirect that reuses the connection rather than a full
+    # page load.
+    live_session :admin do
+      live("/admin", Admin.OverviewLive, :index)
+      live("/admin/documents", Admin.DocumentsLive, :index)
+      live("/admin/storage", Admin.StorageLive, :index)
+      live("/admin/skills", Admin.SkillsLive, :index)
+      live("/admin/sessions", Admin.SessionsLive, :index)
+      live("/admin/documents/:id/edit", DocumentEditorLive, :edit)
+    end
   end
 
   scope "/", AgentDbWeb.Controllers do
@@ -60,7 +70,7 @@ defmodule AgentDbWeb.Router do
   if Mix.env() == :dev do
     scope "/dev" do
       pipe_through(:browser)
-      live_dashboard("/dashboard", metrics: true)
+      live_dashboard("/dashboard", metrics: false)
     end
   end
 end

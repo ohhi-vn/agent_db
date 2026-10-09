@@ -16,8 +16,6 @@ defmodule AgentDb.Workers.JobWorker do
   alias AgentDb.Observability
   alias AgentDb.Runtime
 
-  require Logger
-
   defmodule Handler do
     @moduledoc false
     # What one kind of background work is: which jobs it claims, and what it
@@ -94,7 +92,7 @@ defmodule AgentDb.Workers.JobWorker do
 
   # A claim is followed immediately by another: work often arrives in batches
   # already queued, so idling between them would only add latency.
-  defp work(%{handler: handler, worker_id: worker_id, failures: failures} = state) do
+  defp work(%{handler: handler, failures: failures} = state) do
     result =
       try do
         case Runtime.storage().dequeue_job(handler.kinds()) do
@@ -108,18 +106,36 @@ defmodule AgentDb.Workers.JobWorker do
             %{state | failures: 0}
 
           {:error, reason} ->
-            Logger.error("#{worker_id} dequeue error: #{inspect(reason)}")
+            Observability.log(:error,
+              component: :worker,
+              operation: :dequeue,
+              outcome: :error,
+              reason: reason
+            )
+
             Process.send_after(self(), :process_next, backoff(failures))
             %{state | failures: failures + 1}
         end
       rescue
         error ->
-          Logger.error("#{worker_id} worker crashed, recovered: #{inspect(error)}")
+          Observability.log(:error,
+            component: :worker,
+            operation: :work,
+            outcome: :error,
+            reason: {:worker_crash, error.__struct__}
+          )
+
           Process.send_after(self(), :process_next, backoff(failures))
           %{state | failures: failures + 1}
       catch
-        kind, reason ->
-          Logger.error("#{worker_id} worker caught #{inspect(kind)}: #{inspect(reason)}")
+        kind, _reason ->
+          Observability.log(:error,
+            component: :worker,
+            operation: :work,
+            outcome: :error,
+            reason: {:worker_catch, kind}
+          )
+
           Process.send_after(self(), :process_next, backoff(failures))
           %{state | failures: failures + 1}
       end
@@ -138,41 +154,44 @@ defmodule AgentDb.Workers.JobWorker do
   # work that has not had its chance yet. A failure is recorded. A result goes
   # to storage, which decides whether its node is still there to receive it.
   defp process(storage, handler, job) do
-    queue_wait = queue_wait_ms(job)
-    start = System.monotonic_time(:millisecond)
+    # Correlation for the whole job, so every log it emits — completed, deferred,
+    # failed, or discarded — carries the job id and the trace it was enqueued
+    # under without each call site repeating them.
+    Observability.with_correlation(job_correlation(job), fn ->
+      queue_wait = queue_wait_ms(job)
+      start = System.monotonic_time(:millisecond)
 
-    Observability.with_span("agent_db.job", %{kind: job.kind}, fn ->
-      outcome =
-        try do
-          if job.kind in handler.kinds() do
-            case handler.generate(job) do
-              {:ok, result} -> store(storage, handler, job, result)
-              {:error, :model_loading} -> defer(storage, job.id)
-              {:error, reason} -> fail(storage, job.id, reason)
-              other -> fail(storage, job.id, {:invalid_job_result, other})
+      Observability.with_span("agent_db.job", %{kind: job.kind}, fn ->
+        outcome =
+          try do
+            if job.kind in handler.kinds() do
+              case handler.generate(job) do
+                {:ok, result} -> store(storage, handler, job, result)
+                {:error, :model_loading} -> defer(storage, job)
+                {:error, reason} -> fail(storage, job, reason)
+                other -> fail(storage, job, {:invalid_job_result, other})
+              end
+            else
+              fail(storage, job, {:unknown_job_kind, job.kind})
             end
-          else
-            fail(storage, job.id, {:unknown_job_kind, job.kind})
+          rescue
+            error -> fail(storage, job, {:worker_crash, error.__struct__})
+          catch
+            kind, reason -> fail(storage, job, {:worker_catch, kind, reason})
           end
-        rescue
-          error -> fail(storage, job.id, {:worker_crash, error.__struct__})
-        catch
-          kind, reason -> fail(storage, job.id, {:worker_catch, kind, reason})
-        end
 
-      execution = System.monotonic_time(:millisecond) - start
-      Observability.emit_job(job.kind, outcome, queue_wait, execution)
+        execution = System.monotonic_time(:millisecond) - start
+        Observability.emit_job(job.kind, outcome, queue_wait, execution)
 
-      Observability.log(:info,
-        component: :worker,
-        kind: job.kind,
-        outcome: outcome,
-        job_id: job.id,
-        trace_id: trace_id(job)
-      )
+        Observability.log(:info, component: :worker, kind: job.kind, outcome: outcome)
 
-      :ok
+        :ok
+      end)
     end)
+  end
+
+  defp job_correlation(job) do
+    %{job_id: job.id, trace_id: trace_id(job), span_id: span_id(job)}
   end
 
   defp queue_wait_ms(%{queued_at: queued, claimed_at: claimed})
@@ -183,6 +202,9 @@ defmodule AgentDb.Workers.JobWorker do
 
   defp trace_id(%{payload: %{"_trace" => %{"trace_id" => trace_id}}}), do: trace_id
   defp trace_id(_), do: nil
+
+  defp span_id(%{payload: %{"_trace" => %{"span_id" => span_id}}}), do: span_id
+  defp span_id(_), do: nil
 
   defp store(storage, handler, job, result) do
     outcome =
@@ -205,32 +227,25 @@ defmodule AgentDb.Workers.JobWorker do
       # The node was removed while the model was running. The job is already
       # done; its result is simply not wanted.
       {:ok, :discarded} ->
-        Observability.log(:info,
-          component: :worker,
-          kind: job.kind,
-          outcome: :discarded,
-          job_id: job.id,
-          trace_id: trace_id(job)
-        )
-
+        Observability.log(:info, component: :worker, kind: job.kind, outcome: :discarded)
         :discarded
 
       {:error, reason} ->
-        fail(storage, job.id, reason)
+        fail(storage, job, reason)
     end
   end
 
-  defp defer(storage, job_id) do
-    case storage.defer_job(job_id, @model_loading_delay_ms) do
+  defp defer(storage, job) do
+    case storage.defer_job(job.id, @model_loading_delay_ms) do
       :ok ->
         :deferred
 
       {:error, reason} ->
         Observability.log(:error,
           component: :worker,
+          kind: job.kind,
           outcome: :error,
-          reason: reason,
-          job_id: job_id
+          reason: reason
         )
 
         :error
@@ -240,14 +255,14 @@ defmodule AgentDb.Workers.JobWorker do
   # The bounded error code travels with the failure, so a job that finally
   # gives up can still be explained by whoever looks at it later rather than by
   # the log line that has since rotated away.
-  defp fail(storage, job_id, reason) do
-    case storage.fail_job(job_id, Observability.error_code(reason)) do
+  defp fail(storage, job, reason) do
+    case storage.fail_job(job.id, Observability.error_code(reason)) do
       :ok ->
         Observability.log(:error,
           component: :worker,
+          kind: job.kind,
           outcome: :failed,
-          reason: reason,
-          job_id: job_id
+          reason: reason
         )
 
         :failed
@@ -255,9 +270,9 @@ defmodule AgentDb.Workers.JobWorker do
       {:error, error} ->
         Observability.log(:error,
           component: :worker,
+          kind: job.kind,
           outcome: :error,
-          reason: error,
-          job_id: job_id
+          reason: error
         )
 
         :error

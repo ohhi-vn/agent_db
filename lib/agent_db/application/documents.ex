@@ -43,9 +43,23 @@ defmodule AgentDb.Application.Documents do
   """
   @spec write(uri(), content(), keyword()) :: :ok | {:error, term()}
   def write(uri, content, opts \\ []) when is_binary(content) do
-    Observability.timed(:write, %{}, fn ->
-      Observability.with_span("agent_db.write", %{}, fn -> do_write(uri, content, opts) end)
+    Observability.with_correlation(trace_correlation(opts), fn ->
+      Observability.timed(:write, %{}, fn ->
+        Observability.with_span("agent_db.write", %{}, fn -> do_write(uri, content, opts) end)
+      end)
     end)
+  end
+
+  # The incoming trace, when there is one, so the operation's logs and the jobs
+  # it enqueues carry the same trace id.
+  defp trace_correlation(opts) do
+    case Keyword.get(opts, :trace_context) do
+      %{trace_id: trace_id, span_id: span_id} when is_binary(trace_id) and is_binary(span_id) ->
+        %{trace_id: trace_id, span_id: span_id}
+
+      _ ->
+        %{}
+    end
   end
 
   defp do_write(uri, content, opts) do

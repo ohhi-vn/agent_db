@@ -14,10 +14,9 @@ defmodule AgentDb.Application.Memories do
   # read whole; an atomic fact is neither.
 
   alias AgentDb.Cache
+  alias AgentDb.Observability
   alias AgentDb.Runtime
   alias AgentDb.URI, as: VikingURI
-
-  require Logger
 
   @type uri :: String.t()
   @type value :: String.t()
@@ -156,7 +155,7 @@ defmodule AgentDb.Application.Memories do
     with {:ok, uri} <- validate_slot(uri),
          :ok <- validate_confidence(confidence),
          :ok <- validate_importance(importance),
-         status <- gate_status(uri, value, confidence, opts),
+         status <- gate_status(value, confidence, opts),
          :ok <-
            Runtime.storage().put_memory(uri, value, confidence, source,
              importance: importance,
@@ -170,24 +169,37 @@ defmodule AgentDb.Application.Memories do
 
   # The rule-based gate: explicit opt-in, near-zero confidence, or a value
   # already held elsewhere all wait as candidates. Rule-based and model-free,
-  # so recording still needs no model; the reason is debug-logged, not stored.
+  # so recording still needs no model; the reason is debug-logged as a bounded
+  # kind, not stored, and the URI is never logged.
   # The duplicate lookup fails open: a store that cannot answer still records.
-  defp gate_status(uri, value, confidence, opts) do
+  defp gate_status(value, confidence, opts) do
     if Keyword.get(opts, :candidate, false) do
       :candidate
     else
-      gate_by_rules(uri, value, confidence)
+      gate_by_rules(value, confidence)
     end
   end
 
-  defp gate_by_rules(uri, value, confidence) do
+  defp gate_by_rules(value, confidence) do
     cond do
       confidence < @candidate_min_confidence ->
-        Logger.debug("memory candidate held for low confidence at #{uri}")
+        Observability.log(:debug,
+          component: :memory,
+          operation: :remember,
+          outcome: :held,
+          kind: :low_confidence
+        )
+
         :candidate
 
       duplicate_value?(value) ->
-        Logger.debug("memory candidate held as duplicate at #{uri}")
+        Observability.log(:debug,
+          component: :memory,
+          operation: :remember,
+          outcome: :held,
+          kind: :duplicate
+        )
+
         :candidate
 
       true ->
@@ -263,7 +275,13 @@ defmodule AgentDb.Application.Memories do
         :ok
 
       {:error, reason} ->
-        Logger.debug("memory recall leaving surfaced times untouched: #{inspect(reason)}")
+        Observability.log(:debug,
+          component: :memory,
+          operation: :recall,
+          outcome: :error,
+          reason: reason
+        )
+
         :ok
     end
   end
@@ -323,11 +341,23 @@ defmodule AgentDb.Application.Memories do
           blend_or_fallback(candidates, term, query, vecs)
 
         {:ok, _} ->
-          Logger.debug("memory recall falling back to confidence order: malformed embed batch")
+          Observability.log(:debug,
+            component: :memory,
+            operation: :recall,
+            outcome: :fallback,
+            reason: :malformed_embed_batch
+          )
+
           candidates
 
         {:error, reason} ->
-          Logger.debug("memory recall falling back to confidence order: #{inspect(reason)}")
+          Observability.log(:debug,
+            component: :memory,
+            operation: :recall,
+            outcome: :fallback,
+            reason: reason
+          )
+
           candidates
       end
     else
@@ -339,7 +369,13 @@ defmodule AgentDb.Application.Memories do
     if Enum.all?(vecs, &(byte_size(&1) == byte_size(query))) do
       rank_blended(candidates, term, query, vecs)
     else
-      Logger.debug("memory recall falling back to confidence order: dim mismatch")
+      Observability.log(:debug,
+        component: :memory,
+        operation: :recall,
+        outcome: :fallback,
+        reason: :dim_mismatch
+      )
+
       candidates
     end
   end

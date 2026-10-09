@@ -80,6 +80,10 @@ defmodule AgentDbWeb.Context do
   @spec skill_import_error(term()) :: String.t()
   def skill_import_error(reason), do: AgentDb.skill_import_error_message(reason)
 
+  @doc "Why a store operation failed, in words and from the shared taxonomy."
+  @spec error_message(term()) :: String.t()
+  def error_message(reason), do: Observability.error_message(reason)
+
   @doc "Searches the store. See `AgentDb.search/2` for the options."
   @spec search_documents(String.t(), map() | keyword()) :: {:ok, [map()]} | {:error, term()}
   def search_documents(term, opts \\ []) do

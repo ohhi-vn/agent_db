@@ -16,7 +16,7 @@ defmodule AgentDbWeb.ErrorView do
     <html>
       <head>
         <title>404 Not Found</title>
-        <link phx-track-static rel="stylesheet" href="/assets/app.css" />
+        <link phx-track-static rel="stylesheet" href={AgentDbWeb.Endpoint.static_path("/assets/app.css")} />
       </head>
       <body class="bg-gray-50 min-h-screen flex items-center justify-center">
         <div class="text-center">
@@ -35,7 +35,7 @@ defmodule AgentDbWeb.ErrorView do
     <html>
       <head>
         <title>500 Internal Server Error</title>
-        <link phx-track-static rel="stylesheet" href="/assets/app.css" />
+        <link phx-track-static rel="stylesheet" href={AgentDbWeb.Endpoint.static_path("/assets/app.css")} />
       </head>
       <body class="bg-gray-50 min-h-screen flex items-center justify-center">
         <div class="text-center">

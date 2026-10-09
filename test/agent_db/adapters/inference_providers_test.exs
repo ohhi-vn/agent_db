@@ -133,8 +133,8 @@ defmodule AgentDb.InferenceProvidersTest do
     # shape, and answers like a minimal OpenAI-compatible server.
     use Plug.Router
 
-    plug :match
-    plug :dispatch
+    plug(:match)
+    plug(:dispatch)
 
     post "/embeddings" do
       {:ok, body, conn} = Plug.Conn.read_body(conn)
@@ -180,8 +180,8 @@ defmodule AgentDb.InferenceProvidersTest do
     # is observable rather than asserted.
     use Plug.Router
 
-    plug :match
-    plug :dispatch
+    plug(:match)
+    plug(:dispatch)
 
     post "/api/embed" do
       {:ok, body, conn} = Plug.Conn.read_body(conn)
@@ -210,8 +210,8 @@ defmodule AgentDb.InferenceProvidersTest do
     # so the per-text fallback is exercised rather than asserted.
     use Plug.Router
 
-    plug :match
-    plug :dispatch
+    plug(:match)
+    plug(:dispatch)
 
     post "/api/embed" do
       {:ok, body, conn} = Plug.Conn.read_body(conn)
@@ -235,7 +235,7 @@ defmodule AgentDb.InferenceProvidersTest do
 
   test "openai request bodies carry the configured model" do
     table = :ets.new(:provider_probe, [:set, :public, :named_table])
-    {:ok, _} = Plug.Cowboy.http(ProbeOpenAI, [], port: 11_451)
+    start_supervised!({Bandit, plug: ProbeOpenAI, port: 11_451})
 
     try do
       Application.put_env(:agent_db, :openai_base_url, "http://127.0.0.1:11451")
@@ -252,14 +252,13 @@ defmodule AgentDb.InferenceProvidersTest do
       assert [{:chat, chat_body}] = :ets.lookup(table, :chat)
       assert chat_body["model"] == "probe-llm-v1"
     after
-      Plug.Cowboy.shutdown(ProbeOpenAI.HTTP)
       :ets.delete(table)
     end
   end
 
   test "ollama embeds batch inputs in one call preserving order" do
     table = :ets.new(:provider_probe, [:set, :public, :named_table])
-    {:ok, _} = Plug.Cowboy.http(ProbeOllamaBatch, [], port: 11_452)
+    start_supervised!({Bandit, plug: ProbeOllamaBatch, port: 11_452})
 
     try do
       Application.put_env(:agent_db, :ollama_base_url, "http://127.0.0.1:11452")
@@ -273,14 +272,13 @@ defmodule AgentDb.InferenceProvidersTest do
       assert decode4(second) == [1.0, 0.0, 0.0, 0.0]
       assert decode4(third) == [2.0, 0.0, 0.0, 0.0]
     after
-      Plug.Cowboy.shutdown(ProbeOllamaBatch.HTTP)
       :ets.delete(table)
     end
   end
 
   test "ollama falls back to per-text calls when the server rejects a batch" do
     table = :ets.new(:provider_probe, [:set, :public, :named_table])
-    {:ok, _} = Plug.Cowboy.http(ProbeOllamaRejectBatch, [], port: 11_453)
+    start_supervised!({Bandit, plug: ProbeOllamaRejectBatch, port: 11_453})
 
     try do
       Application.put_env(:agent_db, :ollama_base_url, "http://127.0.0.1:11453")
@@ -288,7 +286,6 @@ defmodule AgentDb.InferenceProvidersTest do
       assert {:ok, [_, _]} = AgentDb.Adapters.Inference.Ollama.embed(["x", "y"])
       assert [{:single_calls, 2}] = :ets.lookup(table, :single_calls)
     after
-      Plug.Cowboy.shutdown(ProbeOllamaRejectBatch.HTTP)
       :ets.delete(table)
     end
   end
@@ -300,8 +297,8 @@ defmodule AgentDb.InferenceProvidersTest do
     # Reachable remote: tags answer, so the provider reports ready.
     use Plug.Router
 
-    plug :match
-    plug :dispatch
+    plug(:match)
+    plug(:dispatch)
 
     get "/api/tags" do
       conn
@@ -315,20 +312,16 @@ defmodule AgentDb.InferenceProvidersTest do
   end
 
   test "a reachable remote counts as healthy, an unreachable one as degraded" do
-    {:ok, _} = Plug.Cowboy.http(ProbeOllamaHealthy, [], port: 11_454)
+    start_supervised!({Bandit, plug: ProbeOllamaHealthy, port: 11_454})
 
-    try do
-      Application.put_env(:agent_db, :inference_provider, :ollama)
-      Application.put_env(:agent_db, :ollama_base_url, "http://127.0.0.1:11454")
+    Application.put_env(:agent_db, :inference_provider, :ollama)
+    Application.put_env(:agent_db, :ollama_base_url, "http://127.0.0.1:11454")
 
-      assert %{status: "ok", checks: %{db: true, models: true}} = AgentDb.health_check()
+    assert %{status: "ok", checks: %{db: true, models: true}} = AgentDb.health_check()
 
-      Application.put_env(:agent_db, :ollama_base_url, "http://127.0.0.1:1")
+    Application.put_env(:agent_db, :ollama_base_url, "http://127.0.0.1:1")
 
-      assert %{status: "degraded", checks: %{db: true, models: false}} = AgentDb.health_check()
-    after
-      Plug.Cowboy.shutdown(ProbeOllamaHealthy.HTTP)
-    end
+    assert %{status: "degraded", checks: %{db: true, models: false}} = AgentDb.health_check()
   end
 
   test "embedding dims are last-observed, unknown before the first embed" do
@@ -343,7 +336,7 @@ defmodule AgentDb.InferenceProvidersTest do
     assert AgentDb.Adapters.Inference.Ollama.model_status().embedding.dim == :unknown
 
     table = :ets.new(:provider_probe, [:set, :public, :named_table])
-    {:ok, _} = Plug.Cowboy.http(ProbeOllamaBatch, [], port: 11_455)
+    start_supervised!({Bandit, plug: ProbeOllamaBatch, port: 11_455})
 
     try do
       Application.put_env(:agent_db, :ollama_base_url, "http://127.0.0.1:11455")
@@ -355,7 +348,6 @@ defmodule AgentDb.InferenceProvidersTest do
       assert ObservedDim.get(:local) == :unknown
       assert ObservedDim.get(:openai_compatible) == :unknown
     after
-      Plug.Cowboy.shutdown(ProbeOllamaBatch.HTTP)
       :ets.delete(table)
     end
   end

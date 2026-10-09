@@ -10,7 +10,7 @@ defmodule AgentDb.ML.ModelManager.Backend do
   @type model_ref :: map()
   @type config :: map()
 
-  require Logger
+  alias AgentDb.Observability
 
   @callback load_embedding(config()) :: {:ok, model_ref()} | {:error, term()}
   @callback load_llm(config()) :: {:ok, model_ref()} | {:error, term()}
@@ -55,23 +55,48 @@ defmodule AgentDb.ML.ModelManager.Backend do
         ok
 
       {:error, reason} ->
-        Logger.warning(
-          "EMLX backend failed for #{inspect(role)}, falling back to EXLA: #{inspect(reason)}"
+        Observability.log(:warning,
+          component: :model,
+          operation: :load,
+          role: role,
+          outcome: :fallback,
+          reason: reason
         )
 
         apply(module_for(:exla), load_fun(role), [config])
     end
   rescue
     _error ->
-      Logger.warning("EMLX backend raised for #{inspect(role)}, falling back to EXLA")
+      Observability.log(:warning,
+        component: :model,
+        operation: :load,
+        role: role,
+        outcome: :fallback,
+        reason: :emlx_raised
+      )
+
       apply(module_for(:exla), load_fun(role), [config])
   catch
     :exit, _ ->
-      Logger.warning("EMLX backend exited for #{inspect(role)}, falling back to EXLA")
+      Observability.log(:warning,
+        component: :model,
+        operation: :load,
+        role: role,
+        outcome: :fallback,
+        reason: :emlx_exited
+      )
+
       apply(module_for(:exla), load_fun(role), [config])
 
     :throw, _ ->
-      Logger.warning("EMLX backend threw for #{inspect(role)}, falling back to EXLA")
+      Observability.log(:warning,
+        component: :model,
+        operation: :load,
+        role: role,
+        outcome: :fallback,
+        reason: :emlx_threw
+      )
+
       apply(module_for(:exla), load_fun(role), [config])
   end
 

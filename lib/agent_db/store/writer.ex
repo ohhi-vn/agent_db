@@ -59,6 +59,11 @@ defmodule AgentDb.Store.Writer do
     {:reply, run_with_busy_retry(fun, state.conn), state}
   end
 
+  @impl true
+  def handle_call(:conn, _from, state) do
+    {:reply, state.conn, state}
+  end
+
   defp run_with_busy_retry(fun, conn) do
     case run_callback(fun, conn) do
       {:error, _} = err when is_tuple(err) ->
@@ -91,16 +96,10 @@ defmodule AgentDb.Store.Writer do
 
   defp busy_error?({:error, :storage_busy}), do: true
   defp busy_error?({:error, reason}), do: busy_text?(inspect(reason))
-  defp busy_error?(_), do: false
 
   defp busy_text?(text) do
     down = String.downcase(text)
     String.contains?(down, "busy") or String.contains?(down, "locked")
-  end
-
-  @impl true
-  def handle_call(:conn, _from, state) do
-    {:reply, state.conn, state}
   end
 
   defp maybe_schema(_conn, false), do: :ok

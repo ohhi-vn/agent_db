@@ -32,7 +32,12 @@ defmodule AgentDb.Adapters.Inference.OpenAICompatible do
            ) do
         {:ok, %Req.Response{status: 200, body: %{"data" => items}}} ->
           vectors = Enum.map(items, fn %{"embedding" => vec} -> encode(vec) end)
-          Enum.each(vectors, &AgentDb.Adapters.Inference.ObservedDim.observe(:openai_compatible, &1))
+
+          Enum.each(
+            vectors,
+            &AgentDb.Adapters.Inference.ObservedDim.observe(:openai_compatible, &1)
+          )
+
           {:ok, vectors}
 
         {:ok, %Req.Response{status: 401}} ->
@@ -64,7 +69,10 @@ defmodule AgentDb.Adapters.Inference.OpenAICompatible do
       url = String.trim_trailing(base, "/") <> "/chat/completions"
       headers = auth_headers()
 
-      body = %{model: AgentDb.Config.openai_llm_model(), messages: [%{role: "user", content: prompt}]}
+      body = %{
+        model: AgentDb.Config.openai_llm_model(),
+        messages: [%{role: "user", content: prompt}]
+      }
 
       case Req.post(url, json: body, headers: headers, receive_timeout: @receive_timeout) do
         {:ok,

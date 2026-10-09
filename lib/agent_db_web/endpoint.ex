@@ -11,6 +11,17 @@ defmodule AgentDbWeb.Endpoint do
   socket("/api", AgentDbWeb.WebSocket)
   socket("/live", Phoenix.LiveView.Socket)
 
+  # The console's compiled stylesheet and script, served from `priv/static`.
+  # Without this plug the pages' `/assets/app.css` and `/assets/app.js` links
+  # have no route and answer 404. It runs before the router and the session, so
+  # public assets are served without the browser pipeline.
+  plug(Plug.Static,
+    at: "/",
+    from: :agent_db,
+    gzip: false,
+    only: ~w(assets fonts images favicon.ico robots.txt)
+  )
+
   plug(Plug.RequestId)
   plug(Plug.Logger)
 
