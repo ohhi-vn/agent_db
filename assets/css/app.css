@@ -43,13 +43,65 @@
 }
 
 /* Admin Dashboard Styles */
+.admin-header {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+}
+
 .admin-sidebar {
   min-height: 100vh;
+  transition: margin 0.15s ease-out;
+}
+
+#admin-shell[data-sidebar="hidden"] .admin-sidebar {
+  display: none;
 }
 
 .admin-content {
   min-height: 100vh;
 }
+
+/* Colorful clean card theme: one 4px top accent per section kind plus a
+   tinted card header. Colors live here (not in Tailwind utilities) so the
+   generated bundle always carries them. */
+.admin-card {
+  border-top-width: 4px;
+  border-top-style: solid;
+  overflow: hidden;
+}
+
+.admin-card-title {
+  background-color: #f9fafb;
+  border-bottom: 1px solid #f3f4f6;
+}
+
+.admin-card-sky { border-top-color: #0ea5e9; }
+.admin-card-sky > .admin-card-title { background-color: #f0f9ff; }
+
+.admin-card-violet { border-top-color: #8b5cf6; }
+.admin-card-violet > .admin-card-title { background-color: #f5f3ff; }
+
+.admin-card-cyan { border-top-color: #06b6d4; }
+.admin-card-cyan > .admin-card-title { background-color: #ecfeff; }
+
+.admin-card-indigo { border-top-color: #6366f1; }
+.admin-card-indigo > .admin-card-title { background-color: #eef2ff; }
+
+.admin-card-amber { border-top-color: #f59e0b; }
+.admin-card-amber > .admin-card-title { background-color: #fffbeb; }
+
+.admin-card-emerald { border-top-color: #10b981; }
+.admin-card-emerald > .admin-card-title { background-color: #ecfdf5; }
+
+.admin-card-rose { border-top-color: #f43f5e; }
+.admin-card-rose > .admin-card-title { background-color: #fff1f2; }
+
+.admin-card-teal { border-top-color: #14b8a6; }
+.admin-card-teal > .admin-card-title { background-color: #f0fdfa; }
+
+.admin-card-orange { border-top-color: #f97316; }
+.admin-card-orange > .admin-card-title { background-color: #fff7ed; }
 
 .document-tree {
   font-family: monospace;

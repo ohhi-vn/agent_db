@@ -55,4 +55,60 @@ defmodule AgentDbWeb.AdminComponentsTest do
       refute html =~ "rounded border"
     end
   end
+
+  describe "the llm layers" do
+    test "renders all three layers with source badges and char counts" do
+      html =
+        render_component(&AdminComponents.llm_layers/1, %{
+          layers: %{
+            l0: %{text: "one-line L0", source: :stored, chars: 11},
+            l1: %{text: "structured L1", source: :fallback, chars: 13},
+            l2: %{text: "full L2 body", source: :stored, chars: 12}
+          }
+        })
+
+      assert html =~ "How the LLM sees this document"
+      assert html =~ "Abstract (L0)"
+      assert html =~ "Overview (L1)"
+      assert html =~ "Full content (L2)"
+      assert html =~ "one-line L0"
+      assert html =~ "structured L1"
+      assert html =~ "full L2 body"
+      assert html =~ "stored"
+      assert html =~ "fallback"
+      assert html =~ "11 chars"
+    end
+
+    test "renders unavailable layers without breaking the others" do
+      html =
+        render_component(&AdminComponents.llm_layers/1, %{
+          layers: %{
+            l0: %{text: "", source: :unavailable, chars: 0},
+            l1: %{text: "structured L1", source: :fallback, chars: 13},
+            l2: %{text: "full L2 body", source: :stored, chars: 12}
+          }
+        })
+
+      assert html =~ "Not available."
+      assert html =~ "structured L1"
+      assert html =~ "full L2 body"
+    end
+
+    test "long layers render an excerpt with the full text behind an expand" do
+      long = String.duplicate("x", 600)
+
+      html =
+        render_component(&AdminComponents.llm_layers/1, %{
+          layers: %{
+            l0: %{text: "one-line L0", source: :stored, chars: 11},
+            l1: %{text: "structured L1", source: :fallback, chars: 13},
+            l2: %{text: long, source: :stored, chars: 600}
+          }
+        })
+
+      assert html =~ "Show full Full content (L2)"
+      assert html =~ String.slice(long, 0, 500)
+      assert html =~ long
+    end
+  end
 end

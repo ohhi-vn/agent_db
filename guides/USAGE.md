@@ -168,6 +168,24 @@ colliding sessions skipped, nothing outside deleted. Re-import converges
 without duplication. Embeddings and generated summaries regenerate via the job
 queue — they are not carried in the archive.
 
+## Seed data for dev and test
+
+```bash
+mix agent_db.seed --json
+mix agent_db.seed --prefix viking://resources/custom --json
+mix agent_db.seed --force
+mix agent_db.seed --clean
+```
+
+Populates a fresh store with one deterministic demo dataset: documents under
+the demo prefix (default `viking://resources/demo`), one typed memory per
+type, one committed session, one demo skill, and demo code-index entries.
+Re-running converges without duplication. A non-empty store is refused unless
+`--force` (merge) or `--clean` (remove only the seed scope, then seed) is
+given; production needs `--allow-prod`. Keyword search, find, and grep reach
+seeded content with no model loaded. Same API from Elixir:
+`AgentDb.Seed.seed()`. Run `mix help agent_db.seed` for exact flags.
+
 ## CLI (`mix agent_db.*`)
 
 Every task supports `--json` (JSON on stdout, reason on stderr, non-zero exit
@@ -182,14 +200,16 @@ mix agent_db.grep "def run" --scope viking://resources/myapp --limit 50 --json
 mix agent_db.recall --type preferences --json
 mix agent_db.tree viking://resources/myapp --depth 2 --json
 mix agent_db.index --project myapp --dir lib
+mix agent_db.seed --json
 mix agent_db.doctor --json
 ```
 
 Task list: `read`, `search`, `find`, `grep`, `recall`, `tree`, `index`,
-`import_skills`, `import_data`, `export_data`, `doctor`. Run
+`import_skills`, `import_data`, `export_data`, `seed`, `doctor`. Run
 `mix help agent_db.<task>` for exact flags (`--mode`, `--scope`, `--top-k` /
 `--limit`, `--depth`, `--type`, `--term`, `--include-superseded`,
-`--project`, `--dir`, `--user`).
+`--project`, `--dir`, `--user`, `--prefix`, `--force`, `--clean`,
+`--allow-prod`).
 
 ## MCP (OpenCode, Zed)
 

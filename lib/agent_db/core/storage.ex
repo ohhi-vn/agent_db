@@ -130,6 +130,38 @@ defmodule AgentDb.Core.Storage do
   @callback remove_subtree(String.t()) :: :ok | {:error, :not_found} | {:error, :is_root}
 
   @doc """
+  Sets the enabled state for `uri` and its whole subtree.
+
+  Disabled is blocked-from-use, not deleted: rows stay readable and editable
+  but are excluded from search and default listings.
+  """
+  @callback set_node_enabled(String.t(), boolean()) :: :ok | {:error, term()}
+
+  @doc """
+  Sets the operator group tag for `uri` and its whole subtree. Empty clears.
+  Tags are names only, never content.
+  """
+  @callback set_node_group(String.t(), String.t()) :: :ok | {:error, term()}
+
+  @doc """
+  Recursive document URIs under `scope` in deterministic order, paged.
+
+  Returns `{rows, total}` where rows carry `uri`, `enabled`, and `group_tag`
+  without blobs. `filter` supports `:substring`, `:include_disabled`, and
+  `:group`. `limit`/`offset` bound the page; `total` is the filtered count.
+  """
+  @callback list_all_documents(String.t(), pos_integer(), non_neg_integer(), map()) ::
+              {:ok, {[map()], non_neg_integer()}} | {:error, term()}
+
+  @doc """
+  Installed skill roots in URI order, paged. Each entry carries `name`,
+  `owner`, `uri`, `files`, `enabled`, and `group_tag`. `filter` supports
+  `:substring`, `:owner`, `:include_disabled`, and `:group`.
+  """
+  @callback list_skill_roots(pos_integer(), non_neg_integer(), map()) ::
+              {:ok, {[map()], non_neg_integer()}} | {:error, term()}
+
+  @doc """
   Replaces the whole subtree at `uri` with `files`, in one atomic step.
 
   Each `file` is stored at `uri` followed by its `path`, with the directories

@@ -262,7 +262,8 @@ defmodule AgentDb.Store.SQLite do
     end)
     |> case do
       :ok ->
-        with :ok <- add_missing_columns(conn) do
+        with :ok <- add_missing_columns(conn),
+             :ok <- ensure_node_meta_indexes(conn) do
           migrate_memory_status_check(conn)
         end
 
@@ -469,7 +470,14 @@ defmodule AgentDb.Store.SQLite do
     # When a recall last surfaced the assertion, for recency-aware ranking.
     # NULL is "never surfaced", which ranks as maximally stale -- honest,
     # since it is.
-    {"memory_meta", "last_surfaced_at", "INTEGER"}
+    {"memory_meta", "last_surfaced_at", "INTEGER"},
+    # Whether a node is available for search and default listings. Disabled is
+    # blocked-from-use, not deleted: the row stays readable and editable.
+    # 1 is enabled, 0 is disabled; existing rows default to enabled.
+    {"nodes", "enabled", "INTEGER NOT NULL DEFAULT 1"},
+    # Operator-assigned group tag, empty when ungrouped. A name only, never
+    # content, so listings can group without exposing document text.
+    {"nodes", "group_tag", "TEXT NOT NULL DEFAULT ''"}
   ]
 
   defp add_missing_columns(conn) do
@@ -491,6 +499,16 @@ defmodule AgentDb.Store.SQLite do
           {:halt, err}
       end
     end)
+  end
+
+  # Indexes over the node management metadata. Created after `add_missing_columns`
+  # (not in `base_ddl`) because the columns may not exist yet on an older
+  # database when the base DDL runs.
+  defp ensure_node_meta_indexes(conn) do
+    with :ok <- exec(conn, "CREATE INDEX IF NOT EXISTS idx_nodes_enabled ON nodes(enabled)"),
+         :ok <- exec(conn, "CREATE INDEX IF NOT EXISTS idx_nodes_group ON nodes(group_tag)") do
+      :ok
+    end
   end
 
   # PRAGMA table_info returns one row per column as
@@ -729,6 +747,8 @@ defmodule AgentDb.Store.SQLite do
         overview TEXT,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        group_tag TEXT NOT NULL DEFAULT '',
         FOREIGN KEY (parent_uri) REFERENCES nodes(uri) ON DELETE CASCADE
       )
       """,

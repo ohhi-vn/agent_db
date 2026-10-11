@@ -63,6 +63,55 @@ defmodule AgentDbWeb.Context do
   @spec get_document(String.t()) :: {:ok, String.t()} | {:error, term()}
   def get_document(uri), do: AgentDb.read(uri)
 
+  @doc """
+  A document's LLM-facing layers with source and size.
+
+  Returns `%{l0: layer, l1: layer, l2: layer}` where each layer is
+  `%{text: String.t(), source: :stored | :fallback | :unavailable, chars: non_neg_integer()}`.
+  L0 is what `AgentDb.abstract/1` returns, L1 what `AgentDb.overview/1`
+  returns, L2 what `AgentDb.read/1` returns. A stored layer was persisted
+  (caller-supplied or generated); a fallback was derived from L2 at read
+  time; unavailable means the read failed. Read-only; never alters store
+  state.
+  """
+  @spec get_layers(String.t()) :: %{l0: map(), l1: map(), l2: map()}
+  def get_layers(uri) do
+    stored =
+      case AgentDb.stored_layers(uri) do
+        {:ok, layers} -> layers
+        {:error, _} -> %{abstract: nil, overview: nil}
+      end
+
+    %{
+      l0: layer_entry(uri, &AgentDb.abstract/1, Map.get(stored, :abstract)),
+      l1: layer_entry(uri, &AgentDb.overview/1, Map.get(stored, :overview)),
+      l2: content_entry(uri)
+    }
+  end
+
+  defp layer_entry(uri, read, stored_value) do
+    case read.(uri) do
+      {:ok, text} ->
+        text = text || ""
+        source = if is_binary(stored_value) and stored_value != "", do: :stored, else: :fallback
+        %{text: text, source: source, chars: String.length(text)}
+
+      {:error, _} ->
+        %{text: "", source: :unavailable, chars: 0}
+    end
+  end
+
+  defp content_entry(uri) do
+    case AgentDb.read(uri) do
+      {:ok, text} ->
+        text = text || ""
+        %{text: text, source: :stored, chars: String.length(text)}
+
+      {:error, _} ->
+        %{text: "", source: :unavailable, chars: 0}
+    end
+  end
+
   @doc "Writes a document, creating it or replacing it."
   @spec put_document(String.t(), String.t(), keyword()) :: :ok | {:error, term()}
   def put_document(uri, content, opts \\ []), do: AgentDb.write(uri, content, opts)
@@ -70,6 +119,54 @@ defmodule AgentDbWeb.Context do
   @doc "Removes the subtree at `uri`."
   @spec delete_document(String.t()) :: :ok | {:error, term()}
   def delete_document(uri), do: AgentDb.rm(uri)
+
+  @doc "Recursive paged document URIs under `scope` for operations listings."
+  @spec list_all_documents(map() | keyword()) :: {:ok, map()} | {:error, term()}
+  def list_all_documents(opts \\ []) do
+    opts = normalize(opts)
+    scope = opts["scope"] || opts["prefix"] || @tree_root
+
+    AgentDb.list_all_documents(scope,
+      page: integer_param(opts, "page", @default_page),
+      per_page: integer_param(opts, "per_page", @default_per_page),
+      substring: to_string_param(opts, "substring", ""),
+      include_disabled: truthy_param(opts, "include_disabled", false),
+      group: to_string_param(opts, "group", "")
+    )
+  end
+
+  @doc "Paged installed-skill inventory across users."
+  @spec list_skills(map() | keyword()) :: {:ok, map()} | {:error, term()}
+  def list_skills(opts \\ []) do
+    opts = normalize(opts)
+
+    AgentDb.list_skills(
+      page: integer_param(opts, "page", @default_page),
+      per_page: integer_param(opts, "per_page", @default_per_page),
+      substring: to_string_param(opts, "substring", ""),
+      owner: to_string_param(opts, "owner", ""),
+      include_disabled: truthy_param(opts, "include_disabled", false),
+      group: to_string_param(opts, "group", "")
+    )
+  end
+
+  @doc "Enables or disables the subtree at `uri`."
+  @spec set_enabled(String.t(), boolean()) :: :ok | {:error, term()}
+  def set_enabled(uri, enabled) when is_boolean(enabled), do: AgentDb.set_enabled(uri, enabled)
+
+  @doc "Assigns the operator group tag for the subtree at `uri`. Empty clears."
+  @spec set_group(String.t(), String.t()) :: :ok | {:error, term()}
+  def set_group(uri, tag) when is_binary(tag), do: AgentDb.set_group(uri, tag)
+
+  @doc "Bulk enable/disable over an explicit URI list."
+  @spec bulk_set_enabled([String.t()], boolean()) :: {:ok, map()} | {:error, term()}
+  def bulk_set_enabled(uris, enabled) when is_list(uris) and is_boolean(enabled),
+    do: AgentDb.bulk_set_enabled(uris, enabled)
+
+  @doc "Bulk group assignment over an explicit URI list."
+  @spec bulk_set_group([String.t()], String.t()) :: {:ok, map()} | {:error, term()}
+  def bulk_set_group(uris, tag) when is_list(uris) and is_binary(tag),
+    do: AgentDb.bulk_set_group(uris, tag)
 
   @doc "Imports Agent Skills into a user's skills subtree. See `AgentDb.import_skills/2`."
   @spec import_skills(String.t(), AgentDb.Skills.Source.source()) ::
@@ -219,6 +316,27 @@ defmodule AgentDbWeb.Context do
   defp parsed_int({value, ""}, _default), do: value
   defp parsed_int({value, _rest}, _default), do: value
   defp parsed_int(:error, default), do: default
+
+  defp to_string_param(opts, key, default) do
+    case opts[key] do
+      nil -> default
+      value when is_binary(value) -> value
+      value when is_atom(value) -> Atom.to_string(value)
+      _other -> default
+    end
+  end
+
+  defp truthy_param(opts, key, default) do
+    case opts[key] do
+      nil -> default
+      true -> true
+      false -> false
+      "true" -> true
+      "1" -> true
+      "on" -> true
+      _other -> false
+    end
+  end
 
   # A role arrives as the word the wire carries. One outside the set a session
   # holds is not turned into a term: an unrecognised role is a bad request, not

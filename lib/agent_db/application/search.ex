@@ -124,7 +124,22 @@ defmodule AgentDb.Application.Search do
            {:ok, limit} <-
              Navigation.validate_limit(opts, @default_grep_limit, @max_grep_limit),
            {:ok, scope_uri} <- Navigation.validate_scope(opts) do
-        Runtime.storage().grep_content(query, scope_uri, limit)
+        # Over-fetch for disabled interleave, then filter and strip.
+        fetch_limit = min(limit * 3, @max_grep_limit)
+
+        case Runtime.storage().grep_content(query, scope_uri, fetch_limit) do
+          {:ok, hits} ->
+            hits =
+              hits
+              |> filter_enabled(opts)
+              |> Enum.take(limit)
+              |> Enum.map(&strip_meta/1)
+
+            {:ok, hits}
+
+          {:error, _} = err ->
+            err
+        end
       end
     end)
   end
@@ -142,9 +157,20 @@ defmodule AgentDb.Application.Search do
               # everything it returned: an unbounded scan materializes every
               # match and then discards all but the first few, which is the
               # whole cost the bound exists to avoid.
-              case Runtime.storage().search_keyword(term, prefix, limit) do
-                {:ok, nodes} -> {:ok, Enum.map(nodes, &entry/1)}
-                {:error, _} = err -> err
+              #
+              # Disabled nodes are over-fetched (3x, capped) then filtered, so
+              # interleaved disabled rows do not starve the requested limit.
+              fetch_limit = min(limit * 3, 200)
+
+              case Runtime.storage().search_keyword(term, prefix, fetch_limit) do
+                {:ok, nodes} ->
+                  nodes
+                  |> filter_enabled(opts)
+                  |> Enum.take(limit)
+                  |> then(fn filtered -> {:ok, Enum.map(filtered, &entry/1)} end)
+
+                {:error, _} = err ->
+                  err
               end
             end
           end)
@@ -184,7 +210,20 @@ defmodule AgentDb.Application.Search do
         with {:ok, prefix} <- scope_prefix(opts) do
           case embed_query(term) do
             {:ok, query} ->
-              Runtime.storage().search_vector(query, top_k(opts), prefix)
+              # Over-fetch for the same disabled-interleave reason as keyword.
+              {:ok, limit} = result_limit_opts(opts)
+              fetch_limit = min(limit * 3, 200)
+
+              case Runtime.storage().search_vector(query, fetch_limit, prefix) do
+                {:ok, hits} ->
+                  hits
+                  |> filter_enabled(opts)
+                  |> Enum.take(limit)
+                  |> then(fn filtered -> {:ok, Enum.map(filtered, &strip_meta/1)} end)
+
+                {:error, _} = err ->
+                  err
+              end
 
             {:error, _} = err ->
               err
@@ -301,6 +340,28 @@ defmodule AgentDb.Application.Search do
       value when is_integer(value) and value > 0 -> value
       _other -> @default_top_k
     end
+  end
+
+  defp result_limit_opts(opts) do
+    case Keyword.get(opts, :top_k, @default_top_k) do
+      limit when is_integer(limit) and limit >= 1 and limit <= @max_top_k -> {:ok, limit}
+      _other -> {:ok, @default_top_k}
+    end
+  end
+
+  # Disabled is blocked-from-use: excluded from search by default, included
+  # only with `include_disabled: true`. Missing flags (older providers) read
+  # as enabled.
+  defp filter_enabled(results, opts) do
+    if Keyword.get(opts, :include_disabled, false) do
+      results
+    else
+      Enum.filter(results, &(Map.get(&1, :enabled, true) != false))
+    end
+  end
+
+  defp strip_meta(hit) do
+    Map.drop(hit, [:enabled, :group_tag])
   end
 
   defp entry(node) do

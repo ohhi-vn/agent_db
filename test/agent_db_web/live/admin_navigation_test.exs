@@ -60,6 +60,18 @@ defmodule AgentDbWeb.AdminNavigationTest do
       assert html =~ ~s{class="admin-content}, "#{path} is missing the shared shell"
       assert html =~ ~s{id="flash"}, "#{path} is missing the shared flash host"
 
+      # The header bar carries identity, the current page title, and the
+      # sidebar toggle; the sidebar is hideable for a wider content view.
+      assert html =~ ~s{class="admin-header}, "#{path} is missing the header bar"
+      assert html =~ ~s{id="sidebar-toggle"}, "#{path} is missing the sidebar toggle"
+
+      assert html =~ ~s{aria-controls="admin-sidebar"},
+             "#{path} toggle is not wired to the sidebar"
+
+      assert html =~ ~s{id="admin-sidebar"}, "#{path} is missing the hideable sidebar"
+      assert html =~ ~s{id="admin-shell"}, "#{path} is missing the shell toggle state"
+      assert html =~ heading, "#{path} header does not show the current page title"
+
       for href <- @nav do
         assert html =~ href, "#{path} is missing the #{href} link"
       end
@@ -81,6 +93,9 @@ defmodule AgentDbWeb.AdminNavigationTest do
 
     assert html =~ ~s{class="admin-content}, "the editor is missing the shared shell"
     assert html =~ ~s{id="flash"}, "the editor is missing the shared flash host"
+    assert html =~ ~s{class="admin-header}, "the editor is missing the header bar"
+    assert html =~ ~s{id="sidebar-toggle"}, "the editor is missing the sidebar toggle"
+    assert html =~ ~s{id="admin-sidebar}, "the editor is missing the hideable sidebar"
 
     for href <- @nav do
       assert html =~ href

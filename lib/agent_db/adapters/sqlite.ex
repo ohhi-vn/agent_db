@@ -52,14 +52,77 @@ defmodule AgentDb.Adapters.SQLite do
   end
 
   defp write_document(conn, segments, content, opts, jobs) do
-    with :ok <- ensure_parents(conn, segments),
-         uri = AgentDb.URI.build(segments),
+    uri = AgentDb.URI.build(segments)
+
+    with {:ok, is_new} <- new_node?(conn, uri),
+         :ok <- ensure_parents(conn, segments),
          :ok <-
            Nodes.upsert_doc(conn, uri, parent_uri(segments), List.last(segments), content, opts),
-         :ok <- enqueue_jobs(conn, jobs) do
+         :ok <- enqueue_jobs(conn, jobs),
+         :ok <- maybe_inherit_parent_meta(conn, segments, uri, is_new) do
       :ok
     end
   end
+
+  defp new_node?(conn, uri) do
+    case Nodes.exists?(conn, uri) do
+      {:ok, exists?} -> {:ok, not exists?}
+      {:error, _} = err -> err
+    end
+  end
+
+  # A document created beneath a disabled or grouped parent starts with the
+  # parent's state, so a disabled subtree stays disabled for new children.
+  # Re-writes keep their own stored state (spec: content write preserves).
+  defp maybe_inherit_parent_meta(_conn, _segments, _uri, false), do: :ok
+
+  defp maybe_inherit_parent_meta(conn, segments, uri, true) do
+    parent = parent_uri(segments)
+
+    with {:ok, parent_meta} <- parent_meta(conn, parent),
+         {:ok, child_meta} <- Nodes.node_meta(conn, uri) do
+      inherit_into(conn, uri, parent_meta, child_meta)
+    end
+  end
+
+  defp parent_meta(_conn, nil), do: {:ok, nil}
+  defp parent_meta(_conn, "viking://"), do: {:ok, nil}
+
+  defp parent_meta(conn, parent) do
+    case Nodes.node_meta(conn, parent) do
+      {:ok, nil} -> {:ok, nil}
+      {:ok, meta} -> {:ok, meta}
+      {:error, _} = err -> err
+    end
+  end
+
+  defp inherit_into(_conn, _uri, nil, _child), do: :ok
+  defp inherit_into(_conn, _uri, _parent, nil), do: :ok
+
+  defp inherit_into(conn, uri, parent, child) do
+    with :ok <- inherit_enabled(conn, uri, parent, child),
+         :ok <- inherit_group(conn, uri, parent, child) do
+      :ok
+    end
+  end
+
+  defp inherit_enabled(conn, uri, %{enabled: false}, %{enabled: true}) do
+    case Nodes.set_enabled(conn, uri, false) do
+      :ok -> :ok
+      {:error, _} = err -> err
+    end
+  end
+
+  defp inherit_enabled(_conn, _uri, _parent, _child), do: :ok
+
+  defp inherit_group(conn, uri, %{group_tag: tag}, %{group_tag: ""}) when tag != "" do
+    case Nodes.set_group(conn, uri, tag) do
+      :ok -> :ok
+      {:error, _} = err -> err
+    end
+  end
+
+  defp inherit_group(_conn, _uri, _parent, _child), do: :ok
 
   # One statement for the whole family a write enqueues: the jobs are inserted
   # inside the caller's transaction either way, so this changes the number of
@@ -99,6 +162,56 @@ defmodule AgentDb.Adapters.SQLite do
     end
   end
 
+  @impl true
+  def set_node_enabled(uri, enabled) when is_boolean(enabled) do
+    case AgentDb.URI.parse(uri) do
+      {:ok, []} ->
+        {:error, :is_root}
+
+      {:ok, _segments} ->
+        Writer.call(fn conn ->
+          SQLite.transaction(conn, fn conn -> Nodes.set_enabled(conn, uri, enabled) end)
+        end)
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  @impl true
+  def set_node_group(uri, tag) when is_binary(tag) do
+    case AgentDb.URI.parse(uri) do
+      {:ok, []} ->
+        {:error, :is_root}
+
+      {:ok, _segments} ->
+        Writer.call(fn conn ->
+          SQLite.transaction(conn, fn conn -> Nodes.set_group(conn, uri, tag) end)
+        end)
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  @impl true
+  def list_all_documents(scope, limit, offset, filter \\ %{}) do
+    Reader.read(fn conn -> Nodes.list_all_documents(conn, scope, limit, offset, filter) end)
+  end
+
+  @impl true
+  def list_skill_roots(limit, offset, filter \\ %{}) do
+    Reader.read(fn conn ->
+      with {:ok, {roots, total}} <- Nodes.list_skill_roots(conn, limit, offset, filter) do
+        {:ok, {Enum.map(roots, &with_skill_file_count(conn, &1)), total}}
+      end
+    end)
+  end
+
+  defp with_skill_file_count(conn, entry) do
+    Map.put(entry, :files, Nodes.count_subtree_documents(conn, entry.uri))
+  end
+
   # One transaction, on the single writer, for the whole skill: what was at the
   # URI, what is at it now, and the work enqueued for it. A step that fails takes
   # the previous subtree with it rather than leaving the URI holding half of one
@@ -113,9 +226,29 @@ defmodule AgentDb.Adapters.SQLite do
   end
 
   defp replace(conn, segments, uri, files) do
-    with {:ok, replaced} <- clear(conn, uri),
-         :ok <- write_skill(conn, segments, files) do
+    with {:ok, prior_meta} <- Nodes.node_meta(conn, uri),
+         {:ok, replaced} <- clear(conn, uri),
+         :ok <- write_skill(conn, segments, files),
+         :ok <- restore_skill_meta(conn, uri, prior_meta, replaced) do
       {:ok, %{replaced: replaced, files: length(files)}}
+    end
+  end
+
+  # A replacement swaps files, not management state: a disabled or grouped
+  # skill stays disabled and grouped after its files are replaced whole.
+  defp restore_skill_meta(_conn, _uri, nil, _replaced), do: :ok
+  defp restore_skill_meta(_conn, _uri, _meta, false), do: :ok
+
+  defp restore_skill_meta(conn, uri, %{enabled: enabled, group_tag: tag}, true) do
+    with :ok <- Nodes.set_enabled(conn, uri, enabled) do
+      if tag != "" do
+        case Nodes.set_group(conn, uri, tag) do
+          :ok -> :ok
+          {:error, _} = err -> err
+        end
+      else
+        :ok
+      end
     end
   end
 
@@ -345,7 +478,7 @@ defmodule AgentDb.Adapters.SQLite do
 
   defp run_vector_search(conn, query, top_k, scope_prefix, table) do
     base_query = """
-      SELECT n.uri, n.parent_uri, n.name, n.kind, n.content, n.abstract, n.overview,
+      SELECT n.uri, n.parent_uri, n.name, n.kind, n.content, n.abstract, n.overview, n.enabled, n.group_tag,
              vec_distance_cosine(v.embedding, ?1) as distance
       FROM "#{table}" v
       JOIN nodes n ON n.uri = v.uri
@@ -367,13 +500,26 @@ defmodule AgentDb.Adapters.SQLite do
     case SQLite.query(conn, query, args ++ [top_k]) do
       {:ok, rows} ->
         {:ok,
-         Enum.map(rows, fn [uri, _parent, _name, _kind, content, abstract, overview, distance] ->
+         Enum.map(rows, fn [
+                             uri,
+                             _parent,
+                             _name,
+                             _kind,
+                             content,
+                             abstract,
+                             overview,
+                             enabled,
+                             group_tag,
+                             distance
+                           ] ->
            %{
              uri: uri,
              content: content,
              abstract: abstract,
              overview: overview,
-             score: 1.0 - distance
+             score: 1.0 - distance,
+             enabled: enabled != 0,
+             group_tag: group_tag || ""
            }
          end)}
 

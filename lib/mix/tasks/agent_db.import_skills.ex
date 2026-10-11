@@ -31,7 +31,8 @@ defmodule Mix.Tasks.AgentDb.ImportSkills do
   directory, a skill with no `SKILL.md`, and a file that is not UTF-8 text, plus
   the bounds one import accepts: at most #{AgentDb.skill_import_limits().max_entries} files
   and #{AgentDb.skill_import_limits().max_bytes} bytes once expanded. A source refused for
-  any of them leaves the store exactly as it was.
+  any of them leaves the store exactly as it was. macOS metadata (`._` sidecars
+  and `.DS_Store` files) is set aside rather than refused.
   """
 
   use Mix.Task

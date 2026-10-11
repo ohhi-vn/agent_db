@@ -7,6 +7,10 @@ defmodule AgentDbWeb.Admin.DocumentsLive do
   store stays usable; the count beside it is the true number of documents the
   store holds. Search runs over store content and links each hit to the editor.
   A refused search reports in words and leaves the listing in place.
+
+  The show-all section lists every document URI recursively, one bounded page
+  at a time, with a substring/group filter, disabled opt-in, and per-row plus
+  bulk enable/disable and group assignment.
   """
   use AgentDbWeb.Admin
 
@@ -35,6 +39,44 @@ defmodule AgentDbWeb.Admin.DocumentsLive do
     {:noreply, search(socket, String.trim(term || ""), String.trim(scope || ""))}
   end
 
+  def handle_event("filter_all", params, socket) do
+    socket =
+      socket
+      |> assign(
+        all_substring: String.trim(params["substring"] || ""),
+        all_group: String.trim(params["group"] || ""),
+        all_show_disabled: params["show_disabled"] in ["true", "on", "1"],
+        all_page: 1
+      )
+      |> load()
+
+    {:noreply, socket}
+  end
+
+  def handle_event("all_page", %{"page" => page}, socket) do
+    {:noreply, socket |> assign(all_page: page) |> load()}
+  end
+
+  def handle_event("toggle_enabled", %{"uri" => uri} = params, socket) do
+    {:noreply, socket |> assign(notice: toggle(uri, params["enabled"])) |> load()}
+  end
+
+  def handle_event("bulk_disable_all", _params, socket) do
+    {:noreply, socket |> assign(notice: bulk_set_enabled(socket, false)) |> load()}
+  end
+
+  def handle_event("bulk_enable_all", _params, socket) do
+    {:noreply, socket |> assign(notice: bulk_set_enabled(socket, true)) |> load()}
+  end
+
+  def handle_event("set_group", %{"uri" => uri, "group_tag" => tag}, socket) do
+    {:noreply, socket |> assign(notice: set_group(uri, String.trim(tag || ""))) |> load()}
+  end
+
+  def handle_event("bulk_set_group_all", %{"group_tag" => tag}, socket) do
+    {:noreply, socket |> assign(notice: bulk_set_group(socket, String.trim(tag || ""))) |> load()}
+  end
+
   def load(socket) do
     page = socket.assigns[:page] || 1
 
@@ -49,6 +91,11 @@ defmodule AgentDbWeb.Admin.DocumentsLive do
     |> assign_new(:search_scope, fn -> "" end)
     |> assign_new(:search_results, fn -> [] end)
     |> assign_new(:search_notice, fn -> nil end)
+    |> assign_new(:all_page, fn -> 1 end)
+    |> assign_new(:all_substring, fn -> "" end)
+    |> assign_new(:all_group, fn -> "" end)
+    |> assign_new(:all_show_disabled, fn -> false end)
+    |> assign(all_listing: all_listing(socket))
   end
 
   @impl Phoenix.LiveView
@@ -69,6 +116,12 @@ defmodule AgentDbWeb.Admin.DocumentsLive do
         notice={@search_notice}
       />
       <AdminComponents.documents documents={@documents} root={@tree_root} />
+      <AdminComponents.documents_all
+        listing={@all_listing}
+        substring={@all_substring}
+        group={@all_group}
+        show_disabled={@all_show_disabled}
+      />
     </div>
     """
   end
@@ -110,6 +163,89 @@ defmodule AgentDbWeb.Admin.DocumentsLive do
       {:error, _reason} -> %{names: [], meta: %{page: page, total: 0, total_pages: 0}}
     end
   end
+
+  defp all_listing(socket) do
+    assigns = socket.assigns
+
+    opts = %{
+      "scope" => @tree_root,
+      "page" => assigns[:all_page] || 1,
+      "per_page" => @page_size,
+      "substring" => assigns[:all_substring] || "",
+      "group" => assigns[:all_group] || "",
+      "include_disabled" => assigns[:all_show_disabled] || false
+    }
+
+    case Context.list_all_documents(opts) do
+      {:ok, %{data: rows, meta: meta}} ->
+        %{data: rows, meta: meta}
+
+      {:error, _reason} ->
+        %{data: [], meta: %{page: 1, per_page: @page_size, total: 0, total_pages: 1}}
+    end
+  end
+
+  defp current_page_uris(socket) do
+    case socket.assigns[:all_listing] do
+      %{data: rows} -> Enum.map(rows, & &1.uri)
+      _ -> []
+    end
+  end
+
+  defp toggle(uri, "false") do
+    case Context.set_enabled(uri, true) do
+      :ok -> "Enabled #{uri}"
+      {:error, reason} -> "Could not enable #{uri}: #{Observability.error_message(reason)}"
+    end
+  end
+
+  defp toggle(uri, _currently_enabled) do
+    case Context.set_enabled(uri, false) do
+      :ok -> "Disabled #{uri}"
+      {:error, reason} -> "Could not disable #{uri}: #{Observability.error_message(reason)}"
+    end
+  end
+
+  defp bulk_set_enabled(socket, enabled) do
+    uris = current_page_uris(socket)
+    verb = if enabled, do: "Enabled", else: "Disabled"
+
+    case Context.bulk_set_enabled(uris, enabled) do
+      {:ok, %{updated: updated, failed: 0}} ->
+        "#{verb} #{updated} document(s)"
+
+      {:ok, %{updated: updated, failed: failed}} ->
+        "#{verb} #{updated} document(s), #{failed} failed"
+
+      {:error, reason} ->
+        "Bulk action failed: #{Observability.error_message(reason)}"
+    end
+  end
+
+  defp set_group(uri, tag) do
+    case Context.set_group(uri, tag) do
+      :ok -> "Set group for #{uri} to #{group_word(tag)}"
+      {:error, reason} -> "Could not set group for #{uri}: #{Observability.error_message(reason)}"
+    end
+  end
+
+  defp bulk_set_group(socket, tag) do
+    uris = current_page_uris(socket)
+
+    case Context.bulk_set_group(uris, tag) do
+      {:ok, %{updated: updated, failed: 0}} ->
+        "Set group for #{updated} document(s) to #{group_word(tag)}"
+
+      {:ok, %{updated: updated, failed: failed}} ->
+        "Set group for #{updated} document(s) to #{group_word(tag)}, #{failed} failed"
+
+      {:error, reason} ->
+        "Bulk action failed: #{Observability.error_message(reason)}"
+    end
+  end
+
+  defp group_word(""), do: "ungrouped"
+  defp group_word(tag), do: tag
 
   defp delete(uri) do
     case Context.delete_document(uri) do

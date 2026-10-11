@@ -44,7 +44,7 @@ The store SHALL persist a hierarchical context tree addressed by `viking://` URI
 - **THEN** a subsequent tree of `viking://resources/t` at the same depth no longer contains `a` or any of its descendants
 
 ### Requirement: Caller-supplied layered content
-The store SHALL store for each document a caller-supplied full content (L2) and optional caller-supplied abstract (L0) and overview (L1). Reading a document's abstract or overview SHALL return the stored L0 or L1 verbatim when present. When caller-supplied L0/L1 are absent, the store SHALL generate them automatically using a local LLM (see `llm-summarization` capability) and store the generated versions. As a final fallback, deterministic caller-independent fallbacks apply (first non-empty line for abstract; first 280 characters of content for overview). LLM generation SHALL occur asynchronously after write acknowledgement.
+The store SHALL store for each document a caller-supplied full content (L2) and optional caller-supplied abstract (L0) and overview (L1). Reading a document's abstract or overview SHALL return the stored L0 or L1 verbatim when present. When caller-supplied L0/L1 are absent, the store SHALL generate them automatically using a local LLM (see `llm-summarization` capability) and store the generated versions. As a final fallback, deterministic caller-independent fallbacks apply (frontmatter-aware first non-empty body line for abstract; first 280 characters of the body after frontmatter for overview). When L2 starts with a leading YAML frontmatter block (`---` line, then `name:`/`description:` fields, then closing `---` line), the L0 fallback SHALL prefer the parsed `name:`/`description:` identity (`"<name> — <description>"`, or whichever field exists) and the L1 fallback SHALL derive from the body after the closing delimiter, never from raw frontmatter. LLM generation SHALL occur asynchronously after write acknowledgement.
 
 #### Scenario: Abstract read with caller-supplied L0
 - **WHEN** a document is written with content and an explicit abstract
@@ -63,6 +63,25 @@ The store SHALL store for each document a caller-supplied full content (L2) and 
 - **WHEN** a document is written with content and no overview
 - **THEN** reading the overview returns the LLM-generated overview once available
 - **AND** before LLM generation completes, returns the first 280 characters of content
+
+#### Scenario: Skill L0 fallback uses frontmatter identity, not the delimiter
+- **WHEN** a `SKILL.md` is written with leading frontmatter carrying `name: easy-rpc` and a `description:` and no stored abstract
+- **THEN** reading the abstract does not return `---`
+- **AND** it returns the parsed identity combining `name` and `description` on one line
+
+#### Scenario: Skill L1 fallback skips raw frontmatter
+- **WHEN** the same frontmatter skill has no stored overview
+- **THEN** reading the overview returns the first 280 characters of the body after the closing `---` delimiter
+- **AND** it does not contain the raw `name:` or `description:` frontmatter lines
+
+#### Scenario: Plain document without frontmatter is unchanged
+- **WHEN** a document without leading `---` frontmatter is written with no stored layers
+- **THEN** reading the abstract returns the first non-empty line of content
+- **AND** reading the overview returns the first 280 characters of content
+
+#### Scenario: Unclosed frontmatter is treated as plain content
+- **WHEN** a document starts with `---` but has no closing `---` delimiter
+- **THEN** fallback derivation treats the whole content as body (existing first-line / first-280-chars behavior)
 
 ### Requirement: Write path persists before cache
 The store SHALL apply every write to SQLite before acknowledging it, and SHALL NOT allow any ETS cache to serve content newer than SQLite state (no cache-ahead-of-disk). Cache state after a write SHALL equal the state a cold cache would produce from SQLite. This obligation SHALL apply to every path that writes document content, including committing a session to a destination URI, and not only to direct document writes.
@@ -383,3 +402,66 @@ The system SHALL bound retries for poison-pill jobs: a job that fails for a reas
 - **WHEN** a queued row carries an unrecognized kind
 - **THEN** claiming it returns a classified failure identifying the kind problem
 - **AND** the row does not remain pending indefinitely
+
+### Requirement: Document enable and disable blocked-from-use
+The store SHALL persist an enabled/disabled state per document URI, defaulting to enabled. A disabled document SHALL stay readable and editable but be excluded from search, find, grep, and default listings unless explicitly included.
+
+#### Scenario: Disable excludes a document from search but keeps it readable
+- **WHEN** a caller disables `viking://resources/p/spec.md` containing a distinctive term and searches that term
+- **THEN** that URI is excluded from keyword, vector, and hybrid results
+- **AND** a direct read of that URI still returns its content
+
+#### Scenario: Disabled subtree excludes descendants
+- **WHEN** a caller disables `viking://resources/p` whose descendants contain a distinctive term and searches that term
+- **THEN** no URI at or beneath `viking://resources/p` is returned by default search
+
+#### Scenario: Re-enable restores searchability
+- **WHEN** a caller re-enables a disabled document whose embedding is already indexed and searches its distinctive term
+- **THEN** that URI is returned again without requiring a rewrite
+
+#### Scenario: Prior documents default to enabled
+- **WHEN** documents written before this change are read after migration
+- **THEN** each reads as enabled and remains searchable as before
+
+### Requirement: Document group-tag metadata
+The store SHALL persist one custom group tag per document or subtree root (empty means ungrouped). Tags SHALL be at most 64 chars (letters, digits, dash, underscore, slash) and SHALL NOT alter content or URIs.
+
+#### Scenario: Assign a custom group to a document subtree
+- **WHEN** a caller assigns group "release-1" to `viking://resources/p` and lists that scope
+- **THEN** entries beneath it report custom group "release-1" alongside the implicit "resources" group
+
+#### Scenario: Content write preserves group and status
+- **WHEN** a caller rewrites content at a grouped, disabled URI
+- **THEN** the rewritten document keeps its disabled status and custom group tag
+
+#### Scenario: Removal clears tags for the removed subtree only
+- **WHEN** a caller removes `viking://resources/p` carrying a custom tag while `viking://resources/q` exists
+- **THEN** no tag rows remain for URIs at or beneath `viking://resources/p`
+- **AND** tags for `viking://resources/q` are unchanged
+
+### Requirement: Recursive paged document listing for operations
+The store SHALL provide a recursive document listing under a scope URI in deterministic URI order, bounded to a caller-requested page (default 50 per page, max 200). The listing SHALL support substring, status, and group filters with counts reflecting the filtered set.
+
+#### Scenario: Recursive show-all stays paginated
+- **WHEN** documents exist in nested subtrees and a caller requests show-all page 1 at 50 per page
+- **THEN** at most 50 full URIs in deterministic order are returned with page metadata and the true filtered total
+
+#### Scenario: Filtered show-all reflects the filter
+- **WHEN** a caller requests show-all with substring "auth" and disabled-included under `viking://`
+- **THEN** only URIs containing "auth" are returned with counts reflecting that filtered set
+
+#### Scenario: Default listing excludes disabled unless asked
+- **WHEN** enabled and disabled documents exist and a caller requests show-all without a status option
+- **THEN** only enabled documents are returned
+- **AND** requesting with disabled-included returns both
+
+### Requirement: Search and recall honor disabled state
+Keyword, vector, and hybrid search plus memory recall over the context tree SHALL exclude disabled URIs by default and SHALL include them only when the caller passes an explicit disabled-included option. A search that matches only disabled content SHALL return an empty result set rather than an error. Disabled content SHALL NOT leak through vector similarity, reciprocal-rank fusion, find, or grep defaults.
+
+#### Scenario: Hybrid search excludes disabled by default
+- **WHEN** only a disabled document contains the query term and a caller hybrid-searches it without options
+- **THEN** an empty result set is returned rather than the disabled URI
+
+#### Scenario: Explicit opt-in returns disabled matches
+- **WHEN** the same caller repeats the search with disabled-included
+- **THEN** the disabled URI is returned with its rank and score as normal

@@ -253,6 +253,7 @@ defmodule AgentDb.Application.Memories do
     with {:ok, scope} <- recall_scope(opts) do
       case Runtime.storage().recall_memories(scope, term, statuses) do
         {:ok, rows} ->
+          rows = filter_disabled(rows, opts)
           # Ranked before the touch, so a recency-aware rank reads the times
           # as they were when the caller last saw them, not as of this call.
           ranked = rerank_by_term(rows, scope, term, statuses)
@@ -262,6 +263,25 @@ defmodule AgentDb.Application.Memories do
         {:error, _} = err ->
           err
       end
+    end
+  end
+
+  # Disabled is blocked-from-use: excluded from recall by default, included
+  # only with `include_disabled: true`. Fail-open on lookup errors so a
+  # transient fault does not hide memories.
+  defp filter_disabled(rows, opts) do
+    if Keyword.get(opts, :include_disabled, false) do
+      rows
+    else
+      Enum.filter(rows, &enabled_memory?/1)
+    end
+  end
+
+  defp enabled_memory?(%{uri: uri}) do
+    case Runtime.storage().get_node(uri) do
+      {:ok, nil} -> true
+      {:ok, node} -> Map.get(node, :enabled, true) != false
+      {:error, _} -> true
     end
   end
 

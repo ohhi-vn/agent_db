@@ -120,6 +120,40 @@ defmodule AgentDbWeb.AdminLiveTest do
       assert {:ok, "a newer manifest"} = AgentDb.read("viking://user/alice/skills/alpha/SKILL.md")
       assert {:error, :not_found} = AgentDb.read("viking://user/alice/skills/alpha/old.md")
     end
+
+    test "selecting a folder lists its files before submit" do
+      view = page("/admin/skills")
+
+      # The form roundtrips selection (phx-change) and streams bytes on
+      # select (auto-upload): in a browser this needs no submit, and the
+      # test client drives the same server state via render_upload.
+      upload =
+        file_input(view, @form, :skill_folder, [
+          %{name: "SKILL.md", relative_path: "alpha/SKILL.md", content: "the manifest"},
+          %{name: "guide.md", relative_path: "alpha/references/guide.md", content: "the guide"}
+        ])
+
+      for entry <- upload.entries, do: render_upload(upload, entry["name"])
+
+      html = render(view)
+      assert html =~ ~s(phx-change="validate")
+      assert html =~ "alpha/SKILL.md"
+      assert html =~ "alpha/references/guide.md"
+    end
+
+    test "a folder with macOS metadata imports the skill and ignores the metadata" do
+      view = page("/admin/skills")
+
+      view =
+        submit_folder(view, "alice", [
+          %{name: "SKILL.md", relative_path: "alpha/SKILL.md", content: "the manifest"},
+          %{name: "._SKILL.md", relative_path: "alpha/._SKILL.md", content: <<0xFF, 0xFE>>}
+        ])
+
+      assert render(view) =~ "1 imported"
+      assert {:ok, "the manifest"} = AgentDb.read("viking://user/alice/skills/alpha/SKILL.md")
+      assert {:ok, ["SKILL.md"]} = AgentDb.list("viking://user/alice/skills/alpha")
+    end
   end
 
   describe "an archive upload" do
@@ -217,6 +251,20 @@ defmodule AgentDbWeb.AdminLiveTest do
   end
 
   describe "realtime updates" do
+    test "the first change event after mount reloads immediately" do
+      view = page("/admin/documents")
+      assert render(view) =~ "0 documents"
+
+      :ok = AgentDb.write("viking://resources/first-event-note.md", "first event content")
+      send(view.pid, {:context_changed, "viking://resources/first-event-note.md", :written, 1})
+
+      # No coalesced refresh, no fallback refresh: the first event is not a
+      # burst, so the page converges on the event itself.
+      html = render(view)
+      assert html =~ "1 documents"
+      assert html =~ "resources"
+    end
+
     test "a change event records URI, kind and version in the feed" do
       view = page("/admin")
       send(view.pid, {:context_changed, "viking://resources/realtime-note.md", :written, 7})
@@ -341,6 +389,110 @@ defmodule AgentDbWeb.AdminLiveTest do
       view |> form("#session-lookup", %{"session_id" => "no-such-session"}) |> render_submit()
 
       assert render(view) =~ "No session with that ID"
+    end
+  end
+
+  describe "a skill's LLM view" do
+    test "expands to the skill's files with their layers and collapses again" do
+      {:ok, _} =
+        AgentDb.import_skills(
+          "alice",
+          {:uploads,
+           [
+             %{path: "alpha/SKILL.md", content: "alpha manifest line"},
+             %{path: "alpha/notes.md", content: "alpha notes body"}
+           ]}
+        )
+
+      view = page("/admin/skills")
+
+      html = view |> element("button", "LLM view") |> render_click()
+
+      assert html =~ "viking://user/alice/skills/alpha/SKILL.md"
+      assert html =~ "viking://user/alice/skills/alpha/notes.md"
+      assert html =~ "Abstract (L0)"
+      assert html =~ "Overview (L1)"
+      assert html =~ "Full content (L2)"
+      assert html =~ "alpha manifest line"
+      assert html =~ "alpha notes body"
+      assert html =~ "chars"
+
+      html = view |> element("button", "Hide LLM view") |> render_click()
+
+      refute html =~ "alpha manifest line"
+      refute html =~ "alpha notes body"
+    end
+
+    test "pages the skill's files fifty at a time" do
+      numbered =
+        for n <- 1..51 do
+          name = "file-#{String.pad_leading(to_string(n), 2, "0")}.md"
+          %{path: "big/#{name}", content: "body #{n}"}
+        end
+
+      files = [%{path: "big/SKILL.md", content: "big manifest"} | numbered]
+
+      {:ok, _} = AgentDb.import_skills("alice", {:uploads, files})
+
+      view = page("/admin/skills")
+      html = view |> element("button", "LLM view") |> render_click()
+
+      assert html =~ "Page 1 of 2"
+      assert html =~ "file-01.md"
+      refute html =~ "file-51.md"
+
+      html = view |> element("button", "Next") |> render_click()
+
+      assert html =~ "Page 2 of 2"
+      assert html =~ "file-51.md"
+    end
+
+    test "a replaced skill converges the open LLM view" do
+      {:ok, _} =
+        AgentDb.import_skills(
+          "alice",
+          {:uploads, [%{path: "gamma/SKILL.md", content: "v1 manifest"}]}
+        )
+
+      view = page("/admin/skills")
+      html = view |> element("button", "LLM view") |> render_click()
+      assert html =~ "v1 manifest"
+
+      {:ok, _} =
+        AgentDb.import_skills(
+          "alice",
+          {:uploads, [%{path: "gamma/SKILL.md", content: "v2 manifest"}]}
+        )
+
+      send(view.pid, :refresh)
+      html = render(view)
+
+      assert html =~ "v2 manifest"
+      refute html =~ "v1 manifest"
+    end
+
+    test "a removed file converges without breaking the remaining files" do
+      {:ok, _} =
+        AgentDb.import_skills(
+          "alice",
+          {:uploads,
+           [
+             %{path: "delta/SKILL.md", content: "kept manifest"},
+             %{path: "delta/old.md", content: "gone body"}
+           ]}
+        )
+
+      view = page("/admin/skills")
+      html = view |> element("button", "LLM view") |> render_click()
+      assert html =~ "kept manifest"
+      assert html =~ "gone body"
+
+      :ok = AgentDb.rm("viking://user/alice/skills/delta/old.md")
+      send(view.pid, :refresh)
+      html = render(view)
+
+      assert html =~ "kept manifest"
+      refute html =~ "gone body"
     end
   end
 

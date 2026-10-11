@@ -90,7 +90,15 @@ defmodule AgentDb.Test.Fakes.Storage do
 
   @impl true
   def get_node(uri) do
-    scripted(:get_node, {:ok, Map.get(documents(), uri) || stubbed_node(uri)})
+    scripted(:get_node, {:ok, with_meta(Map.get(documents(), uri) || stubbed_node(uri))})
+  end
+
+  defp with_meta(nil), do: nil
+
+  defp with_meta(node) when is_map(node) do
+    node
+    |> Map.put_new(:enabled, true)
+    |> Map.put_new(:group_tag, "")
   end
 
   @doc "Reports a node for any URI, shaped as a stored document."
@@ -176,6 +184,173 @@ defmodule AgentDb.Test.Fakes.Storage do
     end
   end
 
+  @impl true
+  def set_node_enabled(uri, enabled) when is_boolean(enabled) do
+    case Map.fetch(documents(), uri) do
+      :error ->
+        {:error, :not_found}
+
+      {:ok, _} ->
+        updated =
+          Map.new(documents(), fn
+            {key, doc} when key == uri ->
+              {key, Map.put(doc, :enabled, enabled)}
+
+            {key, doc} ->
+              if subtree_member?(key, uri),
+                do: {key, Map.put(doc, :enabled, enabled)},
+                else: {key, doc}
+          end)
+
+        put(:documents, updated, [])
+        :ok
+    end
+  end
+
+  @impl true
+  def set_node_group(uri, tag) when is_binary(tag) do
+    with :ok <- validate_fake_group(tag) do
+      case Map.fetch(documents(), uri) do
+        :error ->
+          {:error, :not_found}
+
+        {:ok, _} ->
+          updated =
+            Map.new(documents(), fn
+              {key, doc} when key == uri ->
+                {key, Map.put(doc, :group_tag, tag)}
+
+              {key, doc} ->
+                if subtree_member?(key, uri),
+                  do: {key, Map.put(doc, :group_tag, tag)},
+                  else: {key, doc}
+            end)
+
+          put(:documents, updated, [])
+          :ok
+      end
+    end
+  end
+
+  defp validate_fake_group(""), do: :ok
+
+  defp validate_fake_group(tag) do
+    if String.length(tag) >= 1 and String.length(tag) <= 64 and
+         Regex.match?(~r/\A[A-Za-z0-9_\-\/]+\z/, tag) do
+      :ok
+    else
+      {:error, {:invalid_group, tag}}
+    end
+  end
+
+  defp subtree_member?(candidate, uri) do
+    prefix = String.trim_trailing(uri, "/") <> "/"
+    candidate != uri and String.starts_with?(candidate, prefix)
+  end
+
+  @impl true
+  def list_all_documents(scope, limit, offset, filter \\ %{}) do
+    rows =
+      documents()
+      |> Map.values()
+      |> Enum.filter(fn doc ->
+        doc.kind == :doc and fake_in_scope?(doc.uri, scope) and fake_enabled?(doc, filter) and
+          fake_substring?(doc.uri, filter) and fake_group_doc?(doc, filter)
+      end)
+      |> Enum.sort_by(& &1.uri)
+      |> Enum.map(
+        &%{
+          uri: &1.uri,
+          enabled: Map.get(&1, :enabled, true),
+          group_tag: Map.get(&1, :group_tag, "")
+        }
+      )
+
+    {:ok, {Enum.slice(rows, offset, limit), length(rows)}}
+  end
+
+  @impl true
+  def list_skill_roots(limit, offset, filter \\ %{}) do
+    rows =
+      documents()
+      |> Map.values()
+      |> Enum.filter(fn doc ->
+        doc.kind == :dir and fake_skill_root?(doc.uri) and fake_enabled?(doc, filter) and
+          fake_skill_owner?(doc.uri, filter) and fake_substring?(doc.uri, filter) and
+          fake_group_skill?(doc, filter)
+      end)
+      |> Enum.sort_by(& &1.uri)
+      |> Enum.map(fn doc ->
+        {owner, name} = fake_skill_parts(doc.uri)
+
+        %{
+          name: name,
+          owner: owner,
+          uri: doc.uri,
+          files: fake_subtree_doc_count(doc.uri),
+          enabled: Map.get(doc, :enabled, true),
+          group_tag: Map.get(doc, :group_tag, "")
+        }
+      end)
+
+    {:ok, {Enum.slice(rows, offset, limit), length(rows)}}
+  end
+
+  defp fake_in_scope?(uri, scope) do
+    uri == scope or String.starts_with?(uri, String.trim_trailing(scope, "/") <> "/")
+  end
+
+  defp fake_enabled?(_doc, %{include_disabled: true}), do: true
+  defp fake_enabled?(doc, _filter), do: Map.get(doc, :enabled, true) != false
+
+  defp fake_substring?(_uri, %{substring: sub}) when is_binary(sub) and sub != "" do
+    String.contains?(String.downcase(_uri), String.downcase(sub))
+  end
+
+  defp fake_substring?(_uri, _filter), do: true
+
+  defp fake_group_doc?(_doc, %{group: group}) when is_binary(group) and group != "" do
+    Map.get(_doc, :group_tag, "") == group or fake_in_scope?(_doc.uri, "viking://" <> group)
+  end
+
+  defp fake_group_doc?(_doc, _filter), do: true
+
+  defp fake_skill_root?(uri) do
+    String.starts_with?(uri, "viking://user/") and String.contains?(uri, "/skills/") and
+      uri |> String.split("/") |> length() == 6
+  end
+
+  defp fake_skill_owner?(uri, %{owner: owner}) when is_binary(owner) and owner != "" do
+    String.starts_with?(uri, "viking://user/" <> owner <> "/skills/")
+  end
+
+  defp fake_skill_owner?(_uri, _filter), do: true
+
+  defp fake_group_skill?(doc, %{group: group}) when is_binary(group) and group != "" do
+    Map.get(doc, :group_tag, "") == group or
+      String.starts_with?(doc.uri, "viking://user/" <> group <> "/skills/")
+  end
+
+  defp fake_group_skill?(_doc, _filter), do: true
+
+  defp fake_skill_parts(uri) do
+    case String.split(String.replace_prefix(uri, "viking://", ""), "/") do
+      ["user", owner, "skills", name] -> {owner, name}
+      _ -> {"", uri}
+    end
+  end
+
+  defp fake_subtree_doc_count(uri) do
+    prefix = String.trim_trailing(uri, "/") <> "/"
+
+    documents()
+    |> Map.keys()
+    |> Enum.count(fn key ->
+      (key == uri or String.starts_with?(key, prefix)) and
+        match?(%{kind: :doc}, Map.get(documents(), key))
+    end)
+  end
+
   # In memory the replacement is one step by construction, which is what lets a
   # test ask what a *provider* owes here rather than what SQLite owes: the old
   # subtree goes, the files arrive at their paths, and each is queued for the
@@ -193,6 +368,11 @@ defmodule AgentDb.Test.Fakes.Storage do
   @spec do_replace_skill(String.t(), [map()]) :: {:ok, map()} | {:error, term()}
   def do_replace_skill(uri, files) do
     replaced? = Map.has_key?(documents(), uri)
+    prior = Map.get(documents(), uri)
+
+    prior_meta =
+      if prior, do: {Map.get(prior, :enabled, true), Map.get(prior, :group_tag, "")}, else: nil
+
     doomed = subtree(uri)
     put(:documents, Map.drop(documents(), doomed), [])
     put(:memories, Map.drop(memories(), doomed), [])
@@ -208,8 +388,17 @@ defmodule AgentDb.Test.Fakes.Storage do
       end)
 
     case outcome do
-      :ok -> {:ok, %{replaced: replaced?, files: length(files)}}
-      {:error, _} = err -> err
+      :ok ->
+        if replaced? and prior_meta do
+          {enabled, tag} = prior_meta
+          _ = set_node_enabled(uri, enabled)
+          if tag != "", do: _ = set_node_group(uri, tag)
+        end
+
+        {:ok, %{replaced: replaced?, files: length(files)}}
+
+      {:error, _} = err ->
+        err
     end
   end
 
@@ -988,6 +1177,8 @@ defmodule AgentDb.Test.Fakes.Storage do
   defp record(uri, content, opts) do
     ensure_directories(uri)
 
+    prior = Map.get(documents(), uri)
+
     document = %{
       uri: uri,
       parent_uri: parent_of(uri),
@@ -995,7 +1186,9 @@ defmodule AgentDb.Test.Fakes.Storage do
       kind: :doc,
       content: content,
       abstract: opts[:abstract],
-      overview: opts[:overview]
+      overview: opts[:overview],
+      enabled: if(prior, do: Map.get(prior, :enabled, true), else: true),
+      group_tag: if(prior, do: Map.get(prior, :group_tag, ""), else: "")
     }
 
     put(:documents, Map.put(documents(), uri, document), :ok)
@@ -1016,7 +1209,9 @@ defmodule AgentDb.Test.Fakes.Storage do
           kind: :dir,
           content: nil,
           abstract: nil,
-          overview: nil
+          overview: nil,
+          enabled: true,
+          group_tag: ""
         }),
         []
       )

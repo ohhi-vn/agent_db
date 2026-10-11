@@ -157,7 +157,8 @@ defmodule AgentDb.Application.Documents do
   end
 
   @doc """
-  Reads the L0 abstract, falling back to the first non-empty content line.
+  Reads the L0 abstract, falling back to frontmatter identity or the first
+  non-empty body line.
 
   The fallback is what makes a document readable at all when no model is
   available, so it is a value the store always has rather than an error the
@@ -167,17 +168,35 @@ defmodule AgentDb.Application.Documents do
   def abstract(uri) do
     Observability.timed(:abstract, %{}, fn ->
       with {:ok, segments} <- VikingURI.parse(uri) do
-        layer(segments, fn node -> node.abstract || first_line(node.content) end)
+        layer(segments, fn node -> node.abstract || fallback_abstract(node.content) end)
       end
     end)
   end
 
-  @doc "Reads the L1 overview, falling back to the first 280 characters of content."
+  @doc "Reads the L1 overview, falling back to the first 280 characters of the body after frontmatter."
   @spec overview(uri()) :: {:ok, content()} | {:error, term()}
   def overview(uri) do
     Observability.timed(:overview, %{}, fn ->
       with {:ok, segments} <- VikingURI.parse(uri) do
-        layer(segments, fn node -> node.overview || first_chars(node.content) end)
+        layer(segments, fn node -> node.overview || fallback_overview(node.content) end)
+      end
+    end)
+  end
+
+  @doc """
+  Reads the stored L0/L1 layers without fallback.
+
+  Returns `{:ok, %{abstract: binary | nil, overview: binary | nil}}` for a
+  stored document, so a caller can tell a stored layer from a fallback-derived
+  one without reimplementing the fallback. A missing URI returns an error.
+  """
+  @spec stored_layers(uri()) ::
+          {:ok, %{abstract: content() | nil, overview: content() | nil}} | {:error, term()}
+  def stored_layers(uri) do
+    Observability.timed(:stored_layers, %{}, fn ->
+      with {:ok, segments} <- VikingURI.parse(uri),
+           {:ok, node} <- fetch(segments) do
+        {:ok, %{abstract: node.abstract, overview: node.overview}}
       end
     end)
   end
@@ -188,13 +207,142 @@ defmodule AgentDb.Application.Documents do
     end
   end
 
-  defp first_line(nil), do: ""
-
   defp first_line(content),
     do: content |> String.split("\n") |> Enum.find("", &(&1 != "")) |> String.trim()
 
-  defp first_chars(nil), do: ""
   defp first_chars(content), do: String.slice(content, 0, 280)
+
+  # -- frontmatter-aware fallbacks --
+
+  # A SKILL.md (or any document) may start with a YAML frontmatter block whose
+  # first line is `---` and whose identity no reader should ever see as the
+  # abstract. The fallback therefore prefers the parsed `name:`/`description:`
+  # identity and otherwise derives from the body after the closing delimiter.
+  defp fallback_abstract(nil), do: ""
+
+  defp fallback_abstract(content) do
+    case split_frontmatter(content) do
+      {:ok, fields, body} ->
+        case frontmatter_identity(fields) do
+          nil -> first_line(body)
+          identity -> identity
+        end
+
+      :none ->
+        first_line(content)
+    end
+  end
+
+  defp fallback_overview(nil), do: ""
+
+  defp fallback_overview(content) do
+    case split_frontmatter(content) do
+      {:ok, _fields, body} -> body |> String.trim_leading() |> String.slice(0, 280)
+      :none -> first_chars(content)
+    end
+  end
+
+  # Only a leading `---` line opens frontmatter, and only a later `---`-only
+  # line within the header window closes it. Anything else -- an unclosed
+  # delimiter, a `---` separator mid-document, a block with no `key: value`
+  # line -- is plain body, so today's fallback applies unchanged.
+  @frontmatter_window 20
+
+  defp split_frontmatter(content) when is_binary(content) do
+    normalized =
+      content
+      |> String.replace_prefix("\uFEFF", "")
+      |> String.replace("\r\n", "\n")
+      |> String.replace("\r", "\n")
+
+    case String.split(normalized, "\n") do
+      [first | rest] when rest != [] ->
+        if String.trim(first) == "---" do
+          split_at_closing(rest)
+        else
+          :none
+        end
+
+      _ ->
+        :none
+    end
+  end
+
+  defp split_at_closing(rest) do
+    window = Enum.take(rest, @frontmatter_window)
+
+    case Enum.find_index(window, &(String.trim(&1) == "---")) do
+      nil ->
+        :none
+
+      index ->
+        fields = Enum.take(window, index)
+
+        if Enum.any?(fields, &key_value_line?/1) do
+          body = rest |> Enum.drop(index + 1) |> Enum.join("\n")
+          {:ok, fields, body}
+        else
+          :none
+        end
+    end
+  end
+
+  defp key_value_line?(line), do: line =~ ~r/^\s*[A-Za-z0-9_-]+\s*:/
+
+  defp frontmatter_identity(fields) do
+    case {frontmatter_field(fields, "name"), frontmatter_field(fields, "description")} do
+      {nil, nil} -> nil
+      {name, nil} -> truncate_identity(name)
+      {nil, description} -> truncate_identity(description)
+      {name, description} -> truncate_identity(name <> " — " <> description)
+    end
+  end
+
+  # An abstract stays scannable: one line, bounded like the L1 fallback.
+  defp truncate_identity(identity), do: String.slice(identity, 0, 280)
+
+  # First occurrence wins. An empty value takes the first following non-empty
+  # line that is not itself a `key: value` line, which covers folded
+  # continuations without a YAML parser.
+  defp frontmatter_field(fields, key) do
+    fields
+    |> Enum.with_index()
+    |> Enum.find_value(fn {line, index} ->
+      case parse_field_line(line, key) do
+        :no_match -> nil
+        {:value, ""} -> fields |> Enum.drop(index + 1) |> Enum.find_value(&continuation_line/1)
+        {:value, value} -> value
+      end
+    end)
+  end
+
+  defp continuation_line(line) do
+    cond do
+      String.trim(line) == "" -> nil
+      key_value_line?(line) -> nil
+      true -> String.trim(line)
+    end
+  end
+
+  defp parse_field_line(line, key) do
+    case Regex.run(~r/^\s*#{key}\s*:(.*)$/, line) do
+      [_, raw] -> {:value, raw |> String.trim() |> unquote_scalar()}
+      nil -> :no_match
+    end
+  end
+
+  defp unquote_scalar(value) do
+    if String.length(value) >= 2 and quoted?(value) do
+      value |> String.slice(1, String.length(value) - 2) |> String.trim()
+    else
+      value
+    end
+  end
+
+  defp quoted?(value),
+    do:
+      (String.starts_with?(value, "\"") and String.ends_with?(value, "\"")) or
+        (String.starts_with?(value, "'") and String.ends_with?(value, "'"))
 
   @doc "Lists the names of a URI's direct children, and only those."
   @spec list(uri()) :: {:ok, [String.t()]} | {:error, term()}
@@ -271,7 +419,21 @@ defmodule AgentDb.Application.Documents do
       with :ok <- Navigation.validate_query(query, @max_query_length),
            {:ok, limit} <- Navigation.validate_limit(opts, @default_find_limit, @max_find_limit),
            {:ok, scope_uri} <- Navigation.validate_scope(opts) do
-        Runtime.storage().find_paths(query, scope_uri, limit)
+        fetch_limit = min(limit * 3, @max_find_limit)
+
+        case Runtime.storage().find_paths(query, scope_uri, fetch_limit) do
+          {:ok, hits} ->
+            hits =
+              hits
+              |> filter_enabled(opts)
+              |> Enum.take(limit)
+              |> Enum.map(&Map.drop(&1, [:enabled, :group_tag]))
+
+            {:ok, hits}
+
+          {:error, _} = err ->
+            err
+        end
       end
     end)
   end
@@ -368,5 +530,13 @@ defmodule AgentDb.Application.Documents do
   defp cache_and_return(uri, node) do
     :ok = Cache.put_node(uri, node)
     {:ok, node}
+  end
+
+  defp filter_enabled(results, opts) do
+    if Keyword.get(opts, :include_disabled, false) do
+      results
+    else
+      Enum.filter(results, &(Map.get(&1, :enabled, true) != false))
+    end
   end
 end

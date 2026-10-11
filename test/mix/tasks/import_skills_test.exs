@@ -35,6 +35,19 @@ defmodule Mix.Tasks.AgentDb.ImportSkillsTest do
       assert {:ok, "the manifest"} = AgentDb.read("viking://user/alice/skills/alpha/SKILL.md")
     end
 
+    test "a folder with macOS metadata imports the skill and ignores the metadata" do
+      folder = tmp("alpha")
+      write(folder, "SKILL.md", "the manifest")
+      write(folder, "._SKILL.md", <<0xFF, 0xFE, 0x00, 0x01>>)
+      write(folder, ".DS_Store", <<0x00, 0x01, 0x02, 0x03>>)
+
+      output = run([folder, "--user", "alice"])
+
+      assert output =~ "imported alpha"
+      assert {:ok, "the manifest"} = AgentDb.read("viking://user/alice/skills/alpha/SKILL.md")
+      assert {:ok, ["SKILL.md"]} = AgentDb.list("viking://user/alice/skills/alpha")
+    end
+
     test "imports a collection, one line per skill" do
       folder = tmp("collection")
       write(folder, "alpha/SKILL.md", "alpha's manifest\n")

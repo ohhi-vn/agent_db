@@ -65,13 +65,18 @@ defmodule AgentDb do
   @spec read(uri()) :: {:ok, content()} | {:error, term()}
   defdelegate read(uri), to: Documents
 
-  @doc "Reads a document's L0 abstract, falling back to the first non-empty line."
+  @doc "Reads a document's L0 abstract, falling back to frontmatter identity or the first non-empty body line."
   @spec abstract(uri()) :: {:ok, content()} | {:error, term()}
   defdelegate abstract(uri), to: Documents
 
-  @doc "Reads a document's L1 overview, falling back to the first 280 characters."
+  @doc "Reads a document's L1 overview, falling back to the first 280 characters of the body after frontmatter."
   @spec overview(uri()) :: {:ok, content()} | {:error, term()}
   defdelegate overview(uri), to: Documents
+
+  @doc "Reads a document's stored L0/L1 layers without fallback."
+  @spec stored_layers(uri()) ::
+          {:ok, %{abstract: content() | nil, overview: content() | nil}} | {:error, term()}
+  defdelegate stored_layers(uri), to: Documents
 
   @doc "Lists the names of a URI's direct children."
   @spec list(uri()) :: {:ok, [String.t()]} | {:error, term()}
@@ -300,6 +305,206 @@ defmodule AgentDb do
   @doc "Why a skill import was refused, as a sentence an operator can act on."
   @spec skill_import_error_message(term()) :: String.t()
   defdelegate skill_import_error_message(reason), to: AgentDb.Skills.Source, as: :message
+
+  # -- node management (enable/disable, grouping, operations listings) --
+
+  @doc """
+  Enables or disables the subtree at `uri`.
+
+  Disabled is blocked-from-use: excluded from search and default listings,
+  but still readable and editable. Notifies subscribers so the console
+  reloads without restart.
+  """
+  @spec set_enabled(uri(), boolean()) :: :ok | {:error, term()}
+  def set_enabled(uri, enabled) when is_boolean(enabled) do
+    case AgentDb.Runtime.storage().set_node_enabled(uri, enabled) do
+      :ok ->
+        AgentDb.Cache.invalidate_removal(uri)
+        notify(uri, :replaced)
+        :ok
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  @doc """
+  Assigns the operator group tag for the subtree at `uri`. Empty clears.
+  """
+  @spec set_group(uri(), String.t()) :: :ok | {:error, term()}
+  def set_group(uri, tag) when is_binary(tag) do
+    case AgentDb.Runtime.storage().set_node_group(uri, tag) do
+      :ok ->
+        AgentDb.Cache.invalidate_removal(uri)
+        notify(uri, :replaced)
+        :ok
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  @doc """
+  Applies `set_enabled` to every URI in `uris`, attempting each one.
+  Answers per-URI outcomes plus summary counts.
+  """
+  @spec bulk_set_enabled([uri()], boolean()) ::
+          {:ok, %{results: [map()], updated: non_neg_integer(), failed: non_neg_integer()}}
+  def bulk_set_enabled(uris, enabled) when is_list(uris) and is_boolean(enabled) do
+    results =
+      Enum.map(uris, fn uri ->
+        case set_enabled(uri, enabled) do
+          :ok -> %{uri: uri, status: :ok, reason: nil}
+          {:error, reason} -> %{uri: uri, status: :failed, reason: reason}
+        end
+      end)
+
+    {:ok,
+     %{
+       results: results,
+       updated: Enum.count(results, &(&1.status == :ok)),
+       failed: Enum.count(results, &(&1.status == :failed))
+     }}
+  end
+
+  @doc """
+  Applies `set_group` to every URI in `uris`, attempting each one.
+  """
+  @spec bulk_set_group([uri()], String.t()) ::
+          {:ok, %{results: [map()], updated: non_neg_integer(), failed: non_neg_integer()}}
+  def bulk_set_group(uris, tag) when is_list(uris) and is_binary(tag) do
+    results =
+      Enum.map(uris, fn uri ->
+        case set_group(uri, tag) do
+          :ok -> %{uri: uri, status: :ok, reason: nil}
+          {:error, reason} -> %{uri: uri, status: :failed, reason: reason}
+        end
+      end)
+
+    {:ok,
+     %{
+       results: results,
+       updated: Enum.count(results, &(&1.status == :ok)),
+       failed: Enum.count(results, &(&1.status == :failed))
+     }}
+  end
+
+  @default_list_page 1
+  @default_list_per_page 50
+  @max_list_per_page 200
+
+  @doc """
+  Recursive document URIs under `scope` in deterministic order, paged.
+
+  Options: `:page` (default 1), `:per_page` (default 50, max 200),
+  `:substring`, `:include_disabled` (default false), `:group`.
+  """
+  @spec list_all_documents(uri(), keyword()) :: {:ok, map()} | {:error, term()}
+  def list_all_documents(scope \\ "viking://", opts \\ []) do
+    with {:ok, _} <- AgentDb.URI.parse(scope) do
+      page = clamp_page(Keyword.get(opts, :page, @default_list_page))
+      per_page = clamp_per_page(Keyword.get(opts, :per_page, @default_list_per_page))
+
+      filter = %{
+        substring: Keyword.get(opts, :substring, ""),
+        include_disabled: Keyword.get(opts, :include_disabled, false),
+        group: Keyword.get(opts, :group, "")
+      }
+
+      fetch_all_documents(scope, filter, page, per_page)
+    end
+  end
+
+  @doc """
+  Installed skill roots in URI order, paged. Each entry carries `name`,
+  `owner`, `uri`, `files`, `enabled`, and `group_tag`.
+
+  Options: `:page`, `:per_page`, `:substring`, `:owner`, `:include_disabled`,
+  `:group`.
+  """
+  @spec list_skills(keyword()) :: {:ok, map()} | {:error, term()}
+  def list_skills(opts \\ []) do
+    page = clamp_page(Keyword.get(opts, :page, @default_list_page))
+    per_page = clamp_per_page(Keyword.get(opts, :per_page, @default_list_per_page))
+
+    filter = %{
+      substring: Keyword.get(opts, :substring, ""),
+      owner: Keyword.get(opts, :owner, ""),
+      include_disabled: Keyword.get(opts, :include_disabled, false),
+      group: Keyword.get(opts, :group, "")
+    }
+
+    fetch_skills(filter, page, per_page)
+  end
+
+  defp clamp_page(page) when is_integer(page) and page >= 1, do: page
+  defp clamp_page(_), do: @default_list_page
+
+  defp clamp_per_page(per_page)
+       when is_integer(per_page) and per_page >= 1 and per_page <= @max_list_per_page,
+       do: per_page
+
+  defp clamp_per_page(_), do: @default_list_per_page
+
+  defp page_of_all(rows, total, page, per_page) do
+    total_pages = max(div(total + per_page - 1, per_page), 1)
+    page = page |> max(1) |> min(total_pages)
+
+    %{data: rows, meta: %{page: page, per_page: per_page, total: total, total_pages: total_pages}}
+  end
+
+  defp fetch_all_documents(scope, filter, page, per_page) do
+    offset = (page - 1) * per_page
+
+    case AgentDb.Runtime.storage().list_all_documents(scope, per_page, offset, filter) do
+      {:ok, {rows, total}} ->
+        total_pages = max(div(total + per_page - 1, per_page), 1)
+        clamped = page |> max(1) |> min(total_pages)
+
+        if clamped == page do
+          {:ok, page_of_all(rows, total, page, per_page)}
+        else
+          case AgentDb.Runtime.storage().list_all_documents(
+                 scope,
+                 per_page,
+                 (clamped - 1) * per_page,
+                 filter
+               ) do
+            {:ok, {rows2, _}} -> {:ok, page_of_all(rows2, total, clamped, per_page)}
+            {:error, _} = err -> err
+          end
+        end
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  defp fetch_skills(filter, page, per_page) do
+    offset = (page - 1) * per_page
+
+    case AgentDb.Runtime.storage().list_skill_roots(per_page, offset, filter) do
+      {:ok, {rows, total}} ->
+        total_pages = max(div(total + per_page - 1, per_page), 1)
+        clamped = page |> max(1) |> min(total_pages)
+
+        if clamped == page do
+          {:ok, page_of_all(rows, total, page, per_page)}
+        else
+          case AgentDb.Runtime.storage().list_skill_roots(
+                 per_page,
+                 (clamped - 1) * per_page,
+                 filter
+               ) do
+            {:ok, {rows2, _}} -> {:ok, page_of_all(rows2, total, clamped, per_page)}
+            {:error, _} = err -> err
+          end
+        end
+
+      {:error, _} = err ->
+        err
+    end
+  end
 
   @doc "The confidence recorded when a caller supplies none."
   @spec default_confidence() :: float()

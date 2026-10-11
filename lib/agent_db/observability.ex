@@ -349,6 +349,7 @@ defmodule AgentDb.Observability do
     :invalid_json,
     :invalid_argument,
     :invalid_payload,
+    :invalid_group,
     :not_a_memory_uri,
     :is_root,
     :missing_argument,

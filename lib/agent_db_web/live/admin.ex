@@ -73,11 +73,16 @@ defmodule AgentDbWeb.Admin do
       :timer.send_interval(@refresh_ms, self(), :refresh)
     end
 
+    # Anchored to now rather than zero: the monotonic epoch is arbitrary (it
+    # is negative on some machines), so a zero stamp can lie in the future
+    # and the first change event would wrongly coalesce instead of reloading.
+    last_reload_ms = System.monotonic_time(:millisecond) - @coalesce_ms - 1
+
     socket
     |> assign(
       active: page.admin_page(),
       recent_changes: [],
-      last_reload_ms: 0,
+      last_reload_ms: last_reload_ms,
       reload_pending: false,
       notice: nil
     )

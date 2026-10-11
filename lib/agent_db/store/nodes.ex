@@ -15,7 +15,9 @@ defmodule AgentDb.Store.Nodes do
           kind: kind(),
           content: String.t() | nil,
           abstract: String.t() | nil,
-          overview: String.t() | nil
+          overview: String.t() | nil,
+          enabled: boolean(),
+          group_tag: String.t()
         }
 
   @doc "Fetches one node by URI."
@@ -23,7 +25,7 @@ defmodule AgentDb.Store.Nodes do
   def get(conn, uri) do
     case SQLite.query_one(
            conn,
-           "SELECT uri, parent_uri, name, kind, content, abstract, overview FROM nodes WHERE uri = ?1",
+           "SELECT uri, parent_uri, name, kind, content, abstract, overview, enabled, group_tag FROM nodes WHERE uri = ?1",
            [uri]
          ) do
       {:ok, nil} -> {:ok, nil}
@@ -37,7 +39,7 @@ defmodule AgentDb.Store.Nodes do
   def children(conn, parent_uri) do
     case SQLite.query(
            conn,
-           "SELECT uri, parent_uri, name, kind, content, abstract, overview FROM nodes WHERE parent_uri = ?1 ORDER BY name",
+           "SELECT uri, parent_uri, name, kind, content, abstract, overview, enabled, group_tag FROM nodes WHERE parent_uri = ?1 ORDER BY name",
            [parent_uri]
          ) do
       {:ok, rows} -> {:ok, Enum.map(rows, &row_to_node/1)}
@@ -253,7 +255,7 @@ defmodule AgentDb.Store.Nodes do
 
     case SQLite.query(
            conn,
-           "SELECT uri, parent_uri, name, kind, content, abstract, overview FROM nodes WHERE " <>
+           "SELECT uri, parent_uri, name, kind, content, abstract, overview, enabled, group_tag FROM nodes WHERE " <>
              where <> " ORDER BY uri ASC LIMIT ?",
            args ++ [limit]
          ) do
@@ -278,14 +280,20 @@ defmodule AgentDb.Store.Nodes do
     {scope_where, scope_args} = scope_predicate(scope_uri)
 
     sql =
-      "SELECT uri, parent_uri, name, kind FROM nodes WHERE lower(substr(uri, 10)) LIKE ? ESCAPE '\\'" <>
+      "SELECT uri, parent_uri, name, kind, enabled, group_tag FROM nodes WHERE lower(substr(uri, 10)) LIKE ? ESCAPE '\\'" <>
         scope_where <> " ORDER BY uri ASC LIMIT ?"
 
     case SQLite.query(conn, sql, [pattern | scope_args] ++ [limit]) do
       {:ok, rows} ->
         {:ok,
-         Enum.map(rows, fn [uri, _parent_uri, name, kind] ->
-           %{uri: uri, name: name, kind: safe_kind(kind)}
+         Enum.map(rows, fn [uri, _parent_uri, name, kind, enabled, group_tag] ->
+           %{
+             uri: uri,
+             name: name,
+             kind: safe_kind(kind),
+             enabled: enabled != 0,
+             group_tag: group_tag || ""
+           }
          end)}
 
       {:error, _} = err ->
@@ -311,7 +319,7 @@ defmodule AgentDb.Store.Nodes do
     {scope_where, scope_args} = scope_predicate(scope_uri)
 
     sql =
-      "SELECT uri, content FROM nodes WHERE kind = 'doc' AND lower(COALESCE(content, '')) LIKE ? ESCAPE '\\'" <>
+      "SELECT uri, content, enabled FROM nodes WHERE kind = 'doc' AND lower(COALESCE(content, '')) LIKE ? ESCAPE '\\'" <>
         scope_where <> " ORDER BY uri ASC LIMIT ?"
 
     case SQLite.query(conn, sql, [pattern | scope_args] ++ [limit]) do
@@ -337,19 +345,23 @@ defmodule AgentDb.Store.Nodes do
     needle_len = String.length(query)
 
     rows
-    |> Enum.flat_map(fn [uri, content] ->
-      matching_lines(uri, content || "", needle, needle_len)
+    |> Enum.flat_map(fn
+      [uri, content] ->
+        matching_lines(uri, content || "", needle, needle_len, true)
+
+      [uri, content, enabled] ->
+        matching_lines(uri, content || "", needle, needle_len, enabled != 0)
     end)
     |> Enum.take(limit)
   end
 
-  defp matching_lines(uri, content, needle, needle_len) do
+  defp matching_lines(uri, content, needle, needle_len, enabled) do
     content
     |> String.split("\n")
     |> Enum.with_index(1)
     |> Enum.filter(fn {line, _n} -> String.contains?(String.downcase(line), needle) end)
     |> Enum.map(fn {line, n} ->
-      %{uri: uri, line_number: n, excerpt: excerpt(line, needle, needle_len)}
+      %{uri: uri, line_number: n, excerpt: excerpt(line, needle, needle_len), enabled: enabled}
     end)
   end
 
@@ -390,7 +402,23 @@ defmodule AgentDb.Store.Nodes do
       kind: safe_kind(kind),
       content: content,
       abstract: abstract,
-      overview: overview
+      overview: overview,
+      enabled: true,
+      group_tag: ""
+    }
+  end
+
+  defp row_to_node([uri, parent_uri, name, kind, content, abstract, overview, enabled, group_tag]) do
+    %{
+      uri: uri,
+      parent_uri: parent_uri,
+      name: name,
+      kind: safe_kind(kind),
+      content: content,
+      abstract: abstract,
+      overview: overview,
+      enabled: enabled != 0,
+      group_tag: group_tag || ""
     }
   end
 
@@ -474,5 +502,252 @@ defmodule AgentDb.Store.Nodes do
       "UPDATE nodes SET updated_at = ?1 WHERE uri = ?2",
       [timestamp, uri]
     )
+  end
+
+  # -- enable/disable and grouping metadata --
+
+  @group_tag_max 64
+
+  @doc """
+  Validates an operator-assigned group tag. Empty clears the tag.
+  Tags are 1..64 chars of letters, digits, dash, underscore, or slash.
+  """
+  @spec validate_group(String.t()) :: :ok | {:error, {:invalid_group, String.t()}}
+  def validate_group(""), do: :ok
+
+  def validate_group(tag) when is_binary(tag) do
+    if String.length(tag) >= 1 and String.length(tag) <= @group_tag_max and
+         Regex.match?(~r/\A[A-Za-z0-9_\-\/]+\z/, tag) do
+      :ok
+    else
+      {:error, {:invalid_group, tag}}
+    end
+  end
+
+  def validate_group(tag), do: {:error, {:invalid_group, tag}}
+
+  @doc """
+  Sets `enabled` for the subtree at `uri` (node and descendants) in one
+  statement. Returns `:not_found` when nothing is stored there.
+  """
+  @spec set_enabled(SQLite.conn(), String.t(), boolean()) :: :ok | {:error, term()}
+  def set_enabled(conn, uri, enabled) when is_boolean(enabled) do
+    case exists?(conn, uri) do
+      {:ok, true} ->
+        SQLite.exec_write(
+          conn,
+          "UPDATE nodes SET enabled = ?1, updated_at = ?2 WHERE uri = ?3 OR uri LIKE ?4 ESCAPE '\\'",
+          [
+            if(enabled, do: 1, else: 0),
+            System.system_time(:millisecond),
+            uri,
+            like_escape(uri <> "/") <> "%"
+          ]
+        )
+
+      {:ok, false} ->
+        {:error, :not_found}
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  @doc """
+  Sets `group_tag` for the subtree at `uri` (node and descendants) in one
+  statement. Empty clears the tag. Returns `:not_found` when absent and
+  `{:invalid_group, tag}` for illegal tags.
+  """
+  @spec set_group(SQLite.conn(), String.t(), String.t()) :: :ok | {:error, term()}
+  def set_group(conn, uri, tag) when is_binary(tag) do
+    with :ok <- validate_group(tag),
+         {:ok, true} <- exists?(conn, uri) do
+      SQLite.exec_write(
+        conn,
+        "UPDATE nodes SET group_tag = ?1, updated_at = ?2 WHERE uri = ?3 OR uri LIKE ?4 ESCAPE '\\'",
+        [tag, System.system_time(:millisecond), uri, like_escape(uri <> "/") <> "%"]
+      )
+    else
+      {:ok, false} -> {:error, :not_found}
+      {:error, _} = err -> err
+    end
+  end
+
+  @doc "The stored enabled/group state for one node, or `{:ok, nil}` when absent."
+  @spec node_meta(SQLite.conn(), String.t()) ::
+          {:ok, %{enabled: boolean(), group_tag: String.t()} | nil} | {:error, term()}
+  def node_meta(conn, uri) do
+    case SQLite.query_one(conn, "SELECT enabled, group_tag FROM nodes WHERE uri = ?1", [uri]) do
+      {:ok, nil} -> {:ok, nil}
+      {:ok, [enabled, group_tag]} -> {:ok, %{enabled: enabled != 0, group_tag: group_tag || ""}}
+      {:error, _} = err -> err
+    end
+  end
+
+  # -- recursive operations listing --
+
+  @type list_filter :: %{
+          optional(:substring) => String.t(),
+          optional(:include_disabled) => boolean(),
+          optional(:group) => String.t()
+        }
+
+  @doc """
+  Recursive document URIs under `scope` in deterministic order, paged.
+
+  Returns `{rows, total}` where rows carry `uri`, `enabled`, and `group_tag`
+  without blobs. `opts` supports `:substring` (literal, case-insensitive),
+  `:include_disabled` (default false), and `:group` (custom tag exact or
+  top-level subtree segment).
+  """
+  @spec list_all_documents(SQLite.conn(), String.t(), pos_integer(), pos_integer(), list_filter()) ::
+          {:ok, {[map()], non_neg_integer()}} | {:error, term()}
+  def list_all_documents(conn, scope, limit, offset, filter \\ %{}) do
+    {where, args} = list_all_where(scope, filter)
+
+    count_sql = "SELECT COUNT(*) FROM nodes WHERE #{where}"
+
+    with {:ok, [total]} <- SQLite.query_one(conn, count_sql, args),
+         {:ok, rows} <-
+           SQLite.query(
+             conn,
+             "SELECT uri, enabled, group_tag FROM nodes WHERE #{where} ORDER BY uri ASC LIMIT ? OFFSET ?",
+             args ++ [limit, offset]
+           ) do
+      {:ok,
+       {Enum.map(rows, fn [uri, enabled, group_tag] ->
+          %{uri: uri, enabled: enabled != 0, group_tag: group_tag || ""}
+        end), total}}
+    end
+  end
+
+  defp list_all_where("viking://" = _scope, filter) do
+    base = "kind = 'doc'"
+    args = []
+    {base, args} = apply_enabled_where(base, args, filter)
+    {base, args} = apply_substring_where(base, args, filter)
+    apply_group_where(base, args, filter)
+  end
+
+  defp list_all_where(scope, filter) do
+    base = "kind = 'doc' AND (uri = ? OR uri LIKE ? ESCAPE '\\')"
+    args = [scope, like_escape(scope <> "/") <> "%"]
+
+    {base, args} = apply_enabled_where(base, args, filter)
+    {base, args} = apply_substring_where(base, args, filter)
+    apply_group_where(base, args, filter)
+  end
+
+  defp apply_enabled_where(where, args, %{include_disabled: true}), do: {where, args}
+
+  defp apply_enabled_where(where, args, _filter), do: {"#{where} AND enabled = 1", args}
+
+  defp apply_substring_where(where, args, %{substring: sub}) when is_binary(sub) and sub != "" do
+    pattern = "%" <> like_escape(String.downcase(sub)) <> "%"
+    {"#{where} AND lower(uri) LIKE ? ESCAPE '\\'", args ++ [pattern]}
+  end
+
+  defp apply_substring_where(where, args, _filter), do: {where, args}
+
+  defp apply_group_where(where, args, %{group: group}) when is_binary(group) and group != "" do
+    # Custom tag exact, or top-level subtree segment as implicit group.
+    {"#{where} AND (group_tag = ? OR uri LIKE ? ESCAPE '\\' OR uri = ?)",
+     args ++ [group, like_escape("viking://" <> group <> "/") <> "%", "viking://" <> group]}
+  end
+
+  defp apply_group_where(where, args, _filter), do: {where, args}
+
+  # -- installed-skill inventory --
+
+  @type skill_entry :: %{
+          name: String.t(),
+          owner: String.t(),
+          uri: String.t(),
+          enabled: boolean(),
+          group_tag: String.t()
+        }
+
+  @doc """
+  Skill roots (`viking://user/{owner}/skills/{name}` dirs) in URI order, paged.
+
+  Supports `:substring` (name/URI, case-insensitive), `:owner` (exact
+  `user_id`), `:include_disabled`, and `:group` (owner exact or custom tag
+  exact). Returns `{entries, total}` without file contents.
+  """
+  @spec list_skill_roots(SQLite.conn(), pos_integer(), pos_integer(), map()) ::
+          {:ok, {[skill_entry()], non_neg_integer()}} | {:error, term()}
+  def list_skill_roots(conn, limit, offset, filter \\ %{}) do
+    {where, args} = skill_roots_where(filter)
+    count_sql = "SELECT COUNT(*) FROM nodes WHERE #{where}"
+
+    with {:ok, [total]} <- SQLite.query_one(conn, count_sql, args),
+         {:ok, rows} <-
+           SQLite.query(
+             conn,
+             "SELECT uri, enabled, group_tag FROM nodes WHERE #{where} ORDER BY uri ASC LIMIT ? OFFSET ?",
+             args ++ [limit, offset]
+           ) do
+      {:ok, {Enum.map(rows, &skill_entry/1), total}}
+    end
+  end
+
+  # A skill root is a dir exactly four segments deep under user skills:
+  # `viking://` (2 slashes) plus `user/{owner}/skills/{name}` (3 more).
+  defp skill_roots_where(filter) do
+    base =
+      "kind = 'dir' AND uri LIKE 'viking://user/%/skills/%' ESCAPE '\\' AND (LENGTH(uri) - LENGTH(REPLACE(uri, '/', ''))) = 5"
+
+    args = []
+    {base, args} = apply_skill_owner_where(base, args, filter)
+    {base, args} = apply_enabled_where(base, args, filter)
+    {base, args} = apply_skill_substring_where(base, args, filter)
+    apply_skill_group_where(base, args, filter)
+  end
+
+  defp apply_skill_owner_where(where, args, %{owner: owner})
+       when is_binary(owner) and owner != "" do
+    {"#{where} AND uri LIKE ? ESCAPE '\\'",
+     args ++ [like_escape("viking://user/" <> owner <> "/skills/") <> "%"]}
+  end
+
+  defp apply_skill_owner_where(where, args, _filter), do: {where, args}
+
+  defp apply_skill_substring_where(where, args, %{substring: sub})
+       when is_binary(sub) and sub != "" do
+    pattern = "%" <> like_escape(String.downcase(sub)) <> "%"
+    {"#{where} AND lower(uri) LIKE ? ESCAPE '\\'", args ++ [pattern]}
+  end
+
+  defp apply_skill_substring_where(where, args, _filter), do: {where, args}
+
+  defp apply_skill_group_where(where, args, %{group: group})
+       when is_binary(group) and group != "" do
+    {"#{where} AND (group_tag = ? OR uri LIKE ? ESCAPE '\\')",
+     args ++ [group, like_escape("viking://user/" <> group <> "/skills/") <> "%"]}
+  end
+
+  defp apply_skill_group_where(where, args, _filter), do: {where, args}
+
+  defp skill_entry([uri, enabled, group_tag]) do
+    case String.split(String.replace_prefix(uri, "viking://", ""), "/") do
+      ["user", owner, "skills", name] ->
+        %{name: name, owner: owner, uri: uri, enabled: enabled != 0, group_tag: group_tag || ""}
+
+      _ ->
+        %{name: uri, owner: "", uri: uri, enabled: enabled != 0, group_tag: group_tag || ""}
+    end
+  end
+
+  @doc "How many documents sit at `uri` or beneath it (file count for one skill)."
+  @spec count_subtree_documents(SQLite.conn(), String.t()) :: non_neg_integer()
+  def count_subtree_documents(conn, uri) do
+    case SQLite.query_one(
+           conn,
+           "SELECT COUNT(*) FROM nodes WHERE kind = 'doc' AND (uri = ?1 OR uri LIKE ?2 ESCAPE '\\')",
+           [uri, like_escape(uri <> "/") <> "%"]
+         ) do
+      {:ok, [count]} -> count
+      _ -> 0
+    end
   end
 end

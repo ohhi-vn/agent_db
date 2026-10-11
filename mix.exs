@@ -24,7 +24,8 @@ defmodule AgentDb.MixProject do
       # `_build` caches it and no PLT artifact can reach the package.
       dialyzer: [plt_add_apps: [:mix, :ex_unit], ignore_warnings: ".dialyzer_ignore.exs"],
       aliases: aliases(),
-      deps: deps()
+      deps: deps(),
+      listeners: [Phoenix.CodeReloader]
     ]
   end
 
@@ -113,7 +114,7 @@ defmodule AgentDb.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      {:exqlite, "~> 0.41"},
+      {:exqlite, "~> 0.42"},
       {:exla, "~> 1.0"},
       {:bumblebee, "~> 0.8"},
       {:nx, "~> 1.0"},
@@ -121,7 +122,7 @@ defmodule AgentDb.MixProject do
       {:phoenix_live_view, "~> 1.2"},
       {:phoenix_live_dashboard, "~> 0.9"},
       {:phoenix_html, "~> 4.3"},
-      {:phoenix_pubsub, "~> 2.3"},
+      {:phoenix_pubsub, "~> 2.4"},
       {:phoenix_view, "~> 2.0"},
       {:bandit, "~> 1.12"},
       {:jason, "~> 1.4"},

@@ -28,6 +28,14 @@ defmodule AgentDb.Skills.Source do
   as text because that is what the store holds; a binary asset is reported
   rather than mangled.
 
+  ## What is set aside
+
+  macOS metadata travels inside user folders -- AppleDouble `._` sidecars
+  (materialized beside every file on external volumes) and `.DS_Store` files.
+  It is never skill content, so entries whose base name is one are set aside
+  before they can cost budget, trip validation, or be stored. A source holding
+  only metadata is still refused, as a source with no skills.
+
   Archive members are read in memory and never extracted to disk, and the two
   limits in `limits/0` bound the entries and the expanded bytes of one source,
   so a small archive cannot cost an unbounded amount of work.
@@ -206,28 +214,44 @@ defmodule AgentDb.Skills.Source do
   end
 
   defp descend(dir, name, prefix, read) do
-    child = Path.join(dir, name)
+    # Set aside before stat: metadata is never descended into, read, counted,
+    # or validated, whatever its bytes hold.
+    if metadata?(name) do
+      {:ok, read}
+    else
+      child = Path.join(dir, name)
 
-    with {:ok, path} <- normalize(prefix, name) do
-      case lstat(child) do
-        {:ok, %{type: :directory}} ->
-          with {:ok, read} <- add_dir(read, path) do
-            walk(child, path, read)
-          end
+      with {:ok, path} <- normalize(prefix, name) do
+        case lstat(child) do
+          {:ok, %{type: :directory}} ->
+            with {:ok, read} <- add_dir(read, path) do
+              walk(child, path, read)
+            end
 
-        {:ok, %{type: :regular, size: size}} ->
-          with :ok <- check_size(size),
-               {:ok, binary} <- read_file(child) do
-            add_file(read, path, binary)
-          end
+          {:ok, %{type: :regular, size: size}} ->
+            with :ok <- check_size(size),
+                 {:ok, binary} <- read_file(child) do
+              add_file(read, path, binary)
+            end
 
-        {:ok, %{type: type}} ->
-          {:error, {:unsupported_entry, type, display(path)}}
+          {:ok, %{type: type}} ->
+            {:error, {:unsupported_entry, type, display(path)}}
 
-        {:error, reason} ->
-          {:error, {:unreadable_source, reason, child}}
+          {:error, reason} ->
+            {:error, {:unreadable_source, reason, child}}
+        end
       end
     end
+  end
+
+  # Base names owned by the OS rather than the skill's author. Other dotfiles
+  # stay content: `.env` or `.gitignore` can be a skill file, while `._*` and
+  # `.DS_Store` never are.
+  defp metadata?(name) when is_binary(name),
+    do: String.starts_with?(name, "._") or name == ".DS_Store"
+
+  defp metadata_path?(name) when is_binary(name) do
+    name |> String.trim_trailing("/") |> String.split("/") |> List.last() |> metadata?()
   end
 
   # -- an archive --
@@ -262,16 +286,24 @@ defmodule AgentDb.Skills.Source do
   end
 
   defp read_row(read, %{type: :directory, name: name}) do
-    with {:ok, name} <- normalize_name(name),
-         {:ok, path} <- normalize([], name) do
-      add_dir(read, path)
+    if metadata_path?(name) do
+      {:ok, read}
+    else
+      with {:ok, name} <- normalize_name(name),
+           {:ok, path} <- normalize([], name) do
+        add_dir(read, path)
+      end
     end
   end
 
   defp read_row(read, %{type: :regular, name: name}) do
-    with {:ok, name} <- normalize_name(name),
-         {:ok, path} <- normalize([], name) do
-      add_pending(read, path, name)
+    if metadata_path?(name) do
+      {:ok, read}
+    else
+      with {:ok, name} <- normalize_name(name),
+           {:ok, path} <- normalize([], name) do
+        add_pending(read, path, name)
+      end
     end
   end
 
@@ -299,7 +331,11 @@ defmodule AgentDb.Skills.Source do
   # -- a browser's files --
 
   defp add_upload(read, %{path: name, content: content}) when is_binary(content) do
-    with {:ok, path} <- normalize([], name), do: add_file(read, path, content)
+    if metadata_path?(name) do
+      {:ok, read}
+    else
+      with {:ok, path} <- normalize([], name), do: add_file(read, path, content)
+    end
   end
 
   # -- the bounded read --

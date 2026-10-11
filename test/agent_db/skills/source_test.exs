@@ -269,6 +269,69 @@ defmodule AgentDb.Skills.SourceTest do
     end
   end
 
+  describe "operating-system metadata" do
+    test "a folder holding macOS sidecars beside a skill reads the skill alone" do
+      folder = tmp("with-metadata")
+      write(folder, "SKILL.md", @manifest)
+      write(folder, "._SKILL.md", <<0xFF, 0xFE, 0x00, 0x01>>)
+      write(folder, ".DS_Store", <<0x00, 0x01, 0x02, 0x03>>)
+
+      assert {:ok, [%{name: "with-metadata", files: files}]} = Source.load({:path, folder})
+      assert Enum.map(files, & &1.path) == [["SKILL.md"]]
+    end
+
+    test "a folder holding only metadata is refused as having no skills" do
+      folder = tmp("only-metadata")
+      write(folder, "._SKILL.md", <<0xFF, 0xFE>>)
+
+      assert {:error, {:no_skills}} = Source.load({:path, folder})
+    end
+
+    test "metadata does not consume the entry budget" do
+      uploads =
+        for index <- 1..(Source.limits().max_entries - 1) do
+          %{path: "alpha/#{index}.md", content: "x"}
+        end
+
+      uploads = [%{path: "alpha/SKILL.md", content: @manifest} | uploads]
+      uploads = [%{path: "alpha/._SKILL.md", content: <<0xFF>>} | uploads]
+
+      assert {:ok, [%{name: "alpha", files: files}]} = Source.load({:uploads, uploads})
+      assert length(files) == Source.limits().max_entries
+    end
+
+    test "an archive holding sidecars beside a skill reads the skill alone" do
+      path =
+        archive([
+          {"alpha/SKILL.md", "alpha\n"},
+          {"alpha/._SKILL.md", "sidecar\n"},
+          {"alpha/.DS_Store", "store\n"}
+        ])
+
+      assert {:ok, [%{name: "alpha", files: files}]} = Source.load({:path, path})
+      assert Enum.map(files, & &1.path) == [["SKILL.md"]]
+    end
+
+    test "a browser selection holding a binary sidecar reads the skill alone" do
+      uploads = [
+        %{path: "my-skills/alpha/SKILL.md", content: "alpha\n"},
+        %{path: "my-skills/alpha/._SKILL.md", content: <<0xFF, 0xFE>>}
+      ]
+
+      assert {:ok, [%{name: "alpha", files: files}]} = Source.load({:uploads, uploads})
+      assert Enum.map(files, & &1.path) == [["SKILL.md"]]
+    end
+
+    test "other dotfiles stay skill content" do
+      folder = tmp("dotfiles")
+      write(folder, "SKILL.md", @manifest)
+      write(folder, ".env", "SECRET=x\n")
+
+      assert {:ok, [%{files: files}]} = Source.load({:path, folder})
+      assert Enum.map(files, & &1.path) == [[".env"], ["SKILL.md"]]
+    end
+  end
+
   describe "the limits" do
     test "are published, so a caller configures its own caps to match" do
       assert %{max_entries: entries, max_bytes: bytes} = Source.limits()
