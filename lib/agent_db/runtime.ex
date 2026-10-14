@@ -18,6 +18,24 @@ defmodule AgentDb.Runtime do
   # a deployment ends up serving Ollama while its own console claims it runs
   # local models. A key that maps to no provider is a configuration error and
   # raises here, rather than falling back to a default nobody asked for.
+  #
+  # ## The vector index is admitted through here, and contained
+  #
+  # A vector index is a native engine: sqlite-vec is a loadable extension, and
+  # anything that follows it will be a NIF. Both can raise. A raise inside a
+  # `GenServer.call` is not an error a caller can act on -- it is an exit, and
+  # the process that dies is whichever one the operator was already relying on.
+  # `erl_crash.dump` from 2026-10-13 records exactly this shape: an
+  # `ArgumentError` raised inside a `GenServer.call` whose *error printer* then
+  # died on a closed `standard_error`, taking the runtime down during boot. The
+  # diagnostic for the original error died with it.
+  #
+  # So the three vector functions below are the one place an index answer is
+  # admitted into the rest of the store, and they convert every failure mode
+  # into the store's existing contract: an error tuple carrying a
+  # classification, never an exception, and never a new failure class. They live
+  # beside the resolution rather than in its own module so that a workflow
+  # naming `Runtime` is still naming the only seam it is allowed to.
 
   alias AgentDb.Config
   alias AgentDb.Core
@@ -54,6 +72,47 @@ defmodule AgentDb.Runtime do
   @doc "The module answering the transport port."
   @spec transport() :: module()
   def transport, do: adapter(@transport_adapter)
+
+  # -- the vector index, admitted and contained --
+
+  @doc """
+  Nearest neighbours of a query embedding, or a contained failure.
+
+  Containment converts a raise or an exit from inside the engine into the one
+  classification a caller already knows how to handle. A classified error is
+  passed through as the provider wrote it, so `:dim_mismatch` stays a refusal
+  and `{:invalid_dim, _}` stays an invalid query.
+  """
+  @spec vector_search(binary(), pos_integer(), String.t() | nil, [atom()] | nil) ::
+          {:ok, [map()]} | {:error, term()}
+  def vector_search(query, top_k, scope_prefix, fields \\ nil) do
+    admit(fn -> storage().search_vector(query, top_k, scope_prefix, fields) end)
+  end
+
+  @doc "Stores a generated embedding, or a contained failure."
+  @spec vector_put(integer(), String.t(), binary()) ::
+          {:ok, :stored | :discarded} | {:error, term()}
+  def vector_put(job_id, uri, embedding) do
+    admit(fn -> storage().put_embedding_result(job_id, uri, embedding) end)
+  end
+
+  @doc "Coverage of the index, or a contained failure."
+  @spec vector_stats() :: {:ok, map()} | {:error, term()}
+  def vector_stats do
+    admit(fn -> storage().vector_index_stats() end)
+  end
+
+  @doc """
+  How many index rows name a URI the store no longer holds, or a contained
+  failure.
+
+  Drift is a cost rather than a defect, so this is reported rather than acted
+  on here: a caller that wants to reclaim it says so explicitly.
+  """
+  @spec vector_reclaimable() :: {:ok, non_neg_integer()} | {:error, term()}
+  def vector_reclaimable do
+    admit(fn -> storage().vector_index_reclaimable() end)
+  end
 
   @doc """
   The module answering `key`.
@@ -153,4 +212,26 @@ defmodule AgentDb.Runtime do
   end
 
   defp format_callback({name, arity}), do: "#{name}/#{arity}"
+
+  # The one classification every retryable failure collapses onto, so the
+  # taxonomy does not grow a class per engine. An index that cannot be reached
+  # right now -- it raised, it is saturated, it is not loaded -- is the same fact
+  # to a caller: try again later.
+  @vector_index_unavailable :vector_index_unavailable
+
+  # An engine's overload is "try again later", the same fact as unreachable. It
+  # must not become a distinct class, which would give the taxonomy a permanent
+  # failure for a transient condition. No provider emits `:busy` today; the
+  # mapping is here and tested so an engine that reports it is handled by the
+  # taxonomy it lands in rather than by a new one.
+  defp admit(fun) do
+    classify(fun.())
+  rescue
+    _error -> {:error, @vector_index_unavailable}
+  catch
+    :exit, _reason -> {:error, @vector_index_unavailable}
+  end
+
+  defp classify({:error, :busy}), do: {:error, @vector_index_unavailable}
+  defp classify(other), do: other
 end

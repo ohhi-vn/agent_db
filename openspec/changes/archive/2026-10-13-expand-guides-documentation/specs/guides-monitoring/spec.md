@@ -48,8 +48,15 @@ The system SHALL document the `AgentDb.health_check/0`, `AgentDb.model_status/0`
 - **THEN** the guide recommends specific thresholds for pending job count, oldest pending age, and failed job count based on the queue stats output
 
 ### Requirement: Monitoring guide documents the bounded error taxonomy for alerting without message parsing
-The system SHALL document the shared machine-readable error codes used across telemetry, logs, MCP, WebSocket, HTTP, and CLI so operators can alert on codes (e.g., `:model_loading`, `:embeddings_unavailable`, `:queue_backpressure`, `:inference_timeout`, `:provider_unreachable`) instead of parsing error messages.
+The system SHALL document the shared machine-readable error codes used across telemetry, logs, MCP, WebSocket, HTTP, and CLI so operators can alert on codes (e.g., `:model_loading`, `:embeddings_unavailable`, `:inference_timeout`, `:inference_failed`, `:download_failed`, `:model_load_failed`) instead of parsing error messages. The code set is the `AgentDb.Observability` taxonomy: a code appears in the guide only if the taxonomy classifies it.
+
+#### Scenario: Operator alerts on the taxonomy, not on invented codes
+- **WHEN** an operator reads the alerting section of `guides/MONITORING.md`
+- **THEN** every code they can alert on exists in the `AgentDb.Observability` taxonomy and is emitted by at least one transport, so an alert never waits forever on a code no code path produces
+
+### Requirement: Monitoring guide distinguishes provider health state from transport error codes
+The system SHALL document provider availability as a health-state signal separate from the bounded error codes: the adapters' health probe reports `:unreachable`, surfaced by `AgentDb.model_status/0` and the console, and an operator alerts on that state for availability while alerting on taxonomy codes for classified failures.
 
 #### Scenario: Operator creates an alert on provider unavailability
-- **WHEN** an operator configures an alert for remote inference provider failures
-- **THEN** the guide identifies the error code to match and confirms it appears in telemetry, logs, and transport responses identically
+- **WHEN** an operator configures an alert for a remote inference provider being unreachable
+- **THEN** the guide alerts on the health state (`model_status/0` reporting `:unreachable`) for availability and on the bounded codes (`:inference_timeout`, `:inference_failed`) for classified failures — never on an invented code

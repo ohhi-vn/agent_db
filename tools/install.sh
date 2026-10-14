@@ -163,4 +163,4 @@ else
 fi
 
 echo ""
-echo "done. See docs/agents.md for the full setup guide."
+echo "done. See guides/agents.md for the full setup guide."

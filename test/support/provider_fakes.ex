@@ -498,7 +498,7 @@ defmodule AgentDb.Test.Fakes.Storage do
   end
 
   @impl true
-  def search_keyword(term, scope, limit) do
+  def search_keyword(term, scope, limit, fields \\ nil) do
     needle = String.downcase(term)
 
     hits =
@@ -512,9 +512,46 @@ defmodule AgentDb.Test.Fakes.Storage do
 
     # Bounded and ordered, like the real provider: a fake that ignored the
     # limit would let a caller pass a bound test while the store ignored it.
-    hits = hits |> Enum.sort_by(& &1.uri) |> Enum.take(limit)
+    hits =
+      hits
+      |> Enum.sort_by(& &1.uri)
+      |> Enum.take(limit)
+      |> Enum.map(&with_meta/1)
 
-    scripted(:search_keyword, {:ok, hits})
+    scripted(:search_keyword, {:ok, project(hits, fields)})
+  end
+
+  # A vector hit's score is what ranks it, so it survives a projection the way
+  # a result's URI does.
+  defp project_hits(hits, nil), do: hits
+
+  defp project_hits(hits, fields) do
+    selected = MapSet.new(fields)
+
+    Enum.map(hits, fn hit ->
+      hit
+      |> Map.take([:uri, :content, :abstract, :overview, :score, :enabled, :group_tag])
+      |> Map.filter(fn {key, _value} ->
+        key in [:uri, :score, :enabled, :group_tag] or MapSet.member?(selected, key)
+      end)
+    end)
+  end
+
+  # The projection an in-memory provider applies to a result: only the caller's
+  # selected fields, plus the internal pair the application still filters on,
+  # plus `:uri` whatever the selection. A `nil` selection means the whole node.
+  defp project(nodes, nil), do: nodes
+
+  defp project(nodes, fields) do
+    selected = MapSet.new(fields)
+
+    Enum.map(nodes, fn node ->
+      node
+      |> Map.take([:uri, :content, :abstract, :overview, :enabled, :group_tag])
+      |> Map.filter(fn {key, _value} ->
+        key == :uri or key in [:enabled, :group_tag] or MapSet.member?(selected, key)
+      end)
+    end)
   end
 
   @impl true
@@ -585,7 +622,7 @@ defmodule AgentDb.Test.Fakes.Storage do
   end
 
   @impl true
-  def search_vector(query, _top_k, scope) do
+  def search_vector(query, _top_k, scope, fields \\ nil) do
     # Ranked by nearest neighbour over the vectors themselves, which is what the
     # port hands over: bytes, not text. Exact match is the only similarity a
     # double can implement honestly, so identical text finds itself and
@@ -603,26 +640,46 @@ defmodule AgentDb.Test.Fakes.Storage do
             scripted(:search_vector, {:ok, []})
 
           ^query_dim ->
+            # The read path joins back against the node map, which is what makes
+            # drift inert: a row may survive for a URI the store no longer holds,
+            # but it is not returned. The hydration this filter performs is the
+            # same join the SQLite provider runs in SQL.
             hits =
               for {uri, embedding} <- Map.get(embeddings(), query_dim, %{}),
                   uri_matches?(uri, scope),
+                  held?(uri),
                   distance(query, embedding) <= @identical do
                 %{
                   uri: uri,
                   content: content_at(uri),
                   abstract: abstract_at(uri),
                   overview: overview_at(uri),
+                  enabled: Map.get(documents(), uri).enabled,
                   score: 1.0
                 }
               end
 
-            scripted(:search_vector, {:ok, hits})
+            # A scripted answer replaces the computed one, and a function is
+            # called with the arguments so a test can decide per call. Writing
+            # the stub as a function is how a test makes the index raise: the
+            # containment boundary is what turns that into an error tuple.
+            case scripted(:search_vector, {:ok, project_hits(hits, fields)}) do
+              {:ok, _} = ok -> ok
+              {:error, _} = err -> err
+              fun when is_function(fun, 3) -> fun.(query, scope, query_dim)
+              fun when is_function(fun, 4) -> fun.(query, scope, query_dim, fields)
+              other -> other
+            end
 
           _other ->
             {:error, :dim_mismatch}
         end
     end
   end
+
+  # Present in the node map as a document. A vector row for a URI that was
+  # removed is drift, and drift must not be searchable.
+  defp held?(uri), do: match?(%{kind: :doc}, Map.get(documents(), uri))
 
   # Both are float32 vectors of the same length, so the distance is the sum of
   # squared differences read back out of the bytes. Vectors of different lengths
@@ -952,6 +1009,17 @@ defmodule AgentDb.Test.Fakes.Storage do
     end)
   end
 
+  # A standing job carries no URI, so it is counted by kind. The fake's queue
+  # keeps every job it has ever run, which a durable one does not -- so this
+  # counts only the statuses that mean "still scheduled", matching what a real
+  # queue would report for a job the store means to keep one of.
+  @impl true
+  def count_jobs_of_kind(kind) do
+    Enum.count(jobs(), fn job ->
+      job.kind == kind and job.status in [:pending, :running]
+    end)
+  end
+
   @impl true
   def dequeue_job(kinds) do
     case Enum.find(jobs(), &(&1.status == :pending and &1.kind in kinds)) do
@@ -990,8 +1058,41 @@ defmodule AgentDb.Test.Fakes.Storage do
     scripted(:vector_index_stats, {:ok, fake_vector_counts()})
   end
 
+  @impl true
+  def vector_index_reclaimable, do: scripted(:vector_index_reclaimable, {:ok, drift_count()})
+
+  @impl true
+  def reclaim_vector_index do
+    reclaimed = drift_count()
+
+    if reclaimed > 0 do
+      kept =
+        embeddings()
+        |> Map.new(fn {dim, by_uri} ->
+          {dim, Enum.reject(by_uri, fn {uri, _vec} -> not held?(uri) end) |> Map.new()}
+        end)
+
+      put(:embeddings, kept, [])
+    end
+
+    scripted(:reclaim_vector_index, :ok)
+  end
+
+  # Drift is counted across every dim map, because a row is drift regardless of
+  # which dimensionality it was filed under.
+  defp drift_count do
+    embeddings()
+    |> Enum.flat_map(fn {_dim, by_uri} -> Map.keys(by_uri) end)
+    |> Enum.count(&(not held?(&1)))
+  end
+
   # Counted from what this fake actually holds: documents filed, vectors in
   # the active dim map, and whether any document is missing from it.
+  #
+  # `reclaimable` counts rows naming URIs the node map no longer holds. It is
+  # the drift figure: harmless to search results, because the read path joins
+  # them away, but a number an operator can watch so reclamation falling
+  # behind is visible rather than silent.
   defp fake_vector_counts do
     docs = Enum.count(documents(), fn {_uri, node} -> is_map(node) and node[:kind] == :doc end)
 
@@ -1002,7 +1103,8 @@ defmodule AgentDb.Test.Fakes.Storage do
           active_dim: :unknown,
           vectors: 0,
           documents: docs,
-          needs_backfill: docs > 0
+          needs_backfill: docs > 0,
+          reclaimable: drift_count()
         }
 
       dim ->
@@ -1018,7 +1120,8 @@ defmodule AgentDb.Test.Fakes.Storage do
           active_dim: dim,
           vectors: map_size(vecs),
           documents: docs,
-          needs_backfill: missing?
+          needs_backfill: missing?,
+          reclaimable: Enum.count(vecs, fn {uri, _vec} -> not held?(uri) end)
         }
     end
   end
@@ -1117,6 +1220,54 @@ defmodule AgentDb.Test.Fakes.Storage do
     :ok
   end
 
+  # -- drift setup --
+
+  # A vector row the ordinary write path cannot produce: one that names a URI
+  # the store does not hold. Planting it is what lets the contract suite assert
+  # that a read path survives drift rather than merely asserting it cannot.
+  @doc """
+  Plants a vector row for a URI the store does not hold.
+
+  Drift: a row naming a removed or never-written URI. A provider whose write
+  path is correct never creates one, so a test that needs it has to plant it.
+  """
+  @spec plant_vector(String.t(), [float()]) :: :ok | {:error, term()}
+  def plant_vector(uri, vec) do
+    blob = for x <- vec, into: <<>>, do: <<x::float-32>>
+
+    case fake_vec_dim(blob) do
+      {:ok, dim} -> write_vector(uri, blob, dim)
+      {:error, _} = err -> err
+    end
+  end
+
+  @doc """
+  Stations a vector for a live URI whose content it no longer matches.
+
+  The state a naive provider is in after a re-write: the document is new, the
+  index still describes the old one. Retire-on-write is what prevents it, so the
+  scenario is built by planting rather than by writing.
+  """
+  @spec plant_stale_vector(String.t(), [float()]) :: :ok | {:error, term()}
+  def plant_stale_vector(uri, vec), do: plant_vector(uri, vec)
+
+  defp write_vector(uri, embedding, dim) do
+    maps = embeddings()
+
+    if not Map.has_key?(maps, dim) and map_size(maps) >= @max_vec_dims do
+      {:error, :too_many_dims}
+    else
+      put(
+        :embeddings,
+        Map.update(maps, dim, %{uri => embedding}, &Map.put(&1, uri, embedding)),
+        []
+      )
+
+      put(:vec_active, dim, [])
+      :ok
+    end
+  end
+
   @doc "The jobs recorded, for a test that needs to see the queue."
   def recorded_jobs, do: state(:jobs)
 
@@ -1174,8 +1325,15 @@ defmodule AgentDb.Test.Fakes.Storage do
 
   # A document, and every directory above it, so the tree a write implies
   # exists.
+  #
+  # A write also retires the URI's previous vector, in the same step. The index
+  # is derived, so dropping derived data that is about to be regenerated can only
+  # make vector search return less -- never return a URI the store cannot hold.
+  # Without it, a re-written document stays ranked on content it no longer has
+  # until its own re-embed lands.
   defp record(uri, content, opts) do
     ensure_directories(uri)
+    _ = put(:embeddings, drop_vec_uri(embeddings(), uri), [])
 
     prior = Map.get(documents(), uri)
 
@@ -1288,8 +1446,12 @@ defmodule AgentDb.Test.Fakes.Storage do
 
   # A scope matches a URI or anything beneath it. The scope arrives as a
   # subtree prefix, so trailing separators are normalized rather than assumed
-  # either way.
+  # either way. A job that carries no URI at all -- a standing job the store
+  # schedules itself -- belongs to no subtree, and is never in scope for a
+  # removal.
   defp uri_matches?(_uri, nil), do: true
+
+  defp uri_matches?(uri, _scope) when not is_binary(uri), do: false
 
   defp uri_matches?(uri, scope) do
     prefix = String.trim_trailing(scope, "/")

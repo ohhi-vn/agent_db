@@ -392,6 +392,26 @@ defmodule AgentDb.JobQueue do
     end
   end
 
+  @doc """
+  How many jobs of `kind` exist, in any status.
+
+  A standing job -- one the store schedules itself rather than one a caller
+  asked for -- has no URI to count by, so it is counted by kind. Used to keep a
+  second boot from scheduling a second row of work the first one's deferral
+  cannot cancel.
+  """
+  @spec count_for_kind(atom()) :: non_neg_integer()
+  def count_for_kind(kind) do
+    case Reader.read(fn conn ->
+           SQLite.query_one(conn, "SELECT COUNT(*) FROM job_queue WHERE kind = ?1", [
+             to_string(kind)
+           ])
+         end) do
+      {:ok, [count]} -> count
+      _other -> 0
+    end
+  end
+
   @doc "Returns a map of job counts by status."
   @spec stats() :: {:ok, map()} | {:error, term()}
   def stats do

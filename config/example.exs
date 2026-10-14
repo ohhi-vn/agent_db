@@ -114,6 +114,15 @@ settings =
     # Job worker pool
     setting.(:job_workers, env_int.("AGENT_DB_JOB_WORKERS") || System.schedulers_online()),
 
+    # How long to wait between checks for vector-index rows naming URIs the
+    # store no longer holds. Those rows are already invisible to search, so this
+    # is occupancy rather than correctness -- a cheap count on a cadence. An
+    # unparsable value falls back to the default rather than failing startup.
+    setting.(
+      :vector_reclaim_cadence_ms,
+      env_int.("AGENT_DB_VECTOR_RECLAIM_CADENCE_MS")
+    ),
+
     # EXLA backend
     setting.(
       :exla_backend,

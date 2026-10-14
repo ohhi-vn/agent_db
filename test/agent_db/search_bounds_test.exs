@@ -110,6 +110,83 @@ defmodule AgentDb.SearchBoundsTest do
     end
   end
 
+  describe "field selection" do
+    test "a keyword search answers with only the selected fields", %{prefix: prefix} do
+      :ok =
+        AgentDb.write("#{prefix}/one.md", "a body with a marker term", abstract: "one abstract")
+
+      assert {:ok, [result]} =
+               AgentDb.search("marker", mode: :keyword, scope: prefix, fields: [:uri, :abstract])
+
+      assert result.uri == "#{prefix}/one.md"
+      assert result.abstract == "one abstract"
+
+      # The content was not asked for, so it is not in the answer.
+      refute Map.has_key?(result, :content)
+      refute Map.has_key?(result, :overview)
+      refute Map.has_key?(result, :score)
+    end
+
+    test "an omitted selection returns the whole result set", %{prefix: prefix} do
+      :ok =
+        AgentDb.write("#{prefix}/one.md", "a body with a marker term",
+          abstract: "one abstract",
+          overview: "one overview"
+        )
+
+      assert {:ok, [result]} = AgentDb.search("marker", mode: :keyword, scope: prefix)
+
+      assert result.uri == "#{prefix}/one.md"
+      assert result.content == "a body with a marker term"
+      assert result.abstract == "one abstract"
+      assert result.overview == "one overview"
+    end
+
+    test "a selection does not change which documents are found", %{prefix: prefix} do
+      write_many(prefix, 5, "a marker term")
+
+      assert {:ok, whole} = AgentDb.search("marker", mode: :keyword, scope: prefix)
+
+      assert {:ok, projected} =
+               AgentDb.search("marker", mode: :keyword, scope: prefix, fields: [:uri])
+
+      assert Enum.map(whole, & &1.uri) == Enum.map(projected, & &1.uri)
+    end
+  end
+
+  describe "an unusable selection" do
+    test "an unknown field name is refused", %{prefix: prefix} do
+      assert {:error, {:invalid_fields, [:uri, :checksum]}} =
+               AgentDb.search("marker", mode: :keyword, scope: prefix, fields: [:uri, :checksum])
+    end
+
+    test "a selection without the URI is refused", %{prefix: prefix} do
+      # A result without its URI cannot be fetched, so the store refuses rather
+      # than quietly adding the field back.
+      assert {:error, {:invalid_fields, [:abstract]}} =
+               AgentDb.search("marker", mode: :keyword, scope: prefix, fields: [:abstract])
+    end
+
+    test "an empty selection is refused", %{prefix: prefix} do
+      assert {:error, {:invalid_fields, []}} =
+               AgentDb.search("marker", mode: :keyword, scope: prefix, fields: [])
+    end
+
+    test "a selection that is not a list is refused", %{prefix: prefix} do
+      assert {:error, {:invalid_fields, :uri}} =
+               AgentDb.search("marker", mode: :keyword, scope: prefix, fields: :uri)
+    end
+
+    test "the other legs refuse the same unusable selection", %{prefix: prefix} do
+      write_many(prefix, 3, "a marker term")
+
+      for mode <- [:keyword, :vector, :hybrid] do
+        assert {:error, {:invalid_fields, [:uri, :checksum]}} =
+                 AgentDb.search("marker", mode: mode, scope: prefix, fields: [:uri, :checksum])
+      end
+    end
+  end
+
   describe "the other legs" do
     test "vector search refuses the same unusable bound", %{prefix: prefix} do
       write_many(prefix, 5, "a marker term")

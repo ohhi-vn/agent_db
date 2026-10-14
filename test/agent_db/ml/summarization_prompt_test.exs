@@ -6,6 +6,7 @@ defmodule AgentDb.ML.SummarizationPromptTest do
   use ExUnit.Case, async: false
 
   alias AgentDb.ML.{FakeCallLog, FakeLoader, FakeServing, ModelManager}
+  alias AgentDb.Workers.Summarization, as: Summary
 
   @llm_id "Qwen/Qwen3-0.6B"
 
@@ -175,6 +176,58 @@ defmodule AgentDb.ML.SummarizationPromptTest do
       start_manager(@custom_template)
 
       assert %{llm: %{params: "0.6B"}} = ModelManager.model_status()
+    end
+  end
+
+  describe "the worker holds a provider to the layer budget" do
+    test "an abstract is reduced to its first sentence" do
+      assert Summary.trim(:abstract, "One sentence. A second. A third.") == "One sentence."
+    end
+
+    test "an overview is reduced to its first five sentences" do
+      six = "One. Two. Three. Four. Five. Six."
+      assert Summary.trim(:overview, six) == "One. Two. Three. Four. Five."
+    end
+
+    test "a provider within budget is stored exactly as it answered" do
+      assert Summary.trim(:abstract, "One sentence.") == "One sentence."
+      assert Summary.trim(:overview, "One. Two.") == "One. Two."
+    end
+
+    test "a trim that leaves nothing keeps the answer" do
+      # The empty-summary contract is about a provider that produced nothing,
+      # not about a bound, so an answer that survives no trim is still an answer.
+      assert Summary.trim(:abstract, "...") == "..."
+    end
+
+    test "a newline is a sentence boundary, so a multi-line answer is bounded" do
+      # The divider goes with the sentence it follows, so what is stored is the
+      # line itself with no dangling whitespace after it.
+      assert Summary.trim(:abstract, "First line\nSecond line") == "First line"
+    end
+
+    test "a prompt asks for distinguishing terms rather than generic ones" do
+      abstract = Summary.prompt(:abstract, "content here", nil)
+
+      assert abstract =~ "distinguish this document"
+      assert abstract =~ "ONE sentence"
+
+      overview = Summary.prompt(:overview, "content here", nil)
+
+      assert overview =~ "distinguish this document"
+      assert overview =~ "at most 5 sentences"
+    end
+
+    test "a frontmatter identity is given as context, never as text to summarize" do
+      identity = "layer-fixture \u2014 A fixture skill for the layer reads"
+      abstract = Summary.prompt(:abstract, "content here", identity)
+
+      assert abstract =~ "This document is: #{identity}"
+      assert abstract =~ "content here"
+    end
+
+    test "no identity means no invented context" do
+      refute Summary.prompt(:abstract, "content here", nil) =~ "This document is:"
     end
   end
 end

@@ -15,11 +15,11 @@ defmodule AgentDb.Application.Search do
 
   @type mode :: :keyword | :vector | :hybrid
   @type result :: %{
-          uri: String.t(),
-          content: String.t() | nil,
-          abstract: String.t() | nil,
-          overview: String.t() | nil,
-          score: float()
+          required(uri: String.t()) => term(),
+          optional(:content) => String.t() | nil,
+          optional(:abstract) => String.t() | nil,
+          optional(:overview) => String.t() | nil,
+          optional(:score) => float()
         }
 
   @default_top_k 10
@@ -30,6 +30,11 @@ defmodule AgentDb.Application.Search do
   @rrf_k 60
   @leg_timeout_ms 10_000
 
+  # The per-result fields a caller may select. `:uri` is always returned, so it
+  # is always accepted; an unknown name is the caller's, not ours to substitute.
+  @selectable_fields [:uri, :content, :abstract, :overview, :score]
+  @mandatory_fields [:uri]
+
   @doc """
   Searches for `term`.
 
@@ -38,6 +43,7 @@ defmodule AgentDb.Application.Search do
     - `:scope` - a URI prefix to limit the search to one subtree
     - `:top_k` - maximum results (default 10)
     - `:hybrid_weights` - `{keyword_weight, vector_weight}` or `[keyword: kw, vector: vw]` (default `{0.5, 0.5}`)
+    - `:fields` - the per-result fields to return (default all of them)
 
   A leg that cannot be served -- no vector index, or no embedding model -- is
   reported to the caller rather than raised, so a remote client gets an answer
@@ -70,17 +76,61 @@ defmodule AgentDb.Application.Search do
     # validated its own would answer an unusable `:top_k` as whatever that leg
     # failed for instead -- a vector search would report its missing model for a
     # request that was never well formed.
-    with {:ok, _limit} <- result_limit(opts) do
+    with {:ok, _limit} <- result_limit(opts),
+         {:ok, fields} <- result_fields(opts) do
       case Keyword.get(opts, :mode, :keyword) do
         # A mode arrives as an atom from a caller, or as the string the wire
         # carries from a transport. Both name the same three modes; anything else
         # is reported as it arrived rather than substituted for, since answering
         # a different question than the one asked is worse than an error.
-        mode when mode in ["keyword", :keyword] -> keyword(term, opts)
-        mode when mode in ["vector", :vector] -> vector(term, opts)
-        mode when mode in ["hybrid", :hybrid] -> hybrid(term, opts)
+        mode when mode in ["keyword", :keyword] -> keyword(term, opts, fields)
+        mode when mode in ["vector", :vector] -> vector(term, opts, fields)
+        mode when mode in ["hybrid", :hybrid] -> hybrid(term, opts, fields)
         other -> {:error, {:invalid_mode, other}}
       end
+    end
+  end
+
+  # `:fields` is the caller's own selection of what a result should carry, and
+  # it is validated here rather than trusted downstream, for the same reason
+  # `:top_k` is: an unusable selection answered by substituting a different one
+  # is worse than a refusal. `nil` means the full default set, so a caller that
+  # omits the option sees exactly what it saw before the option existed.
+  #
+  # An empty list is refused rather than read as "nothing": a search that
+  # returned nothing at all would look like an empty store, and a caller could
+  # not tell the difference between selecting nothing and finding nothing.
+  defp result_fields(opts) do
+    case Keyword.get(opts, :fields) do
+      nil ->
+        {:ok, nil}
+
+      fields when is_list(fields) and fields != [] ->
+        validate_fields(fields)
+
+      other ->
+        {:error, {:invalid_fields, other}}
+    end
+  end
+
+  defp validate_fields(fields) do
+    case Enum.reject(fields, &(&1 in @selectable_fields)) do
+      [] -> validate_mandatory(fields)
+      # The selection as the caller wrote it, so what to fix is what was sent
+      # rather than a list with the problem parts repeated in it.
+      _unknown -> {:error, {:invalid_fields, fields}}
+    end
+  end
+
+  # `:uri` must be named explicitly. A result without its URI cannot be fetched,
+  # so silently adding it back would answer a question the caller did not ask --
+  # and reporting the refusal is what the other validated bounds in this module
+  # already do.
+  defp validate_mandatory(fields) do
+    if Enum.all?(@mandatory_fields, &(&1 in fields)) do
+      {:ok, Enum.uniq(fields)}
+    else
+      {:error, {:invalid_fields, fields}}
     end
   end
 
@@ -144,7 +194,7 @@ defmodule AgentDb.Application.Search do
     end)
   end
 
-  defp keyword(term, opts) do
+  defp keyword(term, opts, fields) do
     mode = Keyword.get(opts, :mode, :keyword)
 
     Observability.stage(:resource_search, mode, fn ->
@@ -162,12 +212,12 @@ defmodule AgentDb.Application.Search do
               # interleaved disabled rows do not starve the requested limit.
               fetch_limit = min(limit * 3, 200)
 
-              case Runtime.storage().search_keyword(term, prefix, fetch_limit) do
+              case Runtime.storage().search_keyword(term, prefix, fetch_limit, fields) do
                 {:ok, nodes} ->
                   nodes
                   |> filter_enabled(opts)
                   |> Enum.take(limit)
-                  |> then(fn filtered -> {:ok, Enum.map(filtered, &entry/1)} end)
+                  |> then(fn filtered -> {:ok, Enum.map(filtered, &entry(&1, fields))} end)
 
                 {:error, _} = err ->
                   err
@@ -202,7 +252,7 @@ defmodule AgentDb.Application.Search do
     end
   end
 
-  defp vector(term, opts) do
+  defp vector(term, opts, fields) do
     mode = Keyword.get(opts, :mode, :vector)
 
     Observability.stage(:embedding, mode, fn ->
@@ -214,7 +264,7 @@ defmodule AgentDb.Application.Search do
               {:ok, limit} = result_limit_opts(opts)
               fetch_limit = min(limit * 3, 200)
 
-              case Runtime.storage().search_vector(query, fetch_limit, prefix) do
+              case Runtime.vector_search(query, fetch_limit, prefix, fields) do
                 {:ok, hits} ->
                   hits
                   |> filter_enabled(opts)
@@ -245,13 +295,13 @@ defmodule AgentDb.Application.Search do
   # not leave the other task's result unread. Timeouts and exits become
   # classified errors instead of exiting the caller, so a WebSocket connection
   # stays usable after a failed hybrid search.
-  defp hybrid(term, opts) do
+  defp hybrid(term, opts, fields) do
     mode = Keyword.get(opts, :mode, :hybrid)
 
     Observability.stage(:rerank, mode, fn ->
       Observability.stage(:context_assembly, mode, fn ->
-        keyword_task = Task.async(fn -> keyword(term, opts) end)
-        vector_task = Task.async(fn -> vector(term, opts) end)
+        keyword_task = Task.async(fn -> keyword(term, opts, fields) end)
+        vector_task = Task.async(fn -> vector(term, opts, fields) end)
 
         keyword_result = await_leg(keyword_task, :keyword)
         vector_result = await_leg(vector_task, :vector)
@@ -360,11 +410,17 @@ defmodule AgentDb.Application.Search do
     end
   end
 
-  defp strip_meta(hit) do
-    Map.drop(hit, [:enabled, :group_tag])
-  end
+  defp strip_meta(hit), do: Map.drop(hit, [:enabled, :group_tag])
 
-  defp entry(node) do
-    %{uri: node.uri, content: node.content, abstract: node.abstract, overview: node.overview}
+  # A projected node arrives with only the fields the caller selected, so the
+  # projection is applied here rather than reading keys that were never read.
+  # `nil` leaves the node exactly as storage returned it, which is the whole
+  # default result set.
+  defp entry(node, nil), do: node
+
+  defp entry(node, fields) do
+    node
+    |> Map.take(fields)
+    |> Map.drop([:enabled, :group_tag])
   end
 end

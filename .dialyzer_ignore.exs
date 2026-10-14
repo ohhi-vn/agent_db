@@ -6,6 +6,10 @@
 # visible rather than silent.
 #
 # Locations are project-relative, as Dialyxir wants them.
+#
+# Entries keyed to a line number move when the code above them moves. Re-point
+# one whose line shifts; that is maintenance, not a new tolerance -- the reason
+# it is here is unchanged.
 
 [
   # `AgentDb.Application.worker_specs/0` re-checks that the worker count is a
@@ -14,16 +18,16 @@
   # reports the guard as unreachable. The value comes from application
   # environment, which is outside the type system, so the check stays: it is
   # validation of external configuration, not dead code.
-  {"lib/agent_db/application.ex", :pattern_match, 83},
+  {"lib/agent_db/application.ex", :pattern_match, 98},
 
   # `AgentDb.Runtime.validate_numeric_config!/0` re-checks the worker count,
   # the shutdown grace period, and the inference concurrency before the node
   # starts. Dialyzer trusts the `Config.*` specs (`pos_integer()`) and reports
   # each guard as unreachable, for the same reason as the entry above: these are
   # validations of values read from application environment, not dead code.
-  {"lib/agent_db/runtime.ex", :pattern_match, 128},
-  {"lib/agent_db/runtime.ex", :pattern_match, 134},
-  {"lib/agent_db/runtime.ex", :pattern_match, 141},
+  {"lib/agent_db/runtime.ex", :pattern_match, 187},
+  {"lib/agent_db/runtime.ex", :pattern_match, 193},
+  {"lib/agent_db/runtime.ex", :pattern_match, 200},
 
   # A module-level `false` pattern that can never match a `true` value, reported
   # against `AgentDb.Application` and `AgentDb.Runtime` with no line or column.

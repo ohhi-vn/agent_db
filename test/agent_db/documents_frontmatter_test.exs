@@ -146,4 +146,77 @@ defmodule AgentDb.DocumentsFrontmatterTest do
     {:ok, _} = Application.ensure_all_started(:agent_db)
     :ok
   end
+
+  describe "a fallback abstract carries no markup marker" do
+    test "a leading heading marker is stripped" do
+      uri = write("heading", "## Storage layout\n\nbody\n")
+
+      assert {:ok, "Storage layout"} = AgentDb.abstract(uri)
+    end
+
+    test "a leading blockquote marker is stripped" do
+      uri = write("quote", "> a quoted first line\n\nbody\n")
+
+      assert {:ok, "a quoted first line"} = AgentDb.abstract(uri)
+    end
+
+    test "a leading list bullet is stripped" do
+      uri = write("bullet", "- a bulleted first line\n\nbody\n")
+
+      assert {:ok, "a bulleted first line"} = AgentDb.abstract(uri)
+    end
+
+    test "a plain first line is returned unchanged" do
+      uri = write("plain", "A plain first line\n\nbody\n")
+
+      assert {:ok, "A plain first line"} = AgentDb.abstract(uri)
+    end
+
+    test "a line of only markers keeps its text" do
+      # Nothing remains once the marker is gone, so the line is left as written
+      # rather than becoming an abstract that says nothing.
+      uri = write("markers-only", "###\n\nbody\n")
+
+      assert {:ok, abstract} = AgentDb.abstract(uri)
+      assert abstract =~ "#"
+    end
+
+    test "a marker inside the body is not stripped" do
+      uri = write("inner-marker", "first line\n\n- a bullet in the body\n")
+
+      assert {:ok, "first line"} = AgentDb.abstract(uri)
+    end
+  end
+
+  describe "a fallback overview truncates on a word boundary" do
+    test "a long body stops at a word, not mid-word" do
+      # Each word is 5 characters plus a space, so a raw 280-character slice
+      # would always land inside one.
+      body = String.duplicate("alpha ", 80)
+      uri = write("long-body", body)
+
+      assert {:ok, overview} = AgentDb.overview(uri)
+      assert String.length(overview) <= 280
+      assert String.ends_with?(overview, "alpha")
+      assert overview =~ ~r/^alpha( alpha)*$/
+    end
+
+    test "a short body is returned whole" do
+      uri = write("short-body", "a short body\n")
+
+      assert {:ok, overview} = AgentDb.overview(uri)
+
+      # Nothing was trimmed, so the whole body is there -- including the
+      # trailing newline the bound never had cause to touch.
+      assert overview == "a short body\n"
+    end
+
+    test "the bound is unchanged" do
+      body = String.duplicate("x", 1_000)
+      uri = write("wide-body", body)
+
+      assert {:ok, overview} = AgentDb.overview(uri)
+      assert String.length(overview) == 280
+    end
+  end
 end

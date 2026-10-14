@@ -1,7 +1,7 @@
 defmodule AgentDb.WorkerPoolTest do
   use ExUnit.Case, async: false
 
-  alias AgentDb.Workers.{Embedding, Summarization}
+  alias AgentDb.Workers.{Embedding, Summarization, VectorReclaim}
 
   setup do
     original = :application.get_env(:agent_db, :job_workers, nil)
@@ -19,15 +19,20 @@ defmodule AgentDb.WorkerPoolTest do
     Application.put_env(:agent_db, :job_workers, 3)
     specs = AgentDb.Application.worker_specs()
 
-    assert length(specs) == 6
+    # Two pools of the configured count, plus the single standing reclamation
+    # worker: it claims one global job, so a pool would be several processes
+    # contending for one row.
+    assert length(specs) == 7
 
     ids = Enum.map(specs, & &1.id)
-    assert length(Enum.uniq(ids)) == 6
+    assert length(Enum.uniq(ids)) == 7
 
     embedding_ids = for {Embedding, _n} = id <- ids, do: id
     summarization_ids = for {Summarization, _n} = id <- ids, do: id
     assert length(embedding_ids) == 3
     assert length(summarization_ids) == 3
+
+    assert VectorReclaim in ids
   end
 
   test "startup rejects a non-positive count" do

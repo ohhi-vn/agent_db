@@ -61,6 +61,21 @@ defmodule AgentDb.Application do
   # they go back to pending, so the workers that start next can claim them.
   defp initialize do
     AgentDb.Runtime.storage().reset_running_jobs()
+    enqueue_vector_reclaim()
+  end
+
+  # Schedules the standing reclamation job, once. Enqueuing a second one would
+  # leave a second row that a later boot's `defer_job/2` cannot cancel, so the
+  # count decides: a store that already has one pending, running or done does not
+  # get another.
+  defp enqueue_vector_reclaim do
+    storage = AgentDb.Runtime.storage()
+
+    if storage.count_jobs_of_kind(:reclaim_vector_index) == 0 do
+      storage.enqueue_job(:reclaim_vector_index, %{})
+    end
+
+    :ok
   end
 
   # Started ahead of everything that reads through it, and ahead of whichever
@@ -101,7 +116,16 @@ defmodule AgentDb.Application do
         )
       end
 
-    embedding ++ summarization
+    embedding ++ summarization ++ [vector_reclaim_spec()]
+  end
+
+  # One reclamation worker, not one per `job_workers`: it claims a single global
+  # job, so a pool would be `job_workers` processes contending for one row.
+  defp vector_reclaim_spec do
+    Supervisor.child_spec(
+      {AgentDb.Workers.VectorReclaim, worker_id: AgentDb.Workers.VectorReclaim.registration()},
+      id: AgentDb.Workers.VectorReclaim
+    )
   end
 
   defp transport_specs(opts) do

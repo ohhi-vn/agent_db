@@ -33,6 +33,30 @@ defmodule AgentDbWeb.Mcp do
         ["uri"]
       ),
       tool(
+        "context_abstract",
+        "Reads a document's L0 abstract only, so a client can decide whether to read the content.",
+        %{
+          "uri" => %{"type" => "string"}
+        },
+        ["uri"]
+      ),
+      tool(
+        "context_overview",
+        "Reads a document's L1 overview only, so a client can decide whether to read the content.",
+        %{
+          "uri" => %{"type" => "string"}
+        },
+        ["uri"]
+      ),
+      tool(
+        "context_layers",
+        "Reads a document's L0, L1, and L2 in one call, each with its text, its source (stored or fallback-derived), and its character count.",
+        %{
+          "uri" => %{"type" => "string"}
+        },
+        ["uri"]
+      ),
+      tool(
         "context_write",
         "Writes a document, creating missing parents.",
         %{
@@ -73,7 +97,8 @@ defmodule AgentDbWeb.Mcp do
           "term" => %{"type" => "string"},
           "mode" => %{"type" => "string"},
           "scope" => %{"type" => "string"},
-          "top_k" => %{"type" => "integer"}
+          "top_k" => %{"type" => "integer"},
+          "fields" => %{"type" => "array", "items" => %{"type" => "string"}}
         },
         ["term"]
       ),
@@ -226,6 +251,47 @@ defmodule AgentDbWeb.Mcp do
     end
   end
 
+  # A layer read on its own: the layer a client needs to decide whether to read
+  # L2 at all, without paying for L2 to find out.
+  defp dispatch("context_abstract", args, _opts) do
+    with {:ok, uri} <- required(args, "uri") do
+      case AgentDb.abstract(uri) do
+        {:ok, abstract} -> {:ok, %{"uri" => uri, "abstract" => abstract}}
+        {:error, _} = err -> err
+      end
+    end
+  end
+
+  defp dispatch("context_overview", args, _opts) do
+    with {:ok, uri} <- required(args, "uri") do
+      case AgentDb.overview(uri) do
+        {:ok, overview} -> {:ok, %{"uri" => uri, "overview" => overview}}
+        {:error, _} = err -> err
+      end
+    end
+  end
+
+  # All three layers, each with its source and size. The store names them
+  # abstract/overview/content; a client that wants the L0/L1/L2 labels it uses
+  # for search results finds the same three underneath.
+  defp dispatch("context_layers", args, _opts) do
+    with {:ok, uri} <- required(args, "uri") do
+      case AgentDb.layers(uri) do
+        {:error, _} = err ->
+          err
+
+        %{abstract: l0, overview: l1, content: l2} ->
+          {:ok,
+           %{
+             "uri" => uri,
+             "abstract" => layer_json(l0),
+             "overview" => layer_json(l1),
+             "content" => layer_json(l2)
+           }}
+      end
+    end
+  end
+
   defp dispatch("context_write", args, opts) do
     with {:ok, uri} <- required(args, "uri"),
          {:ok, content} <- required(args, "content") do
@@ -275,6 +341,7 @@ defmodule AgentDbWeb.Mcp do
         [mode: search_mode(args["mode"])]
         |> put_opt(:scope, args["scope"])
         |> put_opt(:top_k, integer_arg(args["top_k"], nil))
+        |> put_fields(args["fields"])
         |> put_trace(opts)
 
       case AgentDb.search(term, search_opts) do
@@ -400,6 +467,28 @@ defmodule AgentDbWeb.Mcp do
 
   defp dispatch(name, _args, _opts), do: {:error, {:unknown_tool, name}}
 
+  # The store speaks atoms and a client sends strings, so the names are
+  # translated here rather than by the store, which would then have to accept
+  # both and decide between them. A name is looked up rather than converted:
+  # the wire is untrusted, and an atom must not be created from it.
+  defp put_fields(opts, nil), do: opts
+
+  defp put_fields(opts, fields) when is_list(fields),
+    do: Keyword.put(opts, :fields, Enum.map(fields, &field_atom/1))
+
+  defp put_fields(opts, _fields), do: opts
+
+  @field_names %{
+    "uri" => :uri,
+    "content" => :content,
+    "abstract" => :abstract,
+    "overview" => :overview,
+    "score" => :score
+  }
+
+  defp field_atom(name) when is_binary(name), do: Map.get(@field_names, name, name)
+  defp field_atom(name) when is_atom(name), do: name
+
   defp tool(name, description, properties, required) do
     %{
       "name" => name,
@@ -410,6 +499,12 @@ defmodule AgentDbWeb.Mcp do
         "required" => required
       }
     }
+  end
+
+  # One layer as JSON: the text, whether it was stored or derived, and its size.
+  # The store reports the source as an atom; the wire carries the word.
+  defp layer_json(%{text: text, source: source, chars: chars}) do
+    %{"text" => text, "source" => to_string(source), "chars" => chars}
   end
 
   defp result(id, data), do: %{"jsonrpc" => "2.0", "id" => id, "result" => data}

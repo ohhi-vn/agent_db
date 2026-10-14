@@ -48,6 +48,61 @@ defmodule AgentDb.WriteAtomicityTest do
     assert {:ok, "original"} = AgentDb.read("viking://resources/atomic/existing.md")
   end
 
+  describe "a summary job carries the document's frontmatter identity" do
+    test "a document with frontmatter carries its identity" do
+      content = """
+      ---
+      name: layer-fixture
+      description: A fixture skill for the layer reads
+      ---
+
+      Body text here.
+      """
+
+      assert :ok = AgentDb.write("viking://resources/atomic/identity.md", content)
+
+      identities =
+        Storage.recorded_jobs()
+        |> Enum.filter(&(&1.kind in [:summarize_abstract, :summarize_overview]))
+        |> Enum.map(& &1.payload["identity"])
+
+      assert length(identities) == 2
+
+      assert Enum.all?(
+               identities,
+               &(&1 == "layer-fixture \u2014 A fixture skill for the layer reads")
+             )
+    end
+
+    test "a document without frontmatter carries no invented identity" do
+      assert :ok = AgentDb.write("viking://resources/atomic/no-identity.md", "just a body")
+
+      assert [] =
+               Storage.recorded_jobs()
+               |> Enum.filter(
+                 &(&1.kind in [:summarize_abstract, :summarize_overview] and
+                     Map.has_key?(&1.payload, "identity"))
+               )
+               |> Enum.map(& &1.payload["identity"])
+    end
+
+    test "a caller-supplied layer carries no identity job to generate it" do
+      # The layer already exists, so no summary job is enqueued for it at all --
+      # which is why the identity travels with the job rather than being read
+      # back from the document.
+      assert :ok =
+               AgentDb.write("viking://resources/atomic/supplied.md", "---\nname: n\n---\nbody\n",
+                 abstract: "a supplied abstract",
+                 overview: "a supplied overview"
+               )
+
+      assert [] =
+               Storage.recorded_jobs()
+               |> Enum.filter(&(&1.kind in [:summarize_abstract, :summarize_overview]))
+               |> Enum.map(& &1.payload["identity"])
+    end
+  end
+
   test "successful async write enqueues required jobs" do
     assert :ok = AgentDb.write("viking://resources/atomic/async.md", "content")
     assert {:ok, "content"} = AgentDb.read("viking://resources/atomic/async.md")

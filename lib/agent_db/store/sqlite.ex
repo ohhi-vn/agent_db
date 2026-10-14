@@ -627,13 +627,16 @@ defmodule AgentDb.Store.SQLite do
     end
   end
 
-  # Releases vec rows left behind by removals that predate the purge in
-  # Nodes.purge_uri_state/2. Such rows are already invisible to search (the
-  # query joins nodes), so this is about reclaiming storage and about not
-  # letting a node recreated at an old deleted URI inherit a stale embedding.
-  # Guarded by an existence check so a clean or large index is not scanned
-  # on every boot. Runs over every dim table plus legacy `vec_nodes`.
-  defp reconcile_orphan_embeddings(conn) do
+  @doc """
+  Reclaims vec rows that name a URI the node store no longer holds.
+
+  Guarded by an existence check so a clean or large index is not scanned on
+  every boot. Runs over every dim table plus legacy `vec_nodes`. Safe to call
+  repeatedly and from any connection, which is what lets the reclamation job
+  reuse it.
+  """
+  @spec reconcile_orphan_embeddings(conn()) :: :ok
+  def reconcile_orphan_embeddings(conn) do
     if vec_available?(conn) do
       case list_vec_tables(conn) do
         {:ok, tables} -> Enum.each(tables, &reconcile_orphan_table(conn, &1))

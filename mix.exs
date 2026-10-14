@@ -77,7 +77,7 @@ defmodule AgentDb.MixProject do
         "mix.exs",
         "README.md",
         "LICENSE",
-        "docs"
+        "guides"
       ]
     ]
   end
@@ -95,10 +95,17 @@ defmodule AgentDb.MixProject do
       extras: [
         "README.md",
         "LICENSE",
-        "docs/QUICKSTART.md",
-        "docs/SETUP.md",
-        "docs/USAGE.md",
-        "docs/agents.md"
+        "guides/QUICKSTART.md",
+        "guides/SETUP.md",
+        "guides/USAGE.md",
+        "guides/ARCHITECTURE.md",
+        "guides/MONITORING.md",
+        # ex_doc generates its own api-reference.html (the module index); the
+        # filename option keeps this guide at its spec'd path without colliding
+        # with that page.
+        {"guides/API-REFERENCE.md", filename: "guide-api-reference"},
+        "guides/TROUBLESHOOTING.md",
+        "guides/agents.md"
       ],
       groups_for_modules: [
         "Context store": [AgentDb, AgentDb.Core.Storage, AgentDb.Core.Transport, AgentDb.Archive],
@@ -107,7 +114,15 @@ defmodule AgentDb.MixProject do
         "Agent skills": [AgentDb.Skills],
         "HTTP, WebSocket and MCP": [AgentDbWeb],
         "Command line": [Mix.Tasks.AgentDb]
-      ]
+      ],
+      # The guides' architecture tables name internal modules that are hidden
+      # by design (@moduledoc false). Autolinking them warns, so exactly those
+      # namespaces are skipped while documented modules stay linked.
+      skip_code_autolink_to:
+        &String.match?(
+          &1,
+          ~r/^AgentDb\.(Adapters|Application|Store|Workers)(\.|$)|^AgentDb\.(Cache|Config|Subscriptions)$/
+        )
     ]
   end
 

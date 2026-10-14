@@ -434,7 +434,7 @@ defmodule AgentDb.StorageContract do
                      :binary.copy(<<0.0::float-32>>, 384)
                    )
 
-          assert {:ok, []} = storage().search_keyword("body", nil, 10)
+          assert {:ok, []} = storage().search_keyword("body", nil, 10, nil)
         end
 
         test "a removed node is not given a summary" do
@@ -480,7 +480,7 @@ defmodule AgentDb.StorageContract do
                      []
                    )
 
-          assert {:ok, [hit]} = storage().search_keyword("quick", nil, 10)
+          assert {:ok, [hit]} = storage().search_keyword("quick", nil, 10, nil)
           assert hit.uri == "viking://resources/contract/search/one.md"
         end
 
@@ -491,7 +491,7 @@ defmodule AgentDb.StorageContract do
           assert :ok =
                    storage().put_document("viking://resources/contract/out.md", "needlehere", [])
 
-          assert {:ok, [hit]} = storage().search_keyword("needlehere", scope <> "/", 10)
+          assert {:ok, [hit]} = storage().search_keyword("needlehere", scope <> "/", 10, nil)
           assert hit.uri == scope <> "/in.md"
         end
 
@@ -502,7 +502,7 @@ defmodule AgentDb.StorageContract do
             assert :ok = storage().put_document("#{scope}/doc#{n}.md", "sharedterm", [])
           end
 
-          assert {:ok, bounded} = storage().search_keyword("sharedterm", scope <> "/", 3)
+          assert {:ok, bounded} = storage().search_keyword("sharedterm", scope <> "/", 3, nil)
           assert length(bounded) == 3
 
           # Ordered by URI, so the same query returns the same documents however
@@ -510,8 +510,72 @@ defmodule AgentDb.StorageContract do
           uris = Enum.map(bounded, & &1.uri)
           assert uris == Enum.sort(uris)
 
-          assert {:ok, again} = storage().search_keyword("sharedterm", scope <> "/", 3)
+          assert {:ok, again} = storage().search_keyword("sharedterm", scope <> "/", 3, nil)
           assert Enum.map(again, & &1.uri) == uris
+        end
+
+        test "a projected keyword search reads only the selected fields" do
+          scope = "viking://resources/contract/projected"
+
+          assert :ok =
+                   storage().put_document(
+                     scope <> "/one.md",
+                     String.duplicate("needle ", 400),
+                     abstract: "one abstract"
+                   )
+
+          assert {:ok, [hit]} =
+                   storage().search_keyword("needle", scope <> "/", 10, [:uri, :abstract])
+
+          # `:uri` survives whatever the selection: a result that cannot be
+          # fetched is not a result.
+          assert hit.uri == scope <> "/one.md"
+          assert hit.abstract == "one abstract"
+
+          # The content was not selected, so it was not read.
+          refute Map.has_key?(hit, :content)
+          refute Map.has_key?(hit, :overview)
+
+          # The internal pair is still there for the caller that filters on it.
+          assert hit.enabled == true
+          assert hit.group_tag == ""
+        end
+
+        test "an unprojected keyword search still returns the whole node" do
+          scope = "viking://resources/contract/whole"
+          uri = scope <> "/one.md"
+
+          assert :ok =
+                   storage().put_document(
+                     uri,
+                     "body text",
+                     abstract: "one abstract",
+                     overview: "one overview"
+                   )
+
+          assert {:ok, [hit]} = storage().search_keyword("body", scope <> "/", 10, nil)
+
+          assert hit.uri == uri
+          assert hit.content == "body text"
+          assert hit.abstract == "one abstract"
+          assert hit.overview == "one overview"
+        end
+
+        test "the same documents are found whichever fields are projected" do
+          scope = "viking://resources/contract/projection-parity"
+
+          for n <- 1..5 do
+            assert :ok = storage().put_document("#{scope}/doc#{n}.md", "sharedterm", [])
+          end
+
+          assert {:ok, whole} = storage().search_keyword("sharedterm", scope <> "/", 10, nil)
+
+          assert {:ok, projected} =
+                   storage().search_keyword("sharedterm", scope <> "/", 10, [:uri])
+
+          # The selection changes what a result carries, never which documents
+          # are found or in what order.
+          assert Enum.map(whole, & &1.uri) == Enum.map(projected, & &1.uri)
         end
       end
 
@@ -1082,20 +1146,22 @@ defmodule AgentDb.StorageContract do
           if stats.available and is_integer(stats.vectors) do
             # Mixed dims land apart: each query finds its own dim's row.
             assert {:ok, [hit_a]} =
-                     storage().search_vector(encode_vector([1.0, 0.0, 0.0, 0.0]), 10, nil)
+                     storage().search_vector(encode_vector([1.0, 0.0, 0.0, 0.0]), 10, nil, nil)
 
             assert hit_a.uri == a
 
-            assert {:ok, [hit_b]} = storage().search_vector(encode_vector([1.0, 0.0]), 10, nil)
+            assert {:ok, [hit_b]} =
+                     storage().search_vector(encode_vector([1.0, 0.0]), 10, nil, nil)
+
             assert hit_b.uri == b
 
             # ...and a query from the other dim is refused, never misranked.
             assert {:error, :dim_mismatch} =
-                     storage().search_vector(encode_vector([1.0, 0.0]), 10, nil)
+                     storage().search_vector(encode_vector([1.0, 0.0]), 10, nil, nil)
           else
             # Without a vector index nothing routes anywhere.
             assert {:error, :vector_index_unavailable} =
-                     storage().search_vector(encode_vector([1.0, 0.0, 0.0, 0.0]), 10, nil)
+                     storage().search_vector(encode_vector([1.0, 0.0, 0.0, 0.0]), 10, nil, nil)
           end
         end
 
@@ -1161,6 +1227,160 @@ defmodule AgentDb.StorageContract do
             assert stats.needs_backfill == true
           else
             assert stats.available == false
+          end
+        end
+      end
+
+      describe "search_vector" do
+        test "a projected vector search reads only the selected fields" do
+          uri = "viking://resources/contract/projected-vector/one.md"
+
+          assert :ok =
+                   storage().put_document(
+                     uri,
+                     String.duplicate("body ", 400),
+                     abstract: "one abstract"
+                   )
+
+          :ok =
+            AgentDb.StorageContract.Helpers.store_vectors(storage(), %{
+              uri => [1.0, 0.0, 0.0, 0.0]
+            })
+
+          assert {:ok, stats} = storage().vector_index_stats()
+
+          if stats.available do
+            assert {:ok, [hit]} =
+                     storage().search_vector(
+                       encode_vector([1.0, 0.0, 0.0, 0.0]),
+                       10,
+                       nil,
+                       [:uri, :abstract, :score]
+                     )
+
+            assert hit.uri == uri
+            assert hit.abstract == "one abstract"
+
+            # The score is what ranks a hit, so it survives a projection the way
+            # a result's URI does.
+            assert is_float(hit.score)
+
+            refute Map.has_key?(hit, :content)
+            refute Map.has_key?(hit, :overview)
+          else
+            assert {:error, :vector_index_unavailable} =
+                     storage().search_vector(
+                       encode_vector([1.0, 0.0, 0.0, 0.0]),
+                       10,
+                       nil,
+                       [:uri, :abstract, :score]
+                     )
+          end
+        end
+
+        test "a projection leaves ranking and ordering untouched" do
+          uris =
+            for n <- 1..5 do
+              uri = "viking://resources/contract/vector-parity/doc#{n}.md"
+              assert :ok = storage().put_document(uri, "body", [])
+              uri
+            end
+
+          :ok =
+            AgentDb.StorageContract.Helpers.store_vectors(storage(), %{
+              Enum.at(uris, 0) => [1.0, 0.0, 0.0, 0.0],
+              Enum.at(uris, 1) => [0.0, 1.0, 0.0, 0.0]
+            })
+
+          assert {:ok, stats} = storage().vector_index_stats()
+
+          if stats.available do
+            assert {:ok, whole} =
+                     storage().search_vector(encode_vector([1.0, 0.0, 0.0, 0.0]), 10, nil, nil)
+
+            assert {:ok, projected} =
+                     storage().search_vector(
+                       encode_vector([1.0, 0.0, 0.0, 0.0]),
+                       10,
+                       nil,
+                       [:uri, :score]
+                     )
+
+            assert Enum.map(whole, & &1.uri) == Enum.map(projected, & &1.uri)
+            assert Enum.map(whole, & &1.score) == Enum.map(projected, & &1.score)
+          end
+        end
+      end
+
+      describe "the vector index is derived, not authoritative" do
+        # These are the guarantees that let removal skip the index and
+        # reclamation pick up afterwards. They are asserted through the port
+        # rather than against one implementation, because every provider owes
+        # them and only the contract can say so.
+
+        test "a re-written document is not ranked on its previous content" do
+          uri = "viking://resources/contract/rewritten.md"
+          assert :ok = storage().put_document(uri, "alpha", [])
+
+          :ok =
+            AgentDb.StorageContract.Helpers.store_vectors(storage(), %{
+              uri => [1.0, 0.0, 0.0, 0.0]
+            })
+
+          # Re-write at the same URI. The write re-enqueues the work that
+          # replaces the vector, so the index may lag -- but it must not
+          # describe content the document no longer has.
+          assert :ok = storage().put_document(uri, "beta", [])
+
+          assert {:ok, stats} = storage().vector_index_stats()
+
+          if stats.available do
+            assert {:ok, []} =
+                     storage().search_vector(encode_vector([1.0, 0.0, 0.0, 0.0]), 10, nil, nil)
+          else
+            assert {:error, :vector_index_unavailable} =
+                     storage().search_vector(encode_vector([1.0, 0.0, 0.0, 0.0]), 10, nil, nil)
+          end
+
+          # The document itself is intact and still findable by keyword, so this
+          # is a gap in the index, not a loss of content.
+          assert {:ok, node} = storage().get_node(uri)
+          assert node.content == "beta"
+          assert {:ok, [hit]} = storage().search_keyword("beta", nil, 10, nil)
+          assert hit.uri == uri
+        end
+
+        test "a URI with no prior vector is reported as needing backfill" do
+          uri = "viking://resources/contract/fresh-write.md"
+          assert :ok = storage().put_document(uri, "brand new content", [])
+
+          assert {:ok, stats} = storage().vector_index_stats()
+
+          # With no index there is nothing to backfill into, and the store says
+          # so rather than reporting a need it cannot meet.
+          if stats.available do
+            assert stats.needs_backfill == true
+          else
+            assert stats.needs_backfill == false
+          end
+        end
+
+        test "backfill still wants the URI whose vector was retired" do
+          a = "viking://resources/contract/lost/a.md"
+          assert :ok = storage().put_document(a, "alpha", [])
+
+          :ok =
+            AgentDb.StorageContract.Helpers.store_vectors(storage(), %{
+              a => [1.0, 0.0, 0.0, 0.0]
+            })
+
+          # Retiring the vector on re-write does not cancel the work: a store
+          # that reported no backfill need here would never re-index what it
+          # just dropped.
+          assert {:ok, stats} = storage().vector_index_stats()
+
+          if stats.available do
+            assert stats.needs_backfill == true
           end
         end
       end

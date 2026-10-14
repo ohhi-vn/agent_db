@@ -114,6 +114,8 @@ cannot work.
 
 ```bash
 mix agent_db.read "viking://resources/myapp/readme.md" --json
+mix agent_db.abstract "viking://resources/myapp/readme.md" --json
+mix agent_db.overview "viking://resources/myapp/readme.md" --json
 mix agent_db.search "authentication" --mode hybrid --json
 mix agent_db.find "auth" --scope viking://resources/myapp --json
 mix agent_db.grep "def run" --scope viking://resources/myapp --json
@@ -130,11 +132,17 @@ non-zero.
 | MCP tool | Facade |
 |----------|--------|
 | `context_read`, `context_write`, `context_rm` | `read`, `write`, `rm` |
+| `context_abstract`, `context_overview`, `context_layers` | `abstract`, `overview`, `layers` |
 | `context_list`, `context_tree` | `list`, `tree` |
 | `context_search`, `context_find`, `context_grep` | `search`, `find`, `grep` |
 | `memory_recall`, `memory_remember`, `memory_forget` | `recall`, `remember`, `forget` |
-| `session_create`, `session_append`, `session_get`, `session_commit` | sessions |
+| `session_create`, `session_append`, `session_get`, `session_commit` | `create_session`, `append_message`, `get_session`, `commit_session` |
 | `store_health` | `health_check` + `model_status` + `queue_stats` |
+
+Read `context_abstract` or `context_overview` before `context_read`, and
+`context_layers` for all three at once — the L0/L1 the store keeps so you can
+decide whether a document is worth paying for. `context_search` takes `fields`
+when you want URIs and abstracts only, without the document bodies.
 
 Errors are JSON (`{"code": ..., "message": "..."}`). A `model_loading`
 message means retry later; anything else names the cause. The session stays

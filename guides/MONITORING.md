@@ -148,7 +148,7 @@ All operational failures and background-job state transitions are logged as stru
 ```elixir
 # Full health check (for orchestration liveness/readiness probes)
 AgentDb.health_check()
-# => %{status: "healthy" | "degraded", checks: %{db: true, models: true}}
+# => %{status: "ok" | "degraded", checks: %{db: true, models: true}}
 
 # Model status detail (includes loading state)
 AgentDb.model_status()
@@ -157,7 +157,7 @@ AgentDb.model_status()
 #      llm: %{state: :loading, ...}
 #    }
 
-# Queue depth and backlog
+# Queue depth and backlog (counts per status present — a status with no rows is absent)
 AgentDb.queue_stats()
 # => %{pending: 5, running: 2, done: 150, failed: 0}
 
@@ -174,7 +174,7 @@ mix agent_db.doctor
 
 # JSON for automation
 mix agent_db.doctor --json
-# => {"checks":{"db":true,"models":true,"queue":true,"pubsub":true,"inference_provider":true},"status":"healthy"}
+# => {"db":true,"status":"ok","provider":"local","queue":{"done":150,"failed":0},"pubsub":true}
 ```
 
 **Exit Codes**: `0` = healthy/degraded, non-zero = database unreachable only.
@@ -201,12 +201,12 @@ Every error response on every transport includes a `code` from this bounded taxo
 | Category | Codes | HTTP Status | Retryable |
 |----------|-------|-------------|-----------|
 | **Missing** | `not_found`, `no_memory`, `assertion_not_found` | 404 | No |
-| **Caller Error** | `invalid_mode`, `invalid_uri`, `invalid_query`, `invalid_limit`, `invalid_document`, `invalid_memory`, `invalid_memory_type`, `invalid_session`, `invalid_user_id`, `invalid_scope`, `invalid_json`, `invalid_argument`, `invalid_payload`, `not_a_memory_uri`, `is_root`, `missing_argument`, `unknown_event`, `unknown_tool`, `unsafe_path`, `unsupported_entry`, `unexpected_entry`, `empty` | 422 | No |
+| **Caller Error** | `invalid_mode`, `invalid_uri`, `invalid_query`, `invalid_limit`, `invalid_document`, `invalid_memory`, `invalid_memory_type`, `invalid_session`, `invalid_user_id`, `invalid_scope`, `invalid_json`, `invalid_argument`, `invalid_payload`, `invalid_group`, `not_a_memory_uri`, `is_root`, `missing_argument`, `unknown_event`, `unknown_tool`, `unsafe_path`, `unsupported_entry`, `unexpected_entry`, `empty` | 422 | No |
 | **Auth** | `unauthorized` | 401 | No |
 | **Rate Limit** | `rate_limited` | 429 | Yes (backoff) |
 | **Payload Too Large** | `too_large`, `too_big`, `too_many_entries` | 413 | No |
 | **Retryable Unavailable** | `model_loading`, `background_jobs_pending`, `vector_index_unavailable`, `storage_busy` | 503 | Yes |
-| **Server Failure** | `inference_failed`, `inference_timeout`, `model_load_failed`, `download_failed`, `background_jobs_failed`, `hybrid_leg_timeout`, `hybrid_leg_failed`, `enqueue_failed`, `storage_error`, `provider_unreachable`, `error` | 500 | Depends |
+| **Server Failure** | `inference_failed`, `inference_timeout`, `model_load_failed`, `download_failed`, `model_not_found`, `background_jobs_failed`, `hybrid_leg_timeout`, `hybrid_leg_failed`, `error` | 500 | Depends |
 
 ### Transport Mapping
 
@@ -222,16 +222,26 @@ Every error response on every transport includes a `code` from this bounded taxo
 
 ### Alerting on Error Codes
 
+Error codes ride in logs and transport responses. The telemetry metrics carry
+only the bounded dimensions (`operation`, `kind`, `role`, `outcome`) — no
+`code` label — so alert on outcomes from metrics and on codes from logs.
+
 ```promql
-# Alert on provider unavailability
-increase(agent_db_operation_total{code="provider_unreachable"}[5m]) > 0
+# Metric side: inference failing at the model layer (role is a real label)
+increase(agent_db_model_total{outcome="error",role="embedding"}[5m]) > 0
 
-# Alert on model load failures
-increase(agent_db_model_total{outcome="error",code="model_load_failed"}[5m]) > 0
-
-# Alert on queue backpressure (failed jobs)
+# Metric side: failed background jobs accumulating
 increase(agent_db_job_total{outcome="error"}[5m]) > 10
 ```
+
+```logql
+# Log side: the classified `reason` is the same code every transport returns
+{app="agent_db", level="error"} | json | reason="model_load_failed"
+```
+
+Provider availability is a health state, not a metric. Poll
+`AgentDb.model_status/0` — the same state the console's model panel shows —
+and alert when the provider reports `:unreachable` or `:unauthorized`.
 
 ## Trace Correlation
 

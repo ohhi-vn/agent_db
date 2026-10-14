@@ -28,5 +28,5 @@ Write-Host ""
 Write-Host "  wsl bash tools/install.sh --check"
 Write-Host "  wsl bash tools/install.sh"
 Write-Host ""
-Write-Host "Windows OpenCode/Zed then use http://localhost:6060/mcp (see docs/agents.md)."
+Write-Host "Windows OpenCode/Zed then use http://localhost:6060/mcp (see guides/agents.md)."
 exit 1

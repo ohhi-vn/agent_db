@@ -65,10 +65,10 @@ and daemon reachability plus MCP `tools/list`.
 
 If the daemon is not reachable, start it first (`iex -S mix`), then re-run.
 If a model file fails to load, delete the truncated cache file and let it
-re-download (see `docs/SETUP.md`).
+re-download (see `guides/SETUP.md`).
 
 ## Next steps
 
-- Full install and configuration: `docs/SETUP.md`
-- Daily workflows (documents, memory, sessions, skills, CLI, MCP, WebSocket): `docs/USAGE.md`
-- Agent setup (OpenCode, Zed): `docs/agents.md`
+- Full install and configuration: `guides/SETUP.md`
+- Daily workflows (documents, memory, sessions, skills, CLI, MCP, WebSocket): `guides/USAGE.md`
+- Agent setup (OpenCode, Zed): `guides/agents.md`

@@ -61,8 +61,32 @@ Benchee.run(
     "grep" => fn -> AgentDb.grep("alpha", limit: 50) end,
     "find" => fn -> AgentDb.find("doc", scope: "viking://resources/bench", limit: 50) end,
     "hybrid_search_error_path" => fn -> AgentDb.search("alpha", mode: :hybrid, top_k: 10) end,
+    # The vector leg on its own, which is the path that embeds the query before
+    # anything else can happen. `hybrid_search_error_path` above measures what
+    # the whole call costs when the leg fails; this measures the embedding
+    # itself, which is the part shared by both modes and the one that was never
+    # measured separately.
+    #
+    # Whether the leg *returns* results depends on the host: with the embedding
+    # model cached the query is embedded for real, and whether the index answers
+    # depends on the sqlite-vec extension being present. Either way the embedding
+    # runs, which is what this scenario is for.
+    "vector_search" => fn -> AgentDb.search("alpha", mode: :vector, top_k: 10) end,
+    # The same query through hybrid, where the two legs run concurrently. The
+    # vector leg's embedding is shared with the scenario above, so the
+    # difference between them is the cost of running the keyword leg alongside
+    # rather than alone.
+    "hybrid_search_concurrent" => fn -> AgentDb.search("beta", mode: :hybrid, top_k: 10) end,
     "write" => fn ->
       AgentDb.write("viking://resources/bench/tmp.md", "tmp #{System.unique_integer()}")
+    end,
+    # A re-write at a URI that already holds a vector, which is the path the
+    # retire-on-write guarantee runs on: the write clears the URI's rows from
+    # every dim table in the same transaction that persists the document. The
+    # cost is invisible at one document and visible once a provider has several
+    # dims to walk, so it is measured rather than assumed.
+    "rewrite_with_vector" => fn ->
+      AgentDb.write("viking://resources/bench/rewritten.md", "tmp #{System.unique_integer()}")
     end,
     "queue_throughput" => fn -> AgentDb.queue_stats() end
   },

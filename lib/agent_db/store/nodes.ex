@@ -205,6 +205,60 @@ defmodule AgentDb.Store.Nodes do
     end
   end
 
+  @doc """
+  Retires the vector rows of a single `uri`, in every dim table and the legacy
+  one.
+
+  The per-URI twin of `purge_subtree/2`'s vec delete, for a write: the URI is
+  not going away, so only its own rows go. The index is derived and about to be
+  regenerated, so dropping it can only make vector search return less -- never
+  return a URI the store cannot hold. Without it a re-written document stays
+  ranked on content it no longer has until its own re-embed lands, which is the
+  window `harden-node-removal` named and never closed.
+
+  Runs inside the caller's transaction, so the retirement lands with the
+  document it describes.
+  """
+  @spec retire_uri_vector(SQLite.conn(), String.t()) :: :ok | {:error, term()}
+  def retire_uri_vector(conn, uri) do
+    if SQLite.vec_available?(conn) do
+      case SQLite.list_vec_dims(conn) do
+        {:ok, dims} -> delete_from_dims(conn, uri, dims)
+        {:error, _} = err -> err
+      end
+    else
+      :ok
+    end
+  end
+
+  defp delete_from_dims(conn, uri, dims) do
+    Enum.reduce_while(dims, :ok, fn dim, :ok ->
+      case SQLite.exec_write(
+             conn,
+             "DELETE FROM \"#{SQLite.vec_table(dim)}\" WHERE uri = ?1",
+             [uri]
+           ) do
+        :ok -> {:cont, :ok}
+        {:error, _} = err -> {:halt, err}
+      end
+    end)
+    |> case do
+      :ok -> delete_legacy_uri_vector(conn, uri)
+      {:error, _} = err -> err
+    end
+  end
+
+  defp delete_legacy_uri_vector(conn, uri) do
+    case SQLite.query_one(
+           conn,
+           "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'vec_nodes'",
+           []
+         ) do
+      {:ok, [1]} -> SQLite.exec_write(conn, "DELETE FROM vec_nodes WHERE uri = ?1", [uri])
+      _ -> :ok
+    end
+  end
+
   # Keyed by destination_uri only, never session_id: a session committed to
   # several destinations loses bookkeeping for the removed one and keeps it for
   # the rest. Leaving a stale row here is what makes a later re-commit of an
@@ -236,10 +290,18 @@ defmodule AgentDb.Store.Nodes do
   Bounded by `limit` in SQL and ordered by URI, so the two are the same on
   every call: a store cannot return a different set of the same results just
   because the rows came back in a different order.
+
+  `fields` is the caller's requested result columns, or `nil` for the default
+  whole-row shape. When `fields` is given, the statement reads only those
+  columns plus the internal ones the caller still needs, so a caller that did
+  not ask for content does not pay to read it. The statement's column list and
+  the row mapper share one order, so they cannot disagree.
   """
-  @spec search(SQLite.conn(), String.t(), String.t() | nil, pos_integer()) ::
-          {:ok, [node_row()]} | {:error, term()}
-  def search(conn, term, scope_prefix, limit) do
+  @spec search(SQLite.conn(), String.t(), String.t() | nil, pos_integer(), [atom()] | nil) ::
+          {:ok, [map()]} | {:error, term()}
+  def search(conn, term, scope_prefix, limit, fields \\ nil)
+
+  def search(conn, term, scope_prefix, limit, nil) do
     pattern = "%" <> like_escape(String.downcase(term)) <> "%"
 
     {where, args} =
@@ -263,6 +325,112 @@ defmodule AgentDb.Store.Nodes do
       {:error, _} = err -> err
     end
   end
+
+  def search(conn, term, scope_prefix, limit, fields) when is_list(fields) do
+    with {:ok, columns} <- projection_columns(fields),
+         {:ok, sql} <- projection_sql(columns) do
+      pattern = "%" <> like_escape(String.downcase(term)) <> "%"
+
+      {where, args} =
+        case scope_prefix do
+          nil ->
+            {"kind = 'doc' AND (lower(COALESCE(content,'')) LIKE ? ESCAPE '\\' OR lower(COALESCE(abstract,'')) LIKE ? ESCAPE '\\' OR lower(COALESCE(overview,'')) LIKE ? ESCAPE '\\')",
+             [pattern, pattern, pattern]}
+
+          prefix when is_binary(prefix) ->
+            {"kind = 'doc' AND uri LIKE ? ESCAPE '\\' AND (lower(COALESCE(content,'')) LIKE ? ESCAPE '\\' OR lower(COALESCE(abstract,'')) LIKE ? ESCAPE '\\' OR lower(COALESCE(overview,'')) LIKE ? ESCAPE '\\')",
+             [like_escape(prefix) <> "%", pattern, pattern, pattern]}
+        end
+
+      case SQLite.query(
+             conn,
+             "SELECT #{sql} FROM nodes WHERE " <> where <> " ORDER BY uri ASC LIMIT ?",
+             args ++ [limit]
+           ) do
+        {:ok, rows} -> {:ok, Enum.map(rows, &projected_row(columns, &1))}
+        {:error, _} = err -> err
+      end
+    end
+  end
+
+  # The order a projected statement reads its columns in, and therefore the
+  # order its row mapper reads them back in. One list, so a rank between the
+  # two cannot happen: adding a column means adding it here only.
+  @projection_columns [:uri, :content, :abstract, :overview, :enabled, :group_tag]
+
+  # `:uri` is read whatever the caller selected, because a result that cannot
+  # be fetched is not a result. The internal pair is read because the caller
+  # still filters on `enabled` and strips `group_tag` afterwards.
+  @projection_internal [:enabled, :group_tag]
+
+  # Every selectable name mapped to its fixed SQL fragment. A field name is
+  # never interpolated as text: an atom is a key into this map, and a name that
+  # is not a key is refused before any statement is built.
+  @projection_sql %{
+    uri: "uri",
+    content: "content",
+    abstract: "abstract",
+    overview: "overview",
+    enabled: "enabled",
+    group_tag: "group_tag"
+  }
+
+  @doc """
+  The columns a projected search statement reads, in the order it reads them.
+
+  Public because it is the one place a caller-supplied field name becomes SQL,
+  and a contract that cannot be tested is not a contract. An atom is looked up
+  in the fixed map below, so a name that is not a key produces an error and no
+  statement rather than a statement containing the name as written.
+  """
+  @spec projection_columns([atom()]) :: {:ok, [atom()]} | {:error, term()}
+  def projection_columns(fields) when is_list(fields) do
+    selected = MapSet.new(fields)
+
+    {:ok,
+     Enum.filter(@projection_columns, fn column ->
+       column == :uri or column in @projection_internal or MapSet.member?(selected, column)
+     end)}
+  end
+
+  @doc """
+  The SQL column list for the columns `projection_columns/1` chose.
+
+  A name is a key into a map of fixed fragments. An atom that is not a key is
+  refused, so the only strings that can reach a statement are the ones written
+  here.
+  """
+  @spec projection_sql([atom()]) :: {:ok, String.t()} | {:error, term()}
+  def projection_sql(columns) do
+    Enum.reduce_while(columns, {:ok, []}, fn column, {:ok, acc} ->
+      case Map.fetch(@projection_sql, column) do
+        {:ok, sql} -> {:cont, {:ok, [sql | acc]}}
+        :error -> {:halt, {:error, {:unknown_projection_column, column}}}
+      end
+    end)
+    |> case do
+      {:ok, reversed} -> {:ok, reversed |> Enum.reverse() |> Enum.join(", ")}
+      {:error, _} = err -> err
+    end
+  end
+
+  defp projected_row(columns, row) do
+    columns
+    |> Enum.zip(row)
+    |> Map.new()
+    |> normalize_projected()
+    |> normalize_group()
+  end
+
+  # The two internal columns are reported in the shape the application already
+  # expects from a whole row, so the filtering and the stripping downstream
+  # read a projected row exactly as they read an unprojected one.
+  defp normalize_projected(%{enabled: flag} = row), do: %{row | enabled: flag != 0}
+  defp normalize_projected(row), do: row
+
+  defp normalize_group(%{group_tag: nil} = row), do: %{row | group_tag: ""}
+  defp normalize_group(%{group_tag: tag} = row), do: %{row | group_tag: tag}
+  defp normalize_group(row), do: row
 
   @doc """
   Path-discovery matches for `query` within `scope_uri` or beneath it.

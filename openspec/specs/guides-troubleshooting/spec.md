@@ -1,10 +1,10 @@
-# Spec Delta
+# guides-troubleshooting Specification
 
 ## Purpose
 
 Provides a symptom-driven diagnostic guide with resolutions and diagnostic commands for common operational issues including model loading failures, database errors, queue backpressure, inference latency, authentication issues, and WSL2-specific problems so operators can resolve incidents without escalating to developers.
 
-## ADDED Requirements
+## Requirements
 
 ### Requirement: Troubleshooting guide organizes issues by observable symptom
 The system SHALL provide `guides/TROUBLESHOOTING.md` with a top-level index of symptoms (e.g., "Daemon won't start", "Model fails to load", "Search returns model_loading", "Queue grows without draining", "High inference latency", "Authentication rejected", "WSL2 daemon unreachable", "Admin console shows errors", "Export/import fails") each linking to a diagnostic section with cause, verification commands, and resolution steps.
@@ -26,7 +26,7 @@ Each diagnostic section SHALL list the exact commands to run (Elixir function ca
 
 #### Scenario: Operator checks database health
 - **WHEN** an operator runs `mix agent_db.doctor --json`
-- **THEN** they see the JSON structure with `checks: %{db: true, models: true, queue: true, pubsub: true, inference_provider: true}` and know which `false` value maps to which symptom section
+- **THEN** they see the report `{"db":true,"status":"ok","provider":"local","queue":{...},"pubsub":true}` — `db` false means the symptom is a storage problem, `status` `degraded` with a healthy `db` means the models or queue sections apply
 
 ### Requirement: Troubleshooting guide documents log interpretation for common error patterns
 The system SHALL document how to read structured logs for the most common failure modes: model download failures (HTTP errors, checksum mismatches), SQLite busy/locked errors, inference OOM or backend mismatches, job retry exhaustion, and authentication token parsing failures. Each pattern SHALL show the log fields (`component`, `operation`, `outcome`, `code`, `trace_id`) and the corresponding guide section.

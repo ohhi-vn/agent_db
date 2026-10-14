@@ -47,7 +47,8 @@ AgentDb.write/3
     ▼
 Documents.write/3
     │
-    ├──► SQLite: INSERT document + enqueue jobs (atomic)
+    ├──► SQLite: INSERT document + enqueue jobs + retire the
+    │           URI's previous vector row (one transaction)
     │
     ├──► Cache: invalidate subtree
     │
@@ -75,10 +76,20 @@ Documents.read/1
 ```
 
 **Durability Guarantees**:
-- SQLite is the source of truth; ETS caches are disposable
-- Writes acknowledged only after SQLite persistence + job enqueue
-- Subtree removal clears node store, vector index, job queue, and caches atomically
-- Full recovery from SQLite alone after restart
+- SQLite is the source of truth for the node store, the memories, the sessions,
+  the commit bookkeeping, and the job queue; ETS caches and the vector index are
+  disposable
+- A removal clears the authoritative stores atomically — node store, memories,
+  commit bookkeeping, job queue, caches
+- The vector index is *derived*, so a removal does not clear it in the same
+  step. What removal does guarantee is that the URI stops being searchable
+  immediately, because every vector search joins back against the node store. A
+  row naming a removed URI is inert from the moment the removal commits, and a
+  standing job reclaims it afterwards. See
+  [Vector index drift](SETUP.md#vector-index-drift)
+- A write retires the URI's previous vector in the same transaction, so a
+  re-written document is never ranked on content it no longer has
+- Full recovery of the authoritative stores from SQLite alone after restart
 
 ### 2. Memory System (`AgentDb.Application.Memories`, `AgentDb.Store.Memories`)
 
@@ -101,6 +112,20 @@ Documents.read/1
 - `AgentDb.Adapters.Inference.Ollama` — Remote Ollama
 - `AgentDb.Adapters.Inference.OpenAICompatible` — Remote OpenAI-compatible
 
+**Containment at the composition root** (`AgentDb.Runtime`): the runtime is
+where a vector-index answer is admitted into the rest of the store, so it is
+also where a failure is contained. A native engine — sqlite-vec is a loadable
+extension, and any that follows will be a NIF — can raise, and a raise inside a
+`GenServer.call` is not an error a caller can act on; it is an exit that kills
+the process the operator was already relying on. `Runtime.vector_search/3`,
+`vector_put/3`, and `vector_stats/0` therefore convert every failure into the
+store's existing error contract: an error tuple carrying a classification,
+never an exception, and never a new failure class. Overload maps to the same
+retryable `:vector_index_unavailable` the store already reports for an index it
+cannot reach — never to a distinct permanent failure — and a worker that sees
+it defers rather than failing. This same containment is why the boundaries test
+allows a workflow to name `Runtime` and no other provider.
+
 **Model Roles**:
 - `embedding` — Vector embeddings for search
 - `llm` — Summarization (abstract/overview generation)
@@ -121,16 +146,22 @@ Documents.read/1
 
 ### 4. Background Job Queue (`AgentDb.JobQueue`, `AgentDb.Workers`)
 
-**Responsibility**: Durable SQLite-backed queue for embedding generation and summarization tasks.
+**Responsibility**: Durable SQLite-backed queue for embedding generation, summarization, and vector-index reclamation.
 
 **Job Kinds**:
 - `:embed` — Generate vector embedding for a document
 - `:summarize_abstract` — Generate L0 abstract
 - `:summarize_overview` — Generate L1 overview
+- `:reclaim_vector_index` — Delete index rows naming URIs the store no longer
+  holds. A *standing* job: the store schedules one at boot, not one per write,
+  and it is counted by kind rather than by URI because it belongs to no
+  subtree. An idle store defers on a cadence rather than scanning
 
 **Worker Pools** (configured via `job_workers`, default: CPU cores):
 - `AgentDb.Workers.Embedding` — One pool
 - `AgentDb.Workers.Summarization` — One pool
+- `AgentDb.Workers.VectorReclaim` — One worker, not a pool: it claims a single
+  global job, so a pool would be several processes contending for one row
 
 **Processing Guarantees**:
 - Jobs survive restart (rows in SQLite)
@@ -249,7 +280,7 @@ running → complete() → done
 | Component | Primary Module | Public Facade |
 |-----------|----------------|---------------|
 | Documents | `AgentDb.Application.Documents` | `AgentDb.write/3`, `read/1`, `list/1`, `tree/2`, `rm/1` |
-| Search | `AgentDb.Application.Search` | `AgentDb.search/3`, `find/2`, `grep/2` |
+| Search | `AgentDb.Application.Search` | `AgentDb.search/2`, `find/2`, `grep/2` |
 | Memory | `AgentDb.Application.Memories` | `AgentDb.remember/3`, `recall/1`, `forget/1`, `promote_memory/1` |
 | Sessions | `AgentDb.Application.Sessions` | `AgentDb.create_session/0`, `append_message/3`, `commit_session/3` |
 | Skills | `AgentDb.Application.Skills` | `AgentDb.import_skills/2` |

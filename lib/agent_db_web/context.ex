@@ -64,51 +64,26 @@ defmodule AgentDbWeb.Context do
   def get_document(uri), do: AgentDb.read(uri)
 
   @doc """
-  A document's LLM-facing layers with source and size.
+  A document's LLM-facing layers, keyed the way the console labels them.
 
   Returns `%{l0: layer, l1: layer, l2: layer}` where each layer is
   `%{text: String.t(), source: :stored | :fallback | :unavailable, chars: non_neg_integer()}`.
-  L0 is what `AgentDb.abstract/1` returns, L1 what `AgentDb.overview/1`
-  returns, L2 what `AgentDb.read/1` returns. A stored layer was persisted
-  (caller-supplied or generated); a fallback was derived from L2 at read
-  time; unavailable means the read failed. Read-only; never alters store
-  state.
+
+  The store answers these layers under their own names (`abstract`, `overview`,
+  `content`) because that is its vocabulary; the console's L0/L1/L2 labels are
+  presentation, and translation at the transport edge is what that edge is for.
+  One call to the facade, so a layer's meaning is the same wherever it is
+  shown.
   """
   @spec get_layers(String.t()) :: %{l0: map(), l1: map(), l2: map()}
   def get_layers(uri) do
-    stored =
-      case AgentDb.stored_layers(uri) do
-        {:ok, layers} -> layers
-        {:error, _} -> %{abstract: nil, overview: nil}
-      end
-
-    %{
-      l0: layer_entry(uri, &AgentDb.abstract/1, Map.get(stored, :abstract)),
-      l1: layer_entry(uri, &AgentDb.overview/1, Map.get(stored, :overview)),
-      l2: content_entry(uri)
-    }
-  end
-
-  defp layer_entry(uri, read, stored_value) do
-    case read.(uri) do
-      {:ok, text} ->
-        text = text || ""
-        source = if is_binary(stored_value) and stored_value != "", do: :stored, else: :fallback
-        %{text: text, source: source, chars: String.length(text)}
-
+    case AgentDb.layers(uri) do
       {:error, _} ->
-        %{text: "", source: :unavailable, chars: 0}
-    end
-  end
+        unavailable = %{text: "", source: :unavailable, chars: 0}
+        %{l0: unavailable, l1: unavailable, l2: unavailable}
 
-  defp content_entry(uri) do
-    case AgentDb.read(uri) do
-      {:ok, text} ->
-        text = text || ""
-        %{text: text, source: :stored, chars: String.length(text)}
-
-      {:error, _} ->
-        %{text: "", source: :unavailable, chars: 0}
+      layers ->
+        %{l0: layers.abstract, l1: layers.overview, l2: layers.content}
     end
   end
 

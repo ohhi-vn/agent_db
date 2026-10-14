@@ -229,6 +229,24 @@ defmodule AgentDb.Config do
     Application.get_env(:agent_db, :shutdown_grace_ms, 5_000)
   end
 
+  @doc """
+  How long to wait before running the next vector-index reclamation check.
+
+  Reclamation reclaims index rows whose URI the store no longer holds. Those
+  rows are already invisible to search, because the read path joins them away,
+  so this is occupancy rather than correctness -- which is why the check is a
+  cheap count on a cadence rather than a scan on every write. The default is a
+  minute: fast enough that drift from a busy store does not accumulate for long,
+  slow enough that an idle store costs one count per minute and no more.
+  """
+  @spec vector_reclaim_cadence_ms() :: pos_integer()
+  def vector_reclaim_cadence_ms do
+    case Application.get_env(:agent_db, :vector_reclaim_cadence_ms, 60_000) do
+      ms when is_integer(ms) and ms > 0 -> ms
+      _other -> 60_000
+    end
+  end
+
   @doc "Test helper: private per-test data dir under the system tmp dir."
   @spec test_data_dir() :: String.t()
   def test_data_dir do

@@ -78,6 +78,35 @@ defmodule AgentDb do
           {:ok, %{abstract: content() | nil, overview: content() | nil}} | {:error, term()}
   defdelegate stored_layers(uri), to: Documents
 
+  @doc """
+  Reads a document's three LLM-facing layers together, each with its source.
+
+  Answers `%{abstract: layer, overview: layer, content: layer}`, where each layer
+  carries `text`, `source` (`:stored`, `:fallback`, or `:unavailable`), and
+  `chars`. A `:fallback` layer was derived from L2 at read time because nothing
+  was stored; `:unavailable` means that layer's read failed. A missing URI is an
+  error, as with any other read.
+
+  One call instead of four, so a caller deciding whether to read a whole
+  document pays one round trip rather than one per layer.
+  """
+  @spec layers(uri()) ::
+          %{
+            abstract: %{
+              text: content(),
+              source: :stored | :fallback | :unavailable,
+              chars: non_neg_integer()
+            },
+            overview: %{
+              text: content(),
+              source: :stored | :fallback | :unavailable,
+              chars: non_neg_integer()
+            },
+            content: %{text: content(), source: :stored | :unavailable, chars: non_neg_integer()}
+          }
+          | {:error, term()}
+  defdelegate layers(uri), to: Documents
+
   @doc "Lists the names of a URI's direct children."
   @spec list(uri()) :: {:ok, [String.t()]} | {:error, term()}
   defdelegate list(uri), to: Documents
@@ -110,6 +139,9 @@ defmodule AgentDb do
     - `:scope` - a URI prefix to limit the search to one subtree
     - `:top_k` - maximum results (default 10)
     - `:hybrid_weights` - `{keyword_weight, vector_weight}` or `[keyword: kw, vector: vw]` (default `{0.5, 0.5}`)
+    - `:fields` - which per-result fields to return: any of `:uri`, `:content`,
+      `:abstract`, `:overview`, `:score`. `:uri` must be named, since a result
+      without its URI cannot be fetched. Omitted returns all of them.
   """
   @spec search(String.t(), keyword()) :: {:ok, [map()]} | {:error, term()}
   defdelegate search(term, opts \\ []), to: Search

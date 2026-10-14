@@ -110,7 +110,8 @@ defmodule AgentDb.VectorIndexSafetyTest do
              active_dim: :unknown,
              vectors: 0,
              documents: 0,
-             needs_backfill: false
+             needs_backfill: false,
+             reclaimable: 0
            }
 
     a = "viking://resources/coverage/a.md"
@@ -130,7 +131,8 @@ defmodule AgentDb.VectorIndexSafetyTest do
              active_dim: 4,
              vectors: 1,
              documents: 2,
-             needs_backfill: true
+             needs_backfill: true,
+             reclaimable: 0
            }
 
     :ok = Helpers.store_vectors(Storage, %{b => [0.0, 1.0, 0.0, 0.0]})

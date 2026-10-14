@@ -237,3 +237,81 @@ code-health fixes in 6.1-6.4 touch paths none of these scenarios run. No
 retained performance change lacks a recorded delta above, and no unmeasured
 optimization was kept: the `list` cache and the SQL-side `LIMIT` are the only
 two, and both are measured.
+
+## Retire-on-write (harden-vector-index-invariant)
+
+Collected 2026-10-14, Apple M1 Pro. Four runs each, `time: 3, memory_time: 1`,
+before and after the change. **This host has no sqlite-vec extension loaded**
+(`SQLite.vec_available?/1` is false), so `Nodes.retire_uri_vector/2` short-circuits
+after its guard and the per-dimension delete walk is never entered. The numbers
+below therefore bound the guard, not the mechanism.
+
+| Scenario | before ips | before median | after ips | after median | delta |
+|---|---|---|---|---|---|
+| write | 1.36-2.31 K | 314-536 us | 0.85-2.23 K | 356-553 us | within run-to-run noise |
+| read | 438 K | 1.96-3.08 us | 461 K | ~2 us | unchanged |
+
+The write scenario's own run-to-run variance is +/-110-240 %, which is wider than
+the difference being measured, so no delta is claimed. What is established is
+that retire-on-write adds one `vec_available?/1` guard per write and nothing
+observable beyond it on a host without the extension.
+
+**What is not yet measured, and why it matters:** the real cost of the deletion
+walk is `list_vec_dims/1` plus one DELETE per dimension, on a provider holding
+up to `@max_vec_dims` tables. On a host with the extension and a second provider
+dim active, that is 2+ statements per write inside a transaction that already
+runs several. The `@max_vec_tables` of 16 is the worst case, and the design's
+recorded mitigation is to batch the per-dimension deletes into one statement
+list if the write scenario regresses on such a host.
+
+Also added, and no claim made: `rewrite_with_vector`, a re-write of the same URI
+in a loop, so the retire path runs on every iteration rather than once per
+distinct URI. Its numbers here are the same as `write`, for the reason above.
+
+The `hybrid_search_error_path` scenario measured 54.8 ms average this run, which
+is the model-loading path rather than fused ranking; it remains unmeasured, as
+the previous baseline already recorded.
+
+## The vector and hybrid legs, with cached weights (harden-vector-index-invariant)
+
+Collected 2026-10-14, Apple M1 Pro, with the embedding model cached in
+`models/sentence-transformers/all-MiniLM-L6-v2` (87 MB). Workers stopped, as
+before. **This host still has no sqlite-vec extension loaded**, so the vector
+leg embeds the query and is then refused by the index; the hybrid leg runs both
+legs concurrently and gets the same refusal.
+
+| Scenario | ips | average | memory |
+|---|---|---|---|
+| vector_search | 0.00986 K | 101 450.87 µs | 6.05 KB |
+| hybrid_search_concurrent | 0.0133 K | 75 399.12 µs | 5.86 KB |
+| hybrid_search_error_path | 0.0149 K | 67 277.70 µs | 5.80 KB |
+| keyword_search_wide (for scale) | 1.41 K | 7 062 µs | 30.88 KB |
+
+A direct probe, outside the harness:
+
+- first vector search, including the lazy model load: **1 043 ms**
+- subsequent vector search, warm: **78 ms**
+
+**What these numbers say, and what they do not.** The embedding leg is now
+measured, and it is expensive: two orders of magnitude above every other
+scenario in this file, and it is a `GenServer.call` into a single serialized
+process, so it is also not parallel across workers. That was previously
+unmeasured — the file's own note asked for it and it sat unanswered since
+2026-09-30.
+
+What these numbers do **not** say is anything about ranking quality or ANN
+lookup. The index refused, so no result was fused and no nearest-neighbour
+query ran. On a host with the extension these scenarios would measure that leg
+too, and the two numbers above would fall to the embedding floor rather than
+stay inflated by the load.
+
+**The recommendation this supports:** the bottleneck in the vector path was
+already known to be inference serialization (the previous baseline names the
+model-manager as the thing to optimize), and these numbers confirm it is the
+whole cost. Any change that aims to speed up vector search should target
+embedding generation — concurrency across the fan-out, a resident process pool,
+a smaller model — and not the index.
+
+`rewrite_with_vector` was also added and reported in the previous section; its
+numbers here match `write`, because retire-on-write short-circuits at the
+`vec_available?/1` guard on this host.

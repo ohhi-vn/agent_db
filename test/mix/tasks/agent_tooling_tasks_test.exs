@@ -13,6 +13,45 @@ defmodule Mix.Tasks.AgentToolingTasksTest do
     :ok
   end
 
+  test "abstract and overview read one layer each, as JSON and as text" do
+    uri = "viking://resources/cli-tasks/layerable.md"
+
+    :ok =
+      AgentDb.write(uri, "a body long enough to measure",
+        abstract: "a supplied abstract",
+        overview: "a supplied overview"
+      )
+
+    out =
+      capture_io(fn ->
+        Mix.Tasks.AgentDb.Abstract.run([uri, "--json", "--no-compile"])
+      end)
+
+    assert %{"uri" => ^uri, "abstract" => "a supplied abstract"} = Jason.decode!(out)
+
+    # Without --json the layer is printed alone, so a shell can use it directly.
+    out =
+      capture_io(fn ->
+        Mix.Tasks.AgentDb.Overview.run([uri, "--no-compile"])
+      end)
+
+    assert String.trim(out) == "a supplied overview"
+  end
+
+  test "a layer read on a missing document exits non-zero with the reason" do
+    assert_raise Mix.Error, ~r/not_found/, fn ->
+      capture_io(fn ->
+        Mix.Tasks.AgentDb.Abstract.run(["viking://resources/cli-tasks/absent.md", "--no-compile"])
+      end)
+    end
+
+    assert_raise Mix.Error, ~r/not_found/, fn ->
+      capture_io(fn ->
+        Mix.Tasks.AgentDb.Overview.run(["viking://resources/cli-tasks/absent.md", "--no-compile"])
+      end)
+    end
+  end
+
   test "read, find, grep, and recall reach the facade" do
     :ok = AgentDb.write("viking://resources/cli-tasks/a.md", "cli tasks hello")
 

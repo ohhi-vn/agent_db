@@ -3,27 +3,43 @@ defmodule AgentDb.Core.Storage do
   Durable state the context store keeps, expressed without reference to any
   particular database.
 
-  A storage adapter owns every record keyed by URI -- documents, the vector
-  index, the persisted job queue, session commit bookkeeping, and memory
-  assertions -- because those records have to agree with each other. The
-  contract therefore exposes whole operations rather than connections or
-  statements: a workflow asks for a subtree to be removed, not for a
-  transaction to be opened.
+  A storage adapter owns the authoritative records: documents, memory
+  assertions, sessions, session commit bookkeeping, and the persisted job queue.
+  Those records have to agree with each other, so the contract exposes whole
+  operations rather than connections or statements: a workflow asks for a
+  subtree to be removed, not for a transaction to be opened.
+
+  A vector index is different in kind. It is derived: every row in it can be
+  reproduced by work the store already persisted. That makes it safe to let the
+  index lag — it is regenerated, not recovered — and it means the guarantee
+  belongs in the read rather than in the write. `search_vector/4` therefore
+  never returns a URI the node store cannot hold, so a row naming a removed
+  URI is inert until reclamation deletes it, and a re-write retires the URI's
+  previous vector so a live document is never ranked on content it no longer
+  has. Drift remains a cost, so it is bounded by `cancel_jobs/1` and reclaimed
+  rather than silently accumulated.
 
   ## Invariants an implementation must uphold
 
     * A write is durable before it is acknowledged, and a cache in front of the
       adapter may never serve anything the adapter has not already committed.
-    * `remove_subtree/1` removes a URI and everything beneath it from *every*
-      store keyed by URI, in one atomic step. A rejected removal leaves all
-      state untouched.
-    * `replace_skill/2` has the same two properties for a whole subtree: the
-      previous contents of the URI, the new ones, and the work enqueued for
-      them all land together or not at all.
+    * The authoritative stores change together. `remove_subtree/1` removes a URI
+      and everything beneath it from the node store, the memory store, the commit
+      bookkeeping and the job queue in one step, and `replace_skill/2` has the
+      same two properties for a whole subtree. A rejected removal leaves all of
+      that untouched.
+    * A vector hit is only ever returned for a URI the node store still holds, so
+      a removed URI is never surfaced even while a row naming it survives in the
+      index. This is the guarantee that lets removal skip the index and reclamation
+      pick up afterwards.
+    * A write retires the previous vector for the URI it writes, so a document is
+      never ranked against content it no longer has. Retiring derived data only
+      ever makes vector search return less, never something the store cannot hold.
     * A result produced by work that started before a removal never brings the
-      removed URI back. `put_embedding_result/3` and `put_layer_result/4`
-      check that the node is still there on the same connection that writes the
-      result, and report `:discarded` when it is not.
+      removed URI back. `put_embedding_result/3` and `put_layer_result/4` check
+      that the node is still there before writing the result and report
+      `:discarded` when it is not, which avoids most orphans outright; the
+      read-path join is what holds for the rest.
 
   Callbacks exchange core values and `{:ok, _}` / `{:error, _}` results, never
   adapter-specific structs or exceptions.
@@ -183,7 +199,14 @@ defmodule AgentDb.Core.Storage do
   @callback put_layer_result(integer(), String.t(), layer(), String.t()) ::
               {:ok, :stored | :discarded} | {:error, term()}
 
-  @doc "Stores a generated embedding for a job, unless its node has since been removed."
+  @doc """
+  Stores a generated embedding for a job, unless its node has since been removed.
+
+  Because the index is derived, an embedding for a URI the store no longer holds
+  is simply not wanted: the job is completed either way, and the result is
+  reported `:discarded`. A write at the URI meanwhile retires the previous
+  vector, so a re-write is never ranked on content it no longer has.
+  """
   @callback put_embedding_result(integer(), String.t(), binary()) ::
               {:ok, :stored | :discarded} | {:error, term()}
 
@@ -194,12 +217,36 @@ defmodule AgentDb.Core.Storage do
   At most `limit` results, ordered deterministically by URI. The bound is
   applied by the provider rather than by the caller, so a query matching more
   documents than were asked for does not materialize all of them.
+
+  `fields` is the set of per-result fields the caller asked for, or `nil` for
+  the default set (URI, content, abstract, overview). A projection is applied
+  by the statement that reads the rows rather than after they are materialized,
+  so a caller that did not ask for content does not pay to read it. `:uri` is
+  returned regardless of the selection, because a result without its URI
+  cannot be used to fetch the document it names. The internal columns a
+  provider still needs (`enabled`, `group_tag`) are read as well and reported
+  alongside, so a filtering caller can drop them itself.
   """
-  @callback search_keyword(String.t(), String.t() | nil, pos_integer()) ::
+  @callback search_keyword(String.t(), String.t() | nil, pos_integer(), [atom()] | nil) ::
               {:ok, [tree_node()]} | {:error, term()}
 
-  @doc "Nearest neighbours of a query embedding, optionally within `scope_prefix`."
-  @callback search_vector(binary(), pos_integer(), String.t() | nil) ::
+  @doc """
+  Nearest neighbours of a query embedding, optionally within `scope_prefix`.
+
+  The index is derived data: a row may survive for URI the node store no longer
+  holds, and the search is what keeps that inert. A hit is only returned when
+  the store can still hold the URI it names, so a removed URI is never surfaced
+  while a row for it survives. Candidates that cannot be hydrated do not count
+  towards `top_k`. Out of range `top_k` values and a query of the wrong
+  dimensionality are refused rather than answered approximately.
+
+  `fields` is the set of per-result fields the caller asked for, or `nil` for
+  the default set (URI, content, abstract, overview, score). A projection is
+  applied by the statement that reads the rows rather than after they are
+  materialized, so a caller that did not ask for content does not pay to read
+  it. `:uri` is returned regardless of the selection.
+  """
+  @callback search_vector(binary(), pos_integer(), String.t() | nil, [atom()] | nil) ::
               {:ok, [hit()]} | {:error, term()}
 
   @doc """
@@ -391,7 +438,10 @@ defmodule AgentDb.Core.Storage do
   `vectors` is `nil` rather than zero, because "not available" and "holds
   nothing" are different facts an operator needs to tell apart. `vectors`
   counts indexed rows and `documents` counts the documents they describe, so a
-  store can report how much of its content is vector-searchable.
+  store can report how much of its content is vector-searchable. `reclaimable`
+  counts rows whose URI the store no longer holds -- drift that is harmless to
+  search results but still occupies the index, and the number that says
+  reclamation is falling behind rather than merely that it has not run yet.
   """
   @callback vector_index_stats() ::
               {:ok,
@@ -401,6 +451,28 @@ defmodule AgentDb.Core.Storage do
                  documents: non_neg_integer()
                }}
               | {:error, term()}
+
+  @doc """
+  How many index rows name a URI the node store no longer holds.
+
+  Drift, reported without scanning content. Reclaimable rows are already
+  invisible to search -- the read path joins them away -- so this counts
+  occupancy rather than correctness, and it is what tells an operator that
+  reclamation is falling behind. Reported without touching anything.
+  """
+  @callback vector_index_reclaimable() :: {:ok, non_neg_integer()} | {:error, term()}
+
+  @doc """
+  Deletes every index row that names a URI the node store no longer holds.
+
+  The reclamation half of the drift contract: removal makes the URI
+  unsearchable immediately, and this reclaims the row afterwards. Rows naming
+  live URIs are left alone, and a store with nothing to reclaim is a no-op.
+  """
+  @callback reclaim_vector_index() :: :ok | {:error, term()}
+
+  @doc "How many jobs of `kind` exist, in any status. A standing job has no URI to count by."
+  @callback count_jobs_of_kind(atom()) :: non_neg_integer()
 
   @doc "Whether the durable state can be reached at all."
   @callback healthy?() :: boolean()

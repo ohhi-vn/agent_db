@@ -12,7 +12,7 @@
 # CI runs the same script, so the assertion that matters is written once.
 
 defmodule AgentDb.VerifyPackage do
-  @required ["lib", "config", "priv/static", "docs", "mix.exs", "README.md", "LICENSE"]
+  @required ["lib", "config", "priv/static", "guides", "mix.exs", "README.md", "LICENSE"]
 
   @forbidden [
     # Local state a developer accumulates and must never publish.

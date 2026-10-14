@@ -95,6 +95,34 @@ defmodule AgentDb.Core.ContractsTest do
       assert {:error, :is_root} = Storage.remove_subtree("viking://")
     end
 
+    test "a vector search projects its fields without depending on an index" do
+      # The projection is a property of the callback's contract, so it is
+      # asserted against a provider that needs no extension: a provider that
+      # only honoured it when a vector index happened to be available would
+      # leave most deployments uncovered.
+      uri = "viking://resources/contract-projection/one.md"
+      assert :ok = Storage.put_document(uri, "body", abstract: "one abstract")
+
+      :ok =
+        AgentDb.StorageContract.Helpers.store_vectors(Storage, %{
+          uri => [1.0, 0.0, 0.0, 0.0]
+        })
+
+      vector = AgentDb.StorageContract.Helpers.encode_vector([1.0, 0.0, 0.0, 0.0])
+
+      assert {:ok, [hit]} = Storage.search_vector(vector, 10, nil, [:uri, :abstract, :score])
+
+      assert hit.uri == uri
+      assert hit.abstract == "one abstract"
+
+      # A hit's score is what ranks it, so it survives a projection the way a
+      # result's URI does.
+      assert hit.score == 1.0
+
+      refute Map.has_key?(hit, :content)
+      refute Map.has_key?(hit, :overview)
+    end
+
     test "a node is a plain value rather than an adapter's own struct" do
       Storage.set_stub_node(%{
         uri: "",

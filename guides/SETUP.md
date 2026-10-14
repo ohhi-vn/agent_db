@@ -1,7 +1,7 @@
 # Setup
 
 Full install, configuration, and verification for operators. For the 5-minute
-path, start at `docs/QUICKSTART.md`.
+path, start at `guides/QUICKSTART.md`.
 
 ## Prerequisites
 
@@ -47,6 +47,7 @@ All values below match `lib/agent_db/application.ex` and
 | `exla_backend` | `AGENT_DB_EXLA_BACKEND` | `cpu` (`cpu` \| `cuda` \| `rocm`; anything else → `:cpu`) |
 | `ml_backend` | `AGENT_DB_ML_BACKEND` | `auto` (`auto` \| `exla` \| `emlx`; anything else → `:auto`) |
 | `inference_concurrency` | — (Application env only) | CPU cores; how many inference runs may be in flight at once, past which a caller runs inline |
+| `vector_reclaim_cadence_ms` | `AGENT_DB_VECTOR_RECLAIM_CADENCE_MS` | `60000`; how long the store waits between checks for vector-index rows naming URIs it no longer holds. Must be a positive integer — anything else falls back to the default. See [Vector index drift](#vector-index-drift) |
 | `inference_provider` | `AGENT_DB_INFERENCE_PROVIDER` | `:local` (`:local` \| `:ollama` \| `:openai_compatible` \| module implementing `AgentDb.Core.Inference`). This one key decides both which provider serves inference and the provider kind `model_status/0` reports. A value naming no known provider fails startup validation rather than serving the default while reporting something else. |
 | `ollama_base_url` | `AGENT_DB_OLLAMA_URL` | `http://localhost:11434` |
 | `ollama_embed_model` / `ollama_llm_model` | Application env only | `nomic-embed-text` / `llama3.1` |
@@ -130,6 +131,46 @@ wsl bash tools/install.sh --check
 
 `tools/install.ps1` refuses native execution on purpose — native Windows has
 no supported EXLA path.
+
+## Vector index drift
+
+The vector index is **derived**, not a second system of record. Every row in
+it can be reproduced from what the store already holds, so it is allowed to
+lag. What that buys is that a removed URI stops being searchable *immediately*
+— the read path checks the node store on every search — rather than the index
+having to be updated in the same transaction as the document.
+
+The residue is called **drift**: rows naming URIs the store no longer holds.
+Drift cannot affect a search result, because the read path joins those rows
+away. It does occupy the index, and left alone it grows without anyone being
+told — which is exactly how that leak went unnoticed before it was fixed.
+
+So the store does two things about it:
+
+- **A write retires the URI's previous vector.** Re-writing a document drops
+  its old row in the same transaction, so a live document is never ranked on
+  content it no longer has.
+- **A standing job reclaims the rest.** One `:reclaim_vector_index` job runs on
+  a cadence, counts what is reclaimable, and deletes only rows whose URI is
+  gone. An idle store costs one count per cadence.
+
+`AgentDb.index_coverage/0` reports the number, so drift is visible instead of
+silent:
+
+```elixir
+AgentDb.index_coverage()
+#=> %{available: true, active_dim: 384, vectors: 1024, documents: 1000,
+#     needs_backfill: false, reclaimable: 24}
+```
+
+`reclaimable` staying at zero means reclamation is keeping up. A number that
+keeps climbing means the job is not running — not removing it, not dropping it
+from the union. Check `AgentDb.queue_detail/1`.
+
+Change the cadence when the default does not fit:
+`AGENT_DB_VECTOR_RECLAIM_CADENCE_MS=30000` for a busier store, or a larger
+value on a store where writes are rare. An unparsable value falls back to the
+default rather than failing to boot.
 
 ## Verification and recovery
 

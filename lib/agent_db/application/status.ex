@@ -88,14 +88,17 @@ defmodule AgentDb.Application.Status do
 
   An index that cannot be queried is reported unavailable, which is a different
   fact from one that holds nothing: the first means vector search cannot be
-  served, the second means there is simply nothing indexed yet. The other
-  indexes' coverage is added by the facade, because each index owns its roots.
+  served, the second means there is simply nothing indexed yet. `reclaimable`
+  counts rows whose URI the store no longer holds -- drift the read path already
+  refuses to surface, reported so a store whose reclamation is falling behind
+  reads as a rising number instead of as nothing at all. The other indexes'
+  coverage is added by the facade, because each index owns its roots.
   """
   @spec index_coverage() :: map()
   def index_coverage do
-    case Runtime.storage().vector_index_stats() do
+    case Runtime.vector_stats() do
       {:ok, vector} -> vector
-      {:error, _} -> %{available: false, vectors: nil, documents: 0}
+      {:error, _} -> %{available: false, vectors: nil, documents: 0, reclaimable: nil}
     end
   end
 

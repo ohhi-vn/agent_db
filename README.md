@@ -4,13 +4,20 @@
 
 ## Guides
 
-- [Quickstart](docs/QUICKSTART.md) — 5 minutes to first write, read, search, and health check.
-- [Setup](docs/SETUP.md) — full install, configuration, backends, and verification.
-- [Usage](docs/USAGE.md) — daily workflows: documents, search, memory, sessions, skills, CLI, MCP, WebSocket.
-- [Agent setup](docs/agents.md) — OpenCode and Zed snippets (canonical).
+The [guide index](guides/README.md) lists every guide with its audience. The
+core path:
 
-The API reference is generated from the code (`mix docs`) rather than written by
-hand, so it cannot drift from the modules it describes.
+- [Quickstart](guides/QUICKSTART.md) — 5 minutes to first write, read, search, and health check.
+- [Setup](guides/SETUP.md) — full install, configuration, backends, and verification.
+- [Usage](guides/USAGE.md) — daily workflows: documents, search, memory, sessions, skills, CLI, MCP, WebSocket.
+- [Agent setup](guides/agents.md) — OpenCode and Zed snippets (canonical).
+- [Architecture](guides/ARCHITECTURE.md) — component boundaries and data flows.
+- [Monitoring](guides/MONITORING.md) — `/admin` console, telemetry, logs, health checks, alerting.
+- [API reference](guides/API-REFERENCE.md) — Elixir API, CLI, MCP, and WebSocket surfaces with the shared error catalog.
+- [Troubleshooting](guides/TROUBLESHOOTING.md) — symptom-first diagnostics.
+
+The Elixir API reference is generated from the code (`mix docs`) rather than
+written by hand, so it cannot drift from the modules it describes.
 
 ## Features
 
@@ -47,9 +54,9 @@ end
 
 MIT licensed; the terms are in [LICENSE](LICENSE).
 
-Full setup (directories, environment, listener, auth, backends): [Setup](docs/SETUP.md).
+Full setup (directories, environment, listener, auth, backends): [Setup](guides/SETUP.md).
 Changing this library, or checking someone else's change: the
-[verification commands](docs/SETUP.md#verifying-a-change) are the ones CI runs.
+[verification commands](guides/SETUP.md#verifying-a-change) are the ones CI runs.
 
 ## Quick Start
 
@@ -91,8 +98,8 @@ Changing this library, or checking someone else's change: the
 :ok = AgentDb.forget("viking://user/memories/preferences/language")
 ```
 
-New here? Follow [Quickstart](docs/QUICKSTART.md) instead — same first success
-in 5 minutes with verification. Daily workflows: [Usage](docs/USAGE.md).
+New here? Follow [Quickstart](guides/QUICKSTART.md) instead — same first success
+in 5 minutes with verification. Daily workflows: [Usage](guides/USAGE.md).
 
 ## Memory
 
@@ -350,7 +357,7 @@ workflow.
 
 `POST /mcp` serves the store as MCP tools for remote agents
 (`http://127.0.0.1:6060/mcp` by default, Bearer opt-in). CLI tasks accept
-`--json` for machine-readable output. See `docs/agents.md` for copy-paste
+`--json` for machine-readable output. See `guides/agents.md` for copy-paste
 OpenCode/Zed snippets, WSL notes, and `tools/install.sh --check`.
 
 ### Replacement
@@ -426,11 +433,11 @@ need no model, and are available in-process (`AgentDb.find/2`,
 ## Configuration
 
 Full configuration reference (every `AGENT_DB_*` variable with defaults,
-listener, auth, backends): [Setup](docs/SETUP.md). The table below is
+listener, auth, backends): [Setup](guides/SETUP.md). The table below is
 intentionally not duplicated here so the two cannot disagree.
 ### HTTP listener
 
-Listener, port, bind interface, and Bearer opt-in: [Setup](docs/SETUP.md#http-listener-and-auth).
+Listener, port, bind interface, and Bearer opt-in: [Setup](guides/SETUP.md#http-listener-and-auth).
 Defaults: port `6060`, bind `127.0.0.1` (loopback). `PORT` is **not** read.
 
 ### Error responses
@@ -464,7 +471,7 @@ a deployment that sets its own must be at least as long.
 
 ### Environment Variables
 
-Full table with defaults and failure recovery: [Setup](docs/SETUP.md#environment-reference).
+Full table with defaults and failure recovery: [Setup](guides/SETUP.md#environment-reference).
 `config/example.exs` is a working starting point: every setting in it has a
 default, so it evaluates with no environment set, and an unparseable value is
 refused by variable name.
@@ -485,7 +492,7 @@ local models while the console reports something else.
 
 ## WebSocket API
 
-Full event reference with copy-paste payloads: [Usage](docs/USAGE.md#websocket-v1).
+Full event reference with copy-paste payloads: [Usage](guides/USAGE.md#websocket-v1).
 Connect to `ws://localhost:6060/api`; with auth enabled, include
 `Authorization: Bearer <token>` header on connect.
 
@@ -597,7 +604,7 @@ AgentDb.Application
 | `Qwen3-0.6B` | Summarization | ~0.6B params | GGUF (Q4_K_M) |
 
 Models auto-download on first use to `model_cache_dir`. Can be pre-placed manually.
-Details: [Setup](docs/SETUP.md#models-pre-placement-and-cache-recovery).
+Details: [Setup](guides/SETUP.md#models-pre-placement-and-cache-recovery).
 
 ### Model cache notes
 

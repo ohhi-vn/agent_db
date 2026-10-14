@@ -54,10 +54,10 @@ defmodule AgentDbWeb.McpTest do
 
       names = response["result"]["tools"] |> Enum.map(& &1["name"])
 
-      for expected <- ~w(context_read context_write context_rm context_list context_tree
-                         context_search context_find context_grep memory_recall memory_remember
-                         memory_forget session_create session_append session_get session_commit
-                         store_health) do
+      for expected <- ~w(context_read context_abstract context_overview context_layers
+                         context_write context_rm context_list context_tree context_search
+                         context_find context_grep memory_recall memory_remember memory_forget
+                         session_create session_append session_get session_commit store_health) do
         assert expected in names, "missing tool #{expected}"
       end
     end
@@ -124,6 +124,181 @@ defmodule AgentDbWeb.McpTest do
 
       uris = text |> Jason.decode!() |> Map.fetch!("results") |> Enum.map(& &1["uri"])
       assert uri in uris
+    end
+
+    test "abstract and overview read one layer each", %{} do
+      uri = "viking://resources/mcp/layerable.md"
+
+      assert %{"result" => _} =
+               call("context_write", %{
+                 "uri" => uri,
+                 "content" => "a body long enough to be interesting",
+                 "abstract" => "a supplied abstract",
+                 "overview" => "a supplied overview"
+               })
+
+      assert %{"result" => %{"content" => [%{"text" => abstract_text}]}} =
+               call("context_abstract", %{"uri" => uri})
+
+      assert %{"uri" => ^uri, "abstract" => "a supplied abstract"} = Jason.decode!(abstract_text)
+
+      assert %{"result" => %{"content" => [%{"text" => overview_text}]}} =
+               call("context_overview", %{"uri" => uri})
+
+      assert %{"uri" => ^uri, "overview" => "a supplied overview"} = Jason.decode!(overview_text)
+    end
+
+    test "layers reads all three, each with its source and size" do
+      uri = "viking://resources/mcp/all-layers.md"
+
+      assert %{"result" => _} =
+               call("context_write", %{
+                 "uri" => uri,
+                 "content" => "a body long enough to measure",
+                 "abstract" => "a supplied abstract"
+               })
+
+      assert %{"result" => %{"content" => [%{"text" => layers_text}]}} =
+               call("context_layers", %{"uri" => uri})
+
+      assert %{
+               "uri" => ^uri,
+               "abstract" => %{
+                 "text" => "a supplied abstract",
+                 "source" => "stored",
+                 "chars" => 19
+               },
+               "overview" => %{"source" => "fallback"},
+               "content" => %{"source" => "stored", "chars" => _}
+             } = Jason.decode!(layers_text)
+    end
+
+    test "a layer that cannot be read does not fail the others" do
+      # A document exists, so the layers tool answers. The abstract read is
+      # driven through the same path as the others, so an unavailable layer is
+      # a property of that read alone.
+      uri = "viking://resources/mcp/degraded.md"
+      assert %{"result" => _} = call("context_write", %{"uri" => uri, "content" => "a body"})
+
+      assert %{"result" => %{"content" => [%{"text" => text}]}} =
+               call("context_layers", %{"uri" => uri})
+
+      decoded = Jason.decode!(text)
+      assert decoded["content"]["source"] == "stored"
+      assert decoded["overview"]["source"] == "fallback"
+      assert decoded["abstract"]["source"] == "fallback"
+    end
+
+    test "a layer read on a missing document is an error, and the session lives" do
+      assert %{"error" => %{"code" => -32_000}} =
+               call("context_abstract", %{"uri" => "viking://resources/mcp/absent.md"})
+
+      # The session is still usable, which is the point of an error rather than
+      # a crash.
+      uri = "viking://resources/mcp/still-readable.md"
+      assert %{"result" => _} = call("context_write", %{"uri" => uri, "content" => "still here"})
+
+      assert %{"result" => %{"content" => [%{"text" => text}]}} =
+               call("context_read", %{"uri" => uri})
+
+      assert %{"content" => "still here"} = Jason.decode!(text)
+    end
+
+    test "layer tools answer without a model" do
+      # A caller-supplied layer is what a client deciding whether to read L2
+      # actually has, and it needs no inference at all.
+      uri = "viking://resources/mcp/no-model.md"
+
+      assert %{"result" => _} =
+               call("context_write", %{
+                 "uri" => uri,
+                 "content" => "a body",
+                 "abstract" => "a stored abstract"
+               })
+
+      assert %{"result" => %{"content" => [%{"text" => text}]}} =
+               call("context_abstract", %{"uri" => uri})
+
+      assert %{"abstract" => "a stored abstract"} = Jason.decode!(text)
+    end
+
+    test "a layer with nothing stored falls back rather than failing" do
+      # No abstract and no overview were supplied, so the read path derives
+      # them from L2. That needs no model, which is what makes an unsummarized
+      # document usable rather than waiting.
+      uri = "viking://resources/mcp/unsummarized.md"
+
+      assert %{"result" => _} =
+               call("context_write", %{"uri" => uri, "content" => "## Heading\n\nbody"})
+
+      assert %{"result" => %{"content" => [%{"text" => text}]}} =
+               call("context_abstract", %{"uri" => uri})
+
+      assert %{"abstract" => "Heading"} = Jason.decode!(text)
+
+      assert %{"result" => %{"content" => [%{"text" => overview_text}]}} =
+               call("context_overview", %{"uri" => uri})
+
+      assert %{"overview" => overview} = Jason.decode!(overview_text)
+      assert overview =~ "Heading"
+    end
+
+    test "a search can answer with URIs and abstracts only" do
+      uri = "viking://resources/mcp/projectable.md"
+
+      assert %{"result" => _} =
+               call("context_write", %{
+                 "uri" => uri,
+                 "content" => "a body with a projection token",
+                 "abstract" => "a projectable abstract"
+               })
+
+      assert %{"result" => %{"content" => [%{"text" => text}]}} =
+               call("context_search", %{
+                 "term" => "projection token",
+                 "mode" => "keyword",
+                 "fields" => ["uri", "abstract"]
+               })
+
+      assert [result] = Jason.decode!(text)["results"]
+      assert result["uri"] == uri
+      assert result["abstract"] == "a projectable abstract"
+
+      # The content was not asked for, so it is not in the answer.
+      refute Map.has_key?(result, "content")
+      refute Map.has_key?(result, "overview")
+      refute Map.has_key?(result, "score")
+    end
+
+    test "a search with an unknown field name is refused" do
+      assert %{"error" => %{"message" => _}} =
+               call("context_search", %{
+                 "term" => "anything",
+                 "mode" => "keyword",
+                 "fields" => ["uri", "checksum"]
+               })
+    end
+
+    test "an omitted field selection returns the full result set" do
+      uri = "viking://resources/mcp/unprojected.md"
+
+      assert %{"result" => _} =
+               call("context_write", %{
+                 "uri" => uri,
+                 "content" => "a body with an unprojected token",
+                 "abstract" => "an abstract"
+               })
+
+      assert %{"result" => %{"content" => [%{"text" => text}]}} =
+               call("context_search", %{
+                 "term" => "unprojected token",
+                 "mode" => "keyword"
+               })
+
+      assert [result] = Jason.decode!(text)["results"]
+      assert result["uri"] == uri
+      assert result["content"] == "a body with an unprojected token"
+      assert result["abstract"] == "an abstract"
     end
 
     test "memory remember, recall, and forget" do

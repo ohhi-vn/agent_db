@@ -230,6 +230,13 @@ defmodule AgentDb.Workers.JobWorker do
         Observability.log(:info, component: :worker, kind: job.kind, outcome: :discarded)
         :discarded
 
+      # The index could not be reached right now -- it raised, it is saturated,
+      # or it is not loaded. That is "try again later", the same shape as a
+      # model still loading, so it is rescheduled without spending an attempt
+      # rather than burning the retry budget of work that has not failed.
+      {:error, :vector_index_unavailable} ->
+        defer(storage, job)
+
       {:error, reason} ->
         fail(storage, job, reason)
     end

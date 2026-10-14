@@ -58,6 +58,11 @@ defmodule AgentDb.Adapters.SQLite do
          :ok <- ensure_parents(conn, segments),
          :ok <-
            Nodes.upsert_doc(conn, uri, parent_uri(segments), List.last(segments), content, opts),
+         # The vector for this URI described its old content. The index is
+         # derived and the write re-enqueues the job that replaces it, so
+         # retiring it now leaves a gap that closes rather than a stale row
+         # that outranks the new content.
+         :ok <- Nodes.retire_uri_vector(conn, uri),
          :ok <- enqueue_jobs(conn, jobs),
          :ok <- maybe_inherit_parent_meta(conn, segments, uri, is_new) do
       :ok
@@ -416,8 +421,8 @@ defmodule AgentDb.Adapters.SQLite do
   # -- search --
 
   @impl true
-  def search_keyword(term, scope_prefix, limit) do
-    Reader.read(fn conn -> Nodes.search(conn, term, scope_prefix, limit) end)
+  def search_keyword(term, scope_prefix, limit, fields \\ nil) do
+    Reader.read(fn conn -> Nodes.search(conn, term, scope_prefix, limit, fields) end)
   end
 
   @impl true
@@ -431,8 +436,8 @@ defmodule AgentDb.Adapters.SQLite do
   end
 
   @impl true
-  def search_vector(query, top_k, scope_prefix) do
-    Reader.read(fn conn -> vector_search(conn, query, top_k, scope_prefix) end)
+  def search_vector(query, top_k, scope_prefix, fields \\ nil) do
+    Reader.read(fn conn -> vector_search(conn, query, top_k, scope_prefix, fields) end)
   end
 
   # The vec tables exist only when the sqlite-vec extension loaded, and a
@@ -440,7 +445,7 @@ defmodule AgentDb.Adapters.SQLite do
   # error text. That is not a reason a caller can act on, so the leg reports
   # itself as unservable instead. A query whose dim differs from the active
   # table is refused, never misranked across dims.
-  defp vector_search(conn, query, top_k, scope_prefix) do
+  defp vector_search(conn, query, top_k, scope_prefix, fields) do
     if SQLite.vec_available?(conn) do
       with {:ok, query_dim} <- SQLite.vec_dim(query),
            {:ok, active} <- SQLite.get_active_dim(conn) do
@@ -452,7 +457,14 @@ defmodule AgentDb.Adapters.SQLite do
             {:ok, []}
 
           true ->
-            run_vector_search(conn, query, top_k, scope_prefix, SQLite.vec_table(query_dim))
+            run_vector_search(
+              conn,
+              query,
+              top_k,
+              scope_prefix,
+              SQLite.vec_table(query_dim),
+              fields
+            )
         end
       else
         {:error, {:invalid_dim, _}} = err -> err
@@ -476,57 +488,100 @@ defmodule AgentDb.Adapters.SQLite do
     end
   end
 
-  defp run_vector_search(conn, query, top_k, scope_prefix, table) do
-    base_query = """
-      SELECT n.uri, n.parent_uri, n.name, n.kind, n.content, n.abstract, n.overview, n.enabled, n.group_tag,
-             vec_distance_cosine(v.embedding, ?1) as distance
-      FROM "#{table}" v
-      JOIN nodes n ON n.uri = v.uri
-      WHERE n.kind = 'doc'
-    """
-
-    {where, args} =
-      case scope_prefix do
+  defp run_vector_search(conn, query, top_k, scope_prefix, table, fields) do
+    # The projection is built from one list shared by the statement and the row
+    # mapper, so the two cannot disagree about which column is where. Every
+    # selectable name is a key into a fixed map of SQL fragments; a name that is
+    # not a key never reaches the statement as text.
+    columns =
+      case fields do
         nil ->
-          {base_query, [query]}
+          [:uri, :content, :abstract, :overview, :enabled, :group_tag, :distance]
 
-        prefix ->
-          {base_query <> " AND n.uri LIKE ?2 ESCAPE '\\'",
-           [query, Nodes.like_escape(prefix) <> "%"]}
+        fields when is_list(fields) ->
+          selected = MapSet.new(fields)
+
+          [:uri, :content, :abstract, :overview, :enabled, :group_tag, :distance]
+          |> Enum.filter(&(&1 == :uri or &1 == :distance or MapSet.member?(selected, &1)))
       end
 
-    query = "#{where} ORDER BY distance ASC LIMIT ?#{length(args) + 1}"
+    with {:ok, select} <- vector_projection_sql(columns) do
+      base_query = """
+        SELECT #{select}
+        FROM "#{table}" v
+        JOIN nodes n ON n.uri = v.uri
+        WHERE n.kind = 'doc'
+      """
 
-    case SQLite.query(conn, query, args ++ [top_k]) do
-      {:ok, rows} ->
-        {:ok,
-         Enum.map(rows, fn [
-                             uri,
-                             _parent,
-                             _name,
-                             _kind,
-                             content,
-                             abstract,
-                             overview,
-                             enabled,
-                             group_tag,
-                             distance
-                           ] ->
-           %{
-             uri: uri,
-             content: content,
-             abstract: abstract,
-             overview: overview,
-             score: 1.0 - distance,
-             enabled: enabled != 0,
-             group_tag: group_tag || ""
-           }
-         end)}
+      {where, args} =
+        case scope_prefix do
+          nil ->
+            {base_query, [query]}
 
-      {:error, _} = err ->
-        err
+          prefix ->
+            {base_query <> " AND n.uri LIKE ?2 ESCAPE '\\'",
+             [query, Nodes.like_escape(prefix) <> "%"]}
+        end
+
+      query = "#{where} ORDER BY distance ASC LIMIT ?#{length(args) + 1}"
+
+      case SQLite.query(conn, query, args ++ [top_k]) do
+        {:ok, rows} -> {:ok, Enum.map(rows, &projected_hit(columns, &1))}
+        {:error, _} = err -> err
+      end
     end
   end
+
+  # The column an atom maps to, and the order a projected statement reads them
+  # in. `distance` is a computed column rather than a node column, so it is
+  # named here rather than in the nodes table's vocabulary.
+  @vector_projection_sql %{
+    uri: "n.uri",
+    content: "n.content",
+    abstract: "n.abstract",
+    overview: "n.overview",
+    enabled: "n.enabled",
+    group_tag: "n.group_tag",
+    distance: "vec_distance_cosine(v.embedding, ?1) as distance"
+  }
+
+  defp vector_projection_sql(columns) do
+    Enum.reduce_while(columns, {:ok, []}, fn column, {:ok, acc} ->
+      case Map.fetch(@vector_projection_sql, column) do
+        {:ok, sql} -> {:cont, {:ok, [sql | acc]}}
+        :error -> {:halt, {:error, {:unknown_projection_column, column}}}
+      end
+    end)
+    |> case do
+      {:ok, reversed} -> {:ok, reversed |> Enum.reverse() |> Enum.join(", ")}
+      {:error, _} = err -> err
+    end
+  end
+
+  # A hit carries its score under `:score`, which is what a caller reads; the
+  # raw cosine distance is an implementation detail of this statement, and the
+  # internal pair is reported in the shape the application already filters on.
+  defp projected_hit(columns, row) do
+    columns
+    |> Enum.zip(row)
+    |> Map.new()
+    |> normalize_hit()
+    |> normalize_enabled()
+    |> normalize_group_tag()
+  end
+
+  defp normalize_hit(%{distance: distance} = hit) do
+    hit |> Map.delete(:distance) |> Map.put(:score, 1.0 - distance)
+  end
+
+  defp normalize_hit(hit), do: hit
+
+  defp normalize_enabled(%{enabled: flag} = hit), do: %{hit | enabled: flag != 0}
+  defp normalize_enabled(hit), do: hit
+
+  defp normalize_group_tag(%{group_tag: nil} = hit), do: %{hit | group_tag: ""}
+  defp normalize_group_tag(%{group_tag: tag} = hit), do: %{hit | group_tag: tag}
+  defp normalize_group_tag(hit), do: hit
 
   # -- sessions --
 
@@ -747,6 +802,9 @@ defmodule AgentDb.Adapters.SQLite do
   def count_jobs(uri, statuses), do: JobQueue.count_for_uri(uri, statuses)
 
   @impl true
+  def count_jobs_of_kind(kind), do: JobQueue.count_for_kind(kind)
+
+  @impl true
   def dequeue_job(kinds), do: JobQueue.dequeue(kinds)
 
   @impl true
@@ -809,7 +867,10 @@ defmodule AgentDb.Adapters.SQLite do
   # "The index is unavailable" and "the index holds nothing" are different
   # facts, and only the first of them means vector search cannot be served.
   # Reports the active dim, its vector count, the document count, and whether
-  # URIs are missing from the active table.
+  # URIs are missing from the active table. `reclaimable` counts rows whose URI
+  # the node store no longer holds: drift the read path already makes
+  # unsearchable, reported so reclamation falling behind is visible rather than
+  # the silent leak `harden-node-removal` recorded.
   defp vector_counts(conn, documents) do
     if SQLite.vec_available?(conn) do
       with {:ok, active} <- SQLite.get_active_dim(conn) do
@@ -821,7 +882,8 @@ defmodule AgentDb.Adapters.SQLite do
                active_dim: :unknown,
                vectors: 0,
                documents: documents,
-               needs_backfill: documents > 0
+               needs_backfill: documents > 0,
+               reclaimable: reclaimable_rows(conn)
              }}
 
           dim ->
@@ -835,7 +897,8 @@ defmodule AgentDb.Adapters.SQLite do
                    active_dim: dim,
                    vectors: vectors,
                    documents: documents,
-                   needs_backfill: needs_backfill?(conn, table)
+                   needs_backfill: needs_backfill?(conn, table),
+                   reclaimable: reclaimable_rows(conn)
                  }}
 
               {:error, _} ->
@@ -845,7 +908,8 @@ defmodule AgentDb.Adapters.SQLite do
                    active_dim: dim,
                    vectors: 0,
                    documents: documents,
-                   needs_backfill: documents > 0
+                   needs_backfill: documents > 0,
+                   reclaimable: reclaimable_rows(conn)
                  }}
             end
         end
@@ -857,9 +921,53 @@ defmodule AgentDb.Adapters.SQLite do
          active_dim: :unknown,
          vectors: nil,
          documents: documents,
-         needs_backfill: false
+         needs_backfill: false,
+         reclaimable: nil
        }}
     end
+  end
+
+  # The same predicate `reconcile_orphan_embeddings/1` deletes by, so the number
+  # reported is the number a reclamation pass would reclaim. Counts and deletes
+  # cannot disagree about what drift is.
+  defp reclaimable_rows(conn) do
+    case SQLite.list_vec_dims(conn) do
+      {:ok, dims} ->
+        dims
+        |> Enum.map(fn dim ->
+          case SQLite.query_one(
+                 conn,
+                 "SELECT COUNT(*) FROM \"#{SQLite.vec_table(dim)}\" WHERE uri NOT IN (SELECT uri FROM nodes)",
+                 []
+               ) do
+            {:ok, [n]} -> n
+            _ -> 0
+          end
+        end)
+        |> Enum.sum()
+
+      {:error, _} ->
+        0
+    end
+  end
+
+  @impl true
+  def vector_index_reclaimable do
+    Reader.read(fn conn ->
+      if SQLite.vec_available?(conn) do
+        {:ok, reclaimable_rows(conn)}
+      else
+        {:ok, 0}
+      end
+    end)
+  end
+
+  @impl true
+  def reclaim_vector_index do
+    # Reuses the boot-time reclamation rather than restating it, so there is one
+    # definition of what drift is. Boot keeps running it for stores opened by a
+    # tool that never starts the application; this is the same work on demand.
+    AgentDb.Store.Writer.call(fn conn -> SQLite.reconcile_orphan_embeddings(conn) end)
   end
 
   defp needs_backfill?(conn, table) do
