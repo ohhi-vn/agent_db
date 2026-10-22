@@ -158,16 +158,36 @@ defmodule AgentDb.MemoryLifecycleTest do
     assert {:ok, "prefers Elixir"} = AgentDb.read(@lang)
   end
 
-  test "the gate holds duplicates and near-zero beliefs as candidates" do
+  test "a waiting candidate does not overwrite the active belief's document" do
+    assert {:ok, _} = AgentDb.remember(@lang, "prefers Elixir", confidence: 0.9)
+    assert {:ok, _} = AgentDb.remember(@lang, "prefers Go", confidence: 0.9, candidate: true)
+
+    # The document is what an active belief is read through, and the candidate
+    # is not the active belief yet.
+    assert {:ok, "prefers Elixir"} = AgentDb.read(@lang)
+
+    # Promotion is what makes the candidate current, document included.
+    assert {:ok, _} = AgentDb.promote_memory(@lang)
+    assert {:ok, "prefers Go"} = AgentDb.read(@lang)
+    assert {:ok, [active]} = AgentDb.recall(@lang)
+    assert active.value == "prefers Go"
+  end
+
+  test "the gate holds near-zero beliefs as candidates and lets distinct URIs coexist" do
+    # The same value at a different URI is a different belief, filed in a
+    # different place. Holding it back would make it invisible to recall
+    # without telling the caller it was held back.
     assert {:ok, _} = AgentDb.remember(@name, "ada lovelace", confidence: 0.9)
 
+    alias_uri = "viking://user/memories/profile/alias"
+
     assert {:ok, _} =
-             AgentDb.remember("viking://user/memories/profile/alias", "ada lovelace",
-               confidence: 0.9
-             )
+             AgentDb.remember(alias_uri, "ada lovelace", confidence: 0.9)
 
-    assert {:ok, []} = AgentDb.recall("viking://user/memories/profile/alias")
+    assert {:ok, [_]} = AgentDb.recall(alias_uri)
 
+    # A near-zero belief is the caller's own statement that it is barely
+    # held, so it waits for review.
     assert {:ok, _} =
              AgentDb.remember("viking://user/memories/events/whisper", "barely held",
                confidence: 0.05
@@ -181,6 +201,34 @@ defmodule AgentDb.MemoryLifecycleTest do
              )
 
     assert {:ok, [_]} = AgentDb.recall("viking://user/memories/events/loud")
+  end
+
+  test "the same value at a different URI is retrievable and not held as a candidate" do
+    other = "viking://user/memories/entities/agent-db"
+
+    assert {:ok, _} = AgentDb.remember(@name, "ada lovelace", confidence: 0.9)
+    assert {:ok, _} = AgentDb.remember(other, "ada lovelace", confidence: 0.9)
+
+    assert {:ok, [held]} = AgentDb.recall(other)
+    assert held.value == "ada lovelace"
+    assert held.status == :active
+
+    assert {:ok, []} = AgentDb.pending_memory_candidates()
+  end
+
+  test "re-recording the same value at the same URI leaves one memory and no candidate" do
+    assert {:ok, _} = AgentDb.remember(@name, "ada lovelace", confidence: 0.9)
+    assert {:ok, _} = AgentDb.remember(@name, "ada lovelace", confidence: 0.9)
+
+    assert {:ok, [only]} = AgentDb.recall(@name)
+    assert only.value == "ada lovelace"
+
+    assert {:ok, []} = AgentDb.pending_memory_candidates()
+
+    # The URI keeps its single assertion: an identical re-write neither
+    # supersedes it nor leaves a second one behind.
+    assert {:ok, history} = AgentDb.recall(uri: @name, include_superseded: true)
+    assert length(history) == 1
   end
 
   # -- provider parity: the same lifecycle through the fake provider --
@@ -282,6 +330,96 @@ defmodule AgentDb.MemoryLifecycleTest do
       assert {:error, :embeddings_unavailable} =
                Storage.memory_conflict_pairs("viking://user/memories/preferences")
     end
+
+    test "stored vectors load through the port, active dimension only" do
+      a = "viking://user/memories/preferences/vec-a"
+      b = "viking://user/memories/preferences/vec-b"
+
+      assert :ok = Storage.put_memory(a, "likes Elixir a lot", 0.9, nil)
+      assert :ok = Storage.put_memory(b, "mutes notifications at night", 0.9, nil)
+
+      # Nothing embedded yet: the answer is honestly empty, not an error.
+      assert {:ok, %{}} = Storage.load_memory_vectors([a, b])
+
+      enc = fn vec -> for x <- vec, into: <<>>, do: <<x::float-32>> end
+
+      {:ok, job_id} = Storage.enqueue_job(:embed, %{uri: a, content: ""})
+      {:ok, _} = Storage.dequeue_job([:embed])
+      assert {:ok, :stored} = Storage.put_embedding_result(job_id, a, enc.([1.0, 0.0, 0.0, 0.0]))
+
+      assert {:ok, vectors} = Storage.load_memory_vectors([a, b])
+      assert Map.fetch!(vectors, a) == enc.([1.0, 0.0, 0.0, 0.0])
+      # A URI with no stored vector is absent rather than an error.
+      refute Map.has_key?(vectors, b)
+    end
+
+    test "the document follows the active assertion, not a waiting candidate" do
+      uri = "viking://user/memories/preferences/shell"
+      alias_uri = "viking://user/memories/preferences/editor"
+
+      assert :ok = Storage.put_memory(uri, "prefers Zsh", 0.9, nil)
+
+      # The candidate waits beside the belief, and the URI still reads the
+      # belief it holds.
+      assert :ok = Storage.put_memory(uri, "prefers Fish", 0.9, nil, status: :candidate)
+      assert {:ok, node} = Storage.get_node(uri)
+      assert node.content == "prefers Zsh"
+
+      # Promotion carries the promoted value through the document.
+      assert {:ok, :promoted} = Storage.promote_memory(uri)
+      assert {:ok, promoted} = Storage.get_node(uri)
+      assert promoted.content == "prefers Fish"
+
+      # An identical re-write leaves the URI its single assertion.
+      assert :ok = Storage.put_memory(alias_uri, "prefers Fish", 0.9, nil)
+      assert :ok = Storage.put_memory(alias_uri, "prefers Fish", 0.9, nil)
+
+      assert {:ok, [only]} = Storage.recall_memories(alias_uri, nil, [:active, :superseded])
+      assert only.value == "prefers Fish"
+    end
+
+    test "an enqueue failure leaves no document, assertion, or job behind" do
+      uri = "viking://user/memories/preferences/quality"
+      Storage.stub(:enqueue_job, {:error, :queue_down})
+
+      assert {:error, :queue_down} =
+               Storage.put_memory(uri, "prefers Vim", 0.9, nil,
+                 jobs: [{:embed, %{uri: uri, content: "prefers Vim"}}]
+               )
+
+      assert {:ok, nil} = Storage.get_node(uri)
+      assert {:ok, []} = Storage.recall_memories(uri, nil, [:active, :superseded, :candidate])
+
+      # Standing jobs the store schedules itself are not the memory's; what
+      # must be gone is anything queued for this URI.
+      refute Enum.any?(Storage.recorded_jobs(), &(&1.payload["uri"] == uri))
+    end
+
+    test "recall is bounded and source-scoped through the port options" do
+      base = "viking://user/memories/preferences/fake-bound"
+
+      for i <- 1..3 do
+        assert :ok = Storage.put_memory("#{base}/f#{i}", "fact #{i}", 0.9, "fake-source-a")
+      end
+
+      assert :ok = Storage.put_memory("#{base}/other", "fact other", 0.9, "fake-source-b")
+
+      assert {:ok, bounded} =
+               Storage.recall_memories(base, nil, [:active], top_k: 2, source: "fake-source-a")
+
+      assert length(bounded) == 2
+      assert Enum.all?(bounded, & &1.truncated)
+
+      assert {:ok, [single]} =
+               Storage.recall_memories(base, nil, [:active], source: "fake-source-b")
+
+      assert single.truncated == false
+
+      assert {:ok, []} = Storage.recall_memories(base, nil, [:active], source: "fake-source-c")
+
+      assert {:error, {:invalid_limit, 0}} =
+               Storage.recall_memories(base, nil, [:active], top_k: 0)
+    end
   end
 
   # -- slice 4: decay penalty + promotion-as-suggest --
@@ -328,14 +466,16 @@ defmodule AgentDb.MemoryLifecycleTest do
     assert Fixture.weights() == AgentDb.Application.Memories.blend_weights()
   end
 
-  test "a gated duplicate is suggested through pending and promotes into an ordinary memory" do
+  test "an explicit candidate is suggested through pending and promotes into an ordinary memory" do
     held = "viking://user/memories/profile/name"
     repeat = "viking://user/memories/profile/alias"
 
     assert {:ok, _} = AgentDb.remember(held, "ada lovelace", confidence: 0.9)
-    assert {:ok, _} = AgentDb.remember(repeat, "ada lovelace", confidence: 0.9)
 
-    # The repetition surfaces as a pending suggestion, not an auto-merge.
+    assert {:ok, _} =
+             AgentDb.remember(repeat, "ada lovelace", confidence: 0.9, candidate: true)
+
+    # The candidate waits for review rather than joining the recalled set.
     assert {:ok, [suggested]} = AgentDb.pending_memory_candidates()
     assert suggested.uri == repeat
 

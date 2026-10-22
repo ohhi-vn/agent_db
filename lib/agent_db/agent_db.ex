@@ -107,6 +107,10 @@ defmodule AgentDb do
           | {:error, term()}
   defdelegate layers(uri), to: Documents
 
+  @doc "Reads the L0/L1/L2 layers for several URIs in one store operation."
+  @spec layers_batch([uri()]) :: %{uri() => map()}
+  defdelegate layers_batch(uris), to: Documents
+
   @doc "Lists the names of a URI's direct children."
   @spec list(uri()) :: {:ok, [String.t()]} | {:error, term()}
   defdelegate list(uri), to: Documents
@@ -261,6 +265,18 @@ defmodule AgentDb do
   @doc "Candidates waiting for promotion review. See AgentDb.Application.Memories.pending_candidates/1."
   @spec pending_memory_candidates(keyword()) :: {:ok, [map()]} | {:error, term()}
   defdelegate pending_memory_candidates(opts \\ []), to: Memories, as: :pending_candidates
+
+  @doc "Memory statistics: counts per type and status, pending, never surfaced. See AgentDb.Application.Memories.statistics/0."
+  @spec memory_statistics() :: {:ok, map()} | {:error, term()}
+  defdelegate memory_statistics(), to: Memories, as: :statistics
+
+  @doc "Alias for `memory_statistics/0`."
+  @spec memory_stats() :: {:ok, map()} | {:error, term()}
+  defdelegate memory_stats(), to: Memories, as: :statistics
+
+  @doc "Alias for `memory_statistics/0`."
+  @spec memory_count() :: {:ok, map()} | {:error, term()}
+  defdelegate memory_count(), to: Memories, as: :statistics
 
   @doc "Possible conflicts between active memories. See AgentDb.Application.Memories.conflicts/1."
   @spec memory_conflicts(keyword()) :: {:ok, [map()]} | {:error, term()}
@@ -642,7 +658,8 @@ defmodule AgentDb do
     |> Map.merge(%{
       code_documents: AgentDb.CodeIndex.coverage().documents,
       hex_documents: AgentDb.HexDocs.coverage().documents,
-      hex_packages: AgentDb.HexDocs.coverage().packages
+      hex_packages: AgentDb.HexDocs.coverage().packages,
+      hex_locked: AgentDb.HexDocs.coverage().locked
     })
   end
 

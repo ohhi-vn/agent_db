@@ -84,7 +84,7 @@ The store SHALL store for each document a caller-supplied full content (L2) and 
 - **THEN** fallback derivation treats the whole content as body (existing first-line / first-280-chars behavior)
 
 ### Requirement: Write path persists before cache
-The store SHALL apply every write to SQLite before acknowledging it, and SHALL NOT allow any ETS cache to serve content newer than SQLite state (no cache-ahead-of-disk). Cache state after a write SHALL equal the state a cold cache would produce from SQLite. This obligation SHALL apply to every path that writes document content, including committing a session to a destination URI, and not only to direct document writes.
+The store SHALL apply every write to SQLite before acknowledging it, and SHALL NOT allow any ETS cache to serve content newer than SQLite state (no cache-ahead-of-disk). Cache state after a write SHALL equal the state a cold cache would produce from SQLite. This obligation SHALL apply to every path that writes document content, including committing a session to a destination URI, and not only to direct document writes. A read that races a concurrent write to the same URI SHALL NOT leave the cache holding content older than what the write produced, so a subsequent read of that URI returns the written content.
 
 #### Scenario: Cache matches disk after write
 - **WHEN** a caller writes a document and immediately reads it through the cached path
@@ -95,6 +95,11 @@ The store SHALL apply every write to SQLite before acknowledging it, and SHALL N
 - **AND** commits a session to that same destination URI, changing its content
 - **THEN** a subsequent read of that URI returns the committed content
 - **AND** that read returns the same content as a read through the SQLite fallback path
+
+#### Scenario: A read racing a write does not leave stale content cached
+- **WHEN** a read of a URI is in flight while a write to that URI completes
+- **THEN** the cache does not afterwards hold the pre-write content for that URI
+- **AND** a subsequent read of that URI returns the written content
 
 ### Requirement: Keyword search
 The store SHALL provide case-insensitive substring keyword search over document content and summaries, optionally scoped to a subtree URI prefix, returning matching URIs with their matched document data. Keyword results SHALL be bounded by the requested `:top_k` (default 10, maximum 200), matching the `search/2` contract, and the bound SHALL be applied in storage rather than after materializing every match; results SHALL be returned in a deterministic order. A `:top_k` outside the accepted range SHALL return `{:error, {:invalid_limit, value}}` rather than fall back to a default, because a default would silently answer a different question than the one asked. This bounding is a breaking change for a caller that relied on an unbounded keyword result set. The store SHALL ALSO provide vector similarity search (see `vector-search` capability) and hybrid search combining both signals.
@@ -236,6 +241,7 @@ The store SHALL perform all core operations locally with no mandatory external d
 - **WHEN** a model failed to load because it was unavailable
 - **THEN** later requests that do not require that model are still served normally
 - **AND** a later request retries the load rather than inheriting a permanently broken state
+
 ### Requirement: Async write acknowledgement
 The store SHALL persist a document and all required durable background jobs for that write as one storage outcome before acknowledging success. The store SHALL acknowledge a successful write (`write/3`) before embedding generation and LLM summarization complete. Background jobs SHALL process embedding and summarization asynchronously. Readers SHALL see progressively enhanced content: content (L2) immediately, then abstract/overview (L0/L1) once generated, then vector searchability once embedded. If persistence or enqueueing any required job fails, the operation SHALL return an error and SHALL leave the prior document state, cache state, and queue state unchanged. A caller that has asked for the work to be completed before the write returns SHALL be told which of the three outcomes occurred: the work completed, the work failed, or the work is still outstanding. A failed job SHALL NOT be reported to a synchronous caller as though the work had completed.
 
@@ -272,6 +278,7 @@ The store SHALL persist a document and all required durable background jobs for 
 - **WHEN** a caller writes with `async: false` and the background jobs have not finished within the wait
 - **THEN** `write/3` reports that the work is still outstanding
 - **AND** it does not report success
+
 ### Requirement: Background job processing
 The store SHALL maintain a durable job queue (SQLite-backed) for embedding generation and summarization tasks. Jobs SHALL be processed by a background worker pool. Job processing SHALL survive restarts: pending jobs SHALL resume after restart. Failed jobs SHALL be retried with exponential backoff. The retry budget SHALL be reserved for work that can succeed on retry: a job deferred because a model is still loading SHALL be rescheduled without consuming an attempt. A deferred job SHALL remain distinguishable from a completed one and from a failed one.
 
@@ -296,6 +303,7 @@ The store SHALL maintain a durable job queue (SQLite-backed) for embedding gener
 - **WHEN** a job has exhausted its attempts and is marked failed
 - **AND** another job is deferred because a model is loading
 - **THEN** the two jobs are reported as different states
+
 ### Requirement: Configuration for models and async behavior
 The store SHALL be configurable for: embedding model name/URL, LLM model name/URL, CPU/GPU backend, async vs sync write mode, job worker pool size, model cache directory, HTTP API enablement and port, and the wait applied to a model-dependent request that is made while the model is still loading. A configured CPU/GPU backend SHALL take effect: the models the store loads SHALL be placed on the configured backend rather than on a default chosen independently of that configuration. The configured wait SHALL be honoured, and a caller SHALL never be blocked indefinitely on a model that is still loading.
 
@@ -314,6 +322,7 @@ The store SHALL be configurable for: embedding model name/URL, LLM model name/UR
 - **WHEN** a wait is configured for model-dependent requests
 - **THEN** a request made while the model is loading waits no longer than that
 - **AND** a longer or shorter wait changes how long the caller is held, not whether the model eventually loads
+
 ### Requirement: Bounded path discovery
 The store SHALL provide `find/2` to discover files and directories whose URI path (excluding the `viking://` scheme) contains a non-empty literal query of at most 256 characters, case-insensitively. A caller MAY scope the search to a valid URI; results SHALL include the scope node and its descendants, match only complete URI segment boundaries for scope membership, and be returned in deterministic URI order without document content. The operation SHALL return at most the requested `limit` (default 50, maximum 200), reject invalid limits and query lengths, and return an empty list when nothing matches. Query text SHALL be treated literally, including SQL wildcard characters.
 
@@ -380,7 +389,7 @@ The system SHALL isolate a failure raised inside a single storage write callback
 - **AND** the shared writer remains available for other calls
 
 ### Requirement: Bounded content inspection and listing reads
-The system SHALL apply the caller's `limit` inside storage for content inspection (`grep`), memory lists, and session lists, and SHALL NOT materialize unbounded rows or document blobs before truncating. Removal of a subtree and recent-error reads SHALL NOT scan entire in-memory tables row by row on the hot path.
+The system SHALL apply the caller's `limit` inside storage for content inspection (`grep`), memory lists, and session lists, and SHALL NOT materialize unbounded rows or document blobs before truncating. Removal of a subtree and recent-error reads SHALL NOT scan entire in-memory tables row by row on the hot path. A subtree-scoped count, enable, disable, or group operation SHALL NOT require a scan of every row in the store.
 
 #### Scenario: Large grep honors limit without loading everything
 - **WHEN** thousands of lines match a content query with `limit: 50`
@@ -391,6 +400,15 @@ The system SHALL apply the caller's `limit` inside storage for content inspectio
 - **WHEN** many memories or sessions exist and the caller lists them
 - **THEN** the result is bounded and ordered deterministically
 - **AND** the store does not load the full table to answer the call
+
+#### Scenario: Removing a subtree does not scan the whole cache
+- **WHEN** a subtree is removed
+- **THEN** the cache entries beneath it are dropped
+- **AND** the drop does not enumerate every key of every cache table
+
+#### Scenario: A subtree operation does not scan the whole store
+- **WHEN** a subtree-scoped count, enable, disable, or group operation runs over a store holding many documents
+- **THEN** the operation is answered without reading every document row
 
 ### Requirement: Bounded durable retry with attempt preservation
 The system SHALL bound retries for poison-pill jobs: a job that fails for a reason that cannot succeed on retry SHALL be marked failed after its budget, and a restart SHALL preserve attempt history rather than resetting it to zero. A job deferred only because a model is still loading SHALL NOT consume the retry budget. A queued job whose kind is unknown SHALL NOT accumulate silently as permanent pending work; it SHALL be classified and surfaced as failed with its reason.
@@ -524,3 +542,50 @@ The deterministic overview fallback SHALL truncate at the end of a word rather t
 #### Scenario: Short body is returned whole
 - **WHEN** a document's body is shorter than the overview bound
 - **THEN** the fallback returns the whole body without trimming
+
+### Requirement: The read cache is bounded and observable
+The store's in-memory read cache SHALL be bounded: it SHALL NOT grow without limit for the lifetime of a process, and entries that are no longer useful SHALL be eligible for eviction. The store SHALL report the cache's size and its hit and miss counts, so an operator can tell whether the cache is earning the memory it holds. The cache SHALL continue to serve the same content a cold cache would produce from SQLite.
+
+#### Scenario: The cache does not grow without limit
+- **WHEN** a long-running process reads many distinct documents
+- **THEN** the cache's retained size stays within a fixed bound
+- **AND** the least useful entries are evicted rather than accumulating
+
+#### Scenario: Cache effectiveness is reportable
+- **WHEN** an operator asks about the cache
+- **THEN** the store reports how many reads were served from the cache and how many were not
+
+#### Scenario: Eviction does not change what a read returns
+- **WHEN** a cached entry has been evicted
+- **THEN** reading that URI still returns the same content as a cold read would
+
+### Requirement: A write is not abandoned at a default timeout
+A store write SHALL NOT be abandoned because a default call timeout elapsed while the write was still proceeding. When a write takes longer than a caller-supplied bound, the store SHALL report a retryable classified error and the write's outcome SHALL be unambiguous to the caller: the caller SHALL NOT be told that a write failed while the write in fact landed.
+
+#### Scenario: A slow write reports rather than silently failing
+- **WHEN** a write exceeds the caller's time bound
+- **THEN** the store reports a classified retryable error
+- **AND** it does not report a failure for a write that proceeded
+
+#### Scenario: The caller learns the write's outcome
+- **WHEN** a write times out at the caller's bound
+- **THEN** the caller can determine whether the write landed
+- **AND** a later read of the written URI is consistent with what the caller was told
+
+#### Scenario: A contended write retries within a bound
+- **WHEN** the store is contended and the database reports busy
+- **THEN** the write waits and retries with growing delay within a bounded timeout rather than failing immediately
+- **AND** a write that still cannot proceed returns a retryable classified error, not a crash
+
+### Requirement: Failure of a memory operation is classified and reported
+A memory operation that fails SHALL report a reason drawn from the store's shared error classification, and SHALL NOT report the failure as an empty result. A memory operation that cannot be evaluated because a model or the vector index is unavailable SHALL report that the evaluation could not be performed.
+
+#### Scenario: A storage failure is classified
+- **WHEN** a memory operation fails because the store cannot answer
+- **THEN** the operation reports a classified failure
+- **AND** it does not return an empty result set
+
+#### Scenario: An unavailable model is reported, not silent
+- **WHEN** a memory operation needs a model that is unavailable
+- **THEN** the operation reports that the work could not be performed
+- **AND** it does not report that nothing was found

@@ -190,10 +190,22 @@ defmodule AgentDbWeb.Admin.SkillsLive do
 
     case Context.list_all_documents(opts) do
       {:ok, %{data: rows, meta: meta}} ->
+        layers_by_uri = Context.get_layers_batch(Enum.map(rows, & &1.uri))
+
         %{
           uri: uri,
           files:
-            Enum.map(rows, fn row -> %{uri: row.uri, layers: Context.get_layers(row.uri)} end),
+            Enum.map(rows, fn row ->
+              %{
+                uri: row.uri,
+                layers:
+                  Map.get(layers_by_uri, row.uri, %{
+                    l0: %{text: "", source: :unavailable, chars: 0},
+                    l1: %{text: "", source: :unavailable, chars: 0},
+                    l2: %{text: "", source: :unavailable, chars: 0}
+                  })
+              }
+            end),
           meta: meta
         }
 
@@ -231,9 +243,6 @@ defmodule AgentDbWeb.Admin.SkillsLive do
 
       {:ok, %{updated: updated, failed: failed}} ->
         "#{verb} #{updated} skill(s), #{failed} failed"
-
-      {:error, reason} ->
-        "Bulk action failed: #{Observability.error_message(reason)}"
     end
   end
 
@@ -253,9 +262,6 @@ defmodule AgentDbWeb.Admin.SkillsLive do
 
       {:ok, %{updated: updated, failed: failed}} ->
         "Set group for #{updated} skill(s) to #{group_word(tag)}, #{failed} failed"
-
-      {:error, reason} ->
-        "Bulk action failed: #{Observability.error_message(reason)}"
     end
   end
 

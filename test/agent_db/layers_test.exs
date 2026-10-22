@@ -10,9 +10,18 @@ defmodule AgentDb.LayersTest do
   use ExUnit.Case, async: false
 
   setup context do
+    Application.put_env(:agent_db, :data_dir, AgentDb.Config.test_data_dir())
+    AgentDb.StorageContract.Helpers.restart_app()
+    AgentDb.StorageContract.Helpers.stop_workers()
     AgentDb.Cache.clear()
     prefix = "viking://resources/layers/#{context.line}"
-    on_exit(fn -> AgentDb.rm(prefix) end)
+
+    on_exit(fn ->
+      AgentDb.rm(prefix)
+      Application.delete_env(:agent_db, :data_dir)
+      AgentDb.StorageContract.Helpers.restart_app()
+    end)
+
     {:ok, prefix: prefix}
   end
 
@@ -63,6 +72,12 @@ defmodule AgentDb.LayersTest do
     test "a frontmatter identity is the abstract, not the YAML block" do
       uri = "viking://user/skill-fixture/skills/layers/SKILL.md"
 
+      # A summary a past run stored at this URI would shadow the frontmatter
+      # with generated text: the fixture must start from nothing. Removal is
+      # durable against summary work still in flight for it, so the leftover
+      # of both this run and any earlier one is dead before the write.
+      _ = AgentDb.rm(uri)
+
       :ok =
         AgentDb.write(
           uri,
@@ -71,6 +86,9 @@ defmodule AgentDb.LayersTest do
 
       layers = AgentDb.layers(uri)
       assert layers.abstract.text == "layer-fixture — A fixture skill for the layer reads"
+
+      # And nothing is left behind for the next run to trip on.
+      on_exit(fn -> AgentDb.rm(uri) end)
     end
   end
 end

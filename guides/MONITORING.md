@@ -17,7 +17,7 @@ The `/admin` console is a real-time LiveView dashboard at `http://localhost:6060
 | **Queue** | Per-status counts (`pending`/`running`/`done`/`failed`), oldest pending age, failed jobs with kind, URI, attempts, classified reason | `AgentDb.queue_stats/0`, `AgentDb.queue_detail/1` |
 | **Index** | Vector index row count vs indexed documents; code index documents; Hex-doc packages locked/indexed | `AgentDb.index_coverage/0` |
 | **Recent Errors** | Bounded newest-first list: operation + classified reason only | `AgentDb.recent_errors/1` |
-| **Recent Changes** | Feed of URI, kind (`written`/`removed`/`replaced`/`committed`), monotonic version | PubSub subscription |
+| **Memories** | Memory counts per type and status; memories waiting for review; promote/reject/forget actions | `AgentDb.memory_statistics/0`, `AgentDb.pending_memory_candidates/1` |
 
 ### Using the Console
 
@@ -48,9 +48,9 @@ AgentDb emits `:telemetry` events with **bounded dimensions only** — never URI
 
 | Event | When Emitted | Measurements | Metadata (Dimensions) |
 |-------|--------------|--------------|----------------------|
-| `[:agent_db, :operation, :stop]` | Public operation completes (success or error) | `duration_ms` | `operation` (atom), `outcome` (`:ok`/`:error`), `kind` (optional), `role` (optional) |
-| `[:agent_db, :job, :stop]` | Background job completes (claimed → done/failed) | `queue_wait_ms`, `execution_ms` | `kind` (`:embed`/`:summarize_abstract`/`:summarize_overview`), `outcome` (`:ok`/`:error`) |
-| `[:agent_db, :model, :stop]` | Model load or inference completes | `duration_ms` | `role` (`:embedding`/`:llm`), `outcome` (`:ok`/`:error`) |
+| `[:agent_db, :operation, :stop]` | Public operation completes (success or error) | `duration_ms` | `operation` (atom), `outcome` (`:ok`/`:error`), `code` (classified reason on failure), `kind` (optional), `role` (optional) |
+| `[:agent_db, :job, :stop]` | Background job completes (claimed → done/failed) | `queue_wait_ms`, `execution_ms` | `kind` (`:embed`/`:summarize_abstract`/`:summarize_overview`), `outcome` (`:ok`/`:error`/`:deferred`/`:failed`/`:discarded`), `code` (classified reason on failure) |
+| `[:agent_db, :model, :stop]` | Model load or inference completes | `duration_ms` | `role` (`:embedding`/`:llm`), `outcome` (`:ok`/`:error`), `code` (classified reason on failure) |
 
 ### Retrieval Pipeline Stages (Child Spans)
 
@@ -103,6 +103,17 @@ end
 - Model inference latency by `role` + `outcome`
 - Error rate by `operation` + `outcome`
 
+### Sink Statistics Surface
+
+The store keeps a bounded in-memory summary of everything it has measured, exposed through `AgentDb.operation_stats/0` (and `AgentDb.Observability.operation_stats/0`):
+
+- **Counts** per `{family, dimension}` and outcome, so each operation, job kind, and model role reports how many times it succeeded, failed, was deferred, was discarded, or errored.
+- **Latency percentiles** (p50, p95, p99, min, max) over a fixed-length ring of duration samples, retained for successes as well as failures, so a slow-but-successful path is visible.
+- **Error rate** per `{family, dimension}`: failures divided by total observations.
+- **Recent failures** (`AgentDb.recent_errors/1`): a bounded newest-first ring of `{family, operation, role, reason, duration_ms, at}`, where `reason` is the classified code.
+
+The rings are bounded: at most `AgentDb.Observability.Sink.max_latency_samples/0` (100) duration samples per tracked operation, and at most `AgentDb.Observability.Sink.max_tracked_operations/0` (64) distinct operations. When the operation bound is exceeded the oldest tracked operation -- counters, samples, and recent failures included -- is dropped, so a store that runs for months keeps a fixed diagnostic footprint. Recent failures are capped at `AgentDb.Observability.Sink.max_errors/0` (50).
+
 ## Structured Logs
 
 All operational failures and background-job state transitions are logged as structured events via `Logger` with the `agent_db` metadata key.
@@ -115,8 +126,9 @@ All operational failures and background-job state transitions are logged as stru
 | `operation` | Operation kind | `:embed`, `:summarize_abstract`, `:write`, `:search` |
 | `kind` | Job/operation subtype | `:embed`, `:summarize_overview` |
 | `role` | Model role | `:embedding`, `:llm` |
-| `outcome` | `:ok` or `:error` | `:error` |
+| `outcome` | `:ok`, `:error`, `:deferred`, `:failed`, or `:discarded` | `:error` |
 | `reason` | Classified error code (see Error Taxonomy) | `:model_load_failed`, `:download_failed` |
+| `code` | Classified error code on the measurement (see Error Taxonomy) | `:model_load_failed`, `:download_failed` |
 | `trace_id` | W3C traceparent trace_id (if available) | `"4bf92f3577b34da6a3ce929d0e0e4736"` |
 | `job_id` | Background job ID (if applicable) | `12345` |
 

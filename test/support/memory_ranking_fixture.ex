@@ -12,7 +12,13 @@ defmodule AgentDb.Test.Support.MemoryRankingFixture do
   # (similarity-only fails) and a low-confidence target beside a confident
   # token-sharing distractor (confidence-only fails).
 
-  @type candidate :: %{uri: String.t(), value: String.t(), confidence: float(), id: integer()}
+  @type candidate :: %{
+          uri: String.t(),
+          value: String.t(),
+          confidence: float(),
+          importance: float(),
+          id: integer()
+        }
 
   @doc "The twenty memories: `{uri, value, confidence}`."
   @spec memories() :: [{String.t(), String.t(), float()}]
@@ -108,13 +114,29 @@ defmodule AgentDb.Test.Support.MemoryRankingFixture do
 
   def cosine(_a, _b), do: 0.0
 
+  @w_conf 0.5
+  @w_sim 0.5
+  @exact_boost 0.15
+  @w_decay 0.1
+  @w_importance 0.1
+  @default_importance 0.5
+  @stale_after_ms 30 * 24 * 60 * 60 * 1_000
+
   @doc "Candidates as maps with stable ids."
   @spec candidates() :: [candidate()]
   def candidates do
+    importances = importances()
+
     memories()
     |> Enum.with_index(1)
     |> Enum.map(fn {{uri, value, conf}, id} ->
-      %{id: id, uri: uri, value: value, confidence: conf}
+      %{
+        id: id,
+        uri: uri,
+        value: value,
+        confidence: conf,
+        importance: Map.get(importances, value, @default_importance)
+      }
     end)
   end
 
@@ -133,25 +155,33 @@ defmodule AgentDb.Test.Support.MemoryRankingFixture do
     |> Enum.map(&elem(&1, 1))
   end
 
-  @w_conf 0.5
-  @w_sim 0.5
-  @exact_boost 0.15
-  @w_decay 0.1
-  @stale_after_ms 30 * 24 * 60 * 60 * 1_000
-
   @doc "Blend weights, mirroring the production recall formula."
-  @spec weights() :: {float(), float(), float(), float()}
-  def weights, do: {@w_conf, @w_sim, @exact_boost, @w_decay}
+  @spec weights() :: {float(), float(), float(), float(), float()}
+  def weights, do: {@w_conf, @w_sim, @exact_boost, @w_decay, @w_importance}
+
+  @doc "Importance per memory value. Absent reads 0.5, the documented default."
+  @spec importances() :: %{String.t() => float()}
+  def importances do
+    # One row differs, and only where no competing case can flip on it: the
+    # demo memory matters less than its peers, and it shares no query scope
+    # with memory whose ranking could react. Everything else stays default.
+    %{"tried Go once for a demo" => 0.3}
+  end
 
   @doc "Deterministic blend of confidence and normalized similarity."
   @spec blend_score(float(), float(), boolean()) :: float()
   def blend_score(confidence, sim01, exact?), do: blend_score(confidence, sim01, exact?, 0.0)
 
-  @doc "Blend with a staleness penalty, mirroring production decay."
+  @doc "Blend with a staleness penalty at the default importance."
   @spec blend_score(float(), float(), boolean(), float()) :: float()
-  def blend_score(confidence, sim01, exact?, staleness01) do
+  def blend_score(confidence, sim01, exact?, staleness01),
+    do: blend_score(confidence, sim01, exact?, staleness01, @default_importance)
+
+  @doc "Blend with staleness and importance, mirroring production decay."
+  @spec blend_score(float(), float(), boolean(), float(), float()) :: float()
+  def blend_score(confidence, sim01, exact?, staleness01, importance) do
     @w_conf * confidence + @w_sim * sim01 + if(exact?, do: @exact_boost, else: 0.0) -
-      @w_decay * staleness01
+      @w_decay * staleness01 + @w_importance * importance
   end
 
   @doc "Staleness of a surfaced time, mirroring production decay."
@@ -186,12 +216,14 @@ defmodule AgentDb.Test.Support.MemoryRankingFixture do
       sim = cosine(query_vec, Map.fetch!(vecs, row.value))
       sim01 = (sim + 1.0) / 2.0
       exact? = String.contains?(String.downcase(row.value), needle)
+      importance = Map.get(row, :importance, @default_importance)
 
       {blend_score(
          row.confidence,
          sim01,
          exact?,
-         staleness(Map.get(row, :last_surfaced_at), now_ms)
+         staleness(Map.get(row, :last_surfaced_at), now_ms),
+         importance
        ), row}
     end)
     |> Enum.sort_by(fn {score, row} -> {-score, -row.confidence, row.uri, row.id} end)

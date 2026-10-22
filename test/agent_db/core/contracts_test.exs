@@ -28,6 +28,7 @@ defmodule AgentDb.Core.ContractsTest do
       for operation <- [
             :child_specs,
             :get_node,
+            :get_nodes,
             :put_document,
             :list_children,
             :remove_subtree,
@@ -45,7 +46,9 @@ defmodule AgentDb.Core.ContractsTest do
             :put_commit,
             :put_memory,
             :recall_memories,
+            :load_memory_vectors,
             :memory_recorded?,
+            :memory_stats,
             :enqueue_job,
             :cancel_jobs,
             :count_jobs,

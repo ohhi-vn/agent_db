@@ -307,7 +307,7 @@ defmodule AgentDb.ML.ModelManager do
 
     duration = System.monotonic_time(:millisecond) - start
     outcome = if match?({:ok, _}, result), do: :ok, else: :error
-    AgentDb.Observability.emit_model(role, outcome, duration)
+    AgentDb.Observability.emit_model(role, outcome, duration, failure_reason(result))
 
     {result, duration}
   end
@@ -416,10 +416,15 @@ defmodule AgentDb.ML.ModelManager do
 
     duration = System.monotonic_time(:millisecond) - start
     outcome = if match?({:ok, _}, result), do: :ok, else: :error
-    AgentDb.Observability.emit_model(role, outcome, duration)
+    AgentDb.Observability.emit_model(role, outcome, duration, failure_reason(result))
 
     {result, duration}
   end
+
+  # The reason behind a failed load or a failed inference call, for the
+  # measurement's code. A success carries none.
+  defp failure_reason({:error, reason}), do: reason
+  defp failure_reason(_), do: nil
 
   defp load_embedding_model(config) do
     model_id = config.embedding_model

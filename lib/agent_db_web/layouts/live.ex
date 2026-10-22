@@ -29,6 +29,9 @@ defmodule AgentDbWeb.Layouts do
   # shares one navigation and the active entry follows the page's `@active`.
   # The header title is derived from `@active` so no page needs a new assign.
   def admin(assigns) do
+    sidebar = Map.get(assigns, :sidebar, "shown")
+    assigns = Map.put(assigns, :sidebar, sidebar)
+
     ~H"""
     <!DOCTYPE html>
     <html lang="en">
@@ -41,13 +44,14 @@ defmodule AgentDbWeb.Layouts do
         <script defer phx-track-static type="text/javascript" src={AgentDbWeb.Endpoint.static_path("/assets/app.js")}></script>
       </head>
       <body class="bg-gray-50">
-        <div id="admin-shell" data-sidebar="shown" class="flex min-h-screen flex-col">
+        <div id="admin-shell" data-sidebar={@sidebar} class="flex min-h-screen flex-col">
           <header class="admin-header flex items-center gap-3 bg-gradient-to-r from-indigo-700 via-blue-700 to-sky-600 px-4 py-3 text-white shadow">
             <button
               id="sidebar-toggle"
               type="button"
+              phx-click="toggle_sidebar"
               aria-controls="admin-sidebar"
-              aria-expanded="true"
+              aria-expanded={if (@sidebar || "shown") == "hidden", do: "false", else: "true"}
               aria-label="Toggle navigation sidebar"
               class="rounded p-2 text-white hover:bg-white/15 focus:outline-none focus:ring-2 focus:ring-white/70"
             >
@@ -63,7 +67,7 @@ defmodule AgentDbWeb.Layouts do
             <h1 class="text-sm font-medium text-white"><%= admin_title(@active) %></h1>
           </header>
           <div class="flex min-h-0 flex-1">
-            <aside id="admin-sidebar" class="admin-sidebar w-56 shrink-0 border-r border-gray-200 bg-white">
+            <aside id="admin-sidebar" class={["admin-sidebar w-56 shrink-0 border-r border-gray-200 bg-white", (@sidebar || "shown") == "hidden" && "hidden"]}>
               <div class="border-b border-gray-100 px-4 py-3 text-xs font-semibold uppercase tracking-wider text-gray-500">
                 Console
               </div>
@@ -89,5 +93,6 @@ defmodule AgentDbWeb.Layouts do
   defp admin_title(:storage), do: "Storage"
   defp admin_title(:skills), do: "Skills"
   defp admin_title(:sessions), do: "Sessions"
+  defp admin_title(:memories), do: "Memories"
   defp admin_title(_), do: "Overview"
 end

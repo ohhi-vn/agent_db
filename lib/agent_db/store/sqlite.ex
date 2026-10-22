@@ -81,6 +81,8 @@ defmodule AgentDb.Store.SQLite do
   @doc "Prepares, binds, and steps a write statement; releases the statement."
   @spec exec_write(conn(), String.t(), list()) :: ok_err()
   def exec_write(conn, sql, args \\ []) do
+    count_statement()
+
     case Sqlite3.prepare(conn, sql) do
       {:ok, stmt} ->
         try do
@@ -185,6 +187,8 @@ defmodule AgentDb.Store.SQLite do
   @doc "Runs a SELECT and collects all rows as lists of column values."
   @spec query(conn(), String.t(), list()) :: {:ok, [list()]} | {:error, term()}
   def query(conn, sql, args \\ []) do
+    count_statement()
+
     case Sqlite3.prepare(conn, sql) do
       {:ok, stmt} ->
         try do
@@ -221,6 +225,72 @@ defmodule AgentDb.Store.SQLite do
     do: collect_rows(conn, stmt, [row | acc], Sqlite3.step(conn, stmt))
 
   defp collect_rows(_conn, _stmt, _acc, {:error, _} = err), do: err
+
+  # -- statement probe --
+
+  # A caller verifying that a read stays inside a small number of queries must
+  # be able to see the count, and exqlite offers no statement hook. This is the
+  # one diagnostic affordance: after `start_statement_probe/0`, the calling
+  # process's statements through this module are counted in a public ETS
+  # table. With no probe open the accounting costs one ETS lookup per
+  # statement and nothing is recorded; pragma and DDL statements through
+  # `exec/2` are not counted, only the prepared statements reads and writes
+  # carry.
+  @probe_table :agent_db_store_sqlite_statements
+
+  @doc "Starts counting this process's statements through this module."
+  @spec start_statement_probe() :: :ok
+  def start_statement_probe do
+    if :ets.whereis(@probe_table) == :undefined do
+      _ = :ets.new(@probe_table, [:named_table, :public])
+    end
+
+    :ok
+  end
+
+  @doc "How many statements `pid` has served through this module."
+  @spec statement_count(pid() | :all) :: non_neg_integer() | %{pid() => non_neg_integer()}
+  def statement_count(pid) when is_pid(pid) do
+    case :ets.whereis(@probe_table) do
+      :undefined ->
+        0
+
+      tid ->
+        case :ets.lookup(tid, pid) do
+          [{^pid, count}] -> count
+          _ -> 0
+        end
+    end
+  end
+
+  def statement_count(:all) do
+    case :ets.whereis(@probe_table) do
+      :undefined -> %{}
+      tid -> :ets.tab2list(tid) |> Map.new()
+    end
+  end
+
+  @doc "Stops the statement probe and drops its counts."
+  @spec stop_statement_probe() :: :ok
+  def stop_statement_probe do
+    case :ets.whereis(@probe_table) do
+      :undefined -> :ok
+      tid -> :ets.delete(tid)
+    end
+
+    :ok
+  end
+
+  defp count_statement do
+    case :ets.whereis(@probe_table) do
+      :undefined ->
+        :ok
+
+      tid ->
+        _ = :ets.update_counter(tid, self(), 1, {self(), 0})
+        :ok
+    end
+  end
 
   @max_vec_dim 8192
   @max_vec_tables 16
@@ -503,10 +573,23 @@ defmodule AgentDb.Store.SQLite do
 
   # Indexes over the node management metadata. Created after `add_missing_columns`
   # (not in `base_ddl`) because the columns may not exist yet on an older
-  # database when the base DDL runs.
+  # database when the base DDL runs. The provenance index rides with them: a
+  # source-scoped recall is an index seek, not a scan of every assertion.
   defp ensure_node_meta_indexes(conn) do
     with :ok <- exec(conn, "CREATE INDEX IF NOT EXISTS idx_nodes_enabled ON nodes(enabled)"),
-         :ok <- exec(conn, "CREATE INDEX IF NOT EXISTS idx_nodes_group ON nodes(group_tag)") do
+         :ok <- exec(conn, "CREATE INDEX IF NOT EXISTS idx_nodes_group ON nodes(group_tag)"),
+         :ok <-
+           exec(
+             conn,
+             "CREATE INDEX IF NOT EXISTS idx_nodes_uri_nocase ON nodes(uri COLLATE NOCASE)"
+           ),
+         :ok <-
+           exec(
+             conn,
+             "CREATE INDEX IF NOT EXISTS idx_memory_meta_uri_nocase ON memory_meta(uri COLLATE NOCASE)"
+           ),
+         :ok <-
+           exec(conn, "CREATE INDEX IF NOT EXISTS idx_memory_meta_source ON memory_meta(source)") do
       :ok
     end
   end

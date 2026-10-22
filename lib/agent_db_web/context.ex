@@ -87,6 +87,22 @@ defmodule AgentDbWeb.Context do
     end
   end
 
+  @doc "Reads several documents' layers in one store operation."
+  def get_layers_batch(uris) when is_list(uris) do
+    batch = AgentDb.layers_batch(uris)
+
+    Map.new(uris, fn uri ->
+      case Map.get(batch, uri) do
+        nil ->
+          unavailable = %{text: "", source: :unavailable, chars: 0}
+          {uri, %{l0: unavailable, l1: unavailable, l2: unavailable}}
+
+        layers ->
+          {uri, %{l0: layers.abstract, l1: layers.overview, l2: layers.content}}
+      end
+    end)
+  end
+
   @doc "Writes a document, creating it or replacing it."
   @spec put_document(String.t(), String.t(), keyword()) :: :ok | {:error, term()}
   def put_document(uri, content, opts \\ []), do: AgentDb.write(uri, content, opts)
@@ -240,6 +256,26 @@ defmodule AgentDbWeb.Context do
   @doc "How much of the store's content each index covers."
   @spec index_coverage() :: map()
   def index_coverage, do: AgentDb.index_coverage()
+
+  @doc "Memory statistics: counts per type and status, pending, never surfaced."
+  @spec memory_statistics() :: {:ok, map()} | {:error, term()}
+  def memory_statistics, do: AgentDb.memory_statistics()
+
+  @doc "Memories waiting for review."
+  @spec pending_memory_candidates(keyword()) :: {:ok, [map()]} | {:error, term()}
+  def pending_memory_candidates(opts \\ []), do: AgentDb.pending_memory_candidates(opts)
+
+  @doc "Promotes a waiting memory candidate."
+  @spec promote_memory(String.t()) :: {:ok, String.t()} | {:error, term()}
+  def promote_memory(uri), do: AgentDb.promote_memory(uri)
+
+  @doc "Rejects a waiting memory candidate."
+  @spec reject_memory_candidate(String.t()) :: :ok | {:error, term()}
+  def reject_memory_candidate(uri), do: AgentDb.reject_memory_candidate(uri)
+
+  @doc "Removes a memory and its provenance."
+  @spec forget_memory(String.t()) :: :ok | {:error, term()}
+  def forget_memory(uri), do: AgentDb.forget(uri)
 
   @doc "A bounded, read-only view of the BEAM runtime."
   @spec runtime_snapshot() :: map()

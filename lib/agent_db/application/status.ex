@@ -3,6 +3,7 @@ defmodule AgentDb.Application.Status do
 
   # What the store can report about itself.
 
+  alias AgentDb.Observability
   alias AgentDb.Runtime
 
   @doc """
@@ -43,8 +44,8 @@ defmodule AgentDb.Application.Status do
   @spec queue() :: map()
   def queue do
     case Runtime.storage().queue_stats() do
-      {:ok, stats} -> stats
-      {:error, _} -> %{}
+      {:ok, stats} -> Map.put(stats, :available, true)
+      {:error, reason} -> %{available: false, reason: Observability.classify_reason(reason)}
     end
   end
 
@@ -59,8 +60,16 @@ defmodule AgentDb.Application.Status do
   @spec queue_detail(pos_integer()) :: map()
   def queue_detail(limit \\ 20) do
     case Runtime.storage().queue_detail(limit) do
-      {:ok, detail} -> detail
-      {:error, _} -> %{oldest_pending_ms: nil, failed: [], available: false}
+      {:ok, detail} ->
+        Map.put(detail, :available, true)
+
+      {:error, reason} ->
+        %{
+          oldest_pending_ms: nil,
+          failed: [],
+          available: false,
+          reason: Observability.classify_reason(reason)
+        }
     end
   end
 
@@ -76,10 +85,18 @@ defmodule AgentDb.Application.Status do
   def storage do
     case Runtime.storage().stats() do
       {:ok, stats} ->
-        stats
+        Map.put(stats, :available, true)
 
-      {:error, _} ->
-        %{documents: 0, directories: 0, by_top_subtree: %{}, db_bytes: nil, wal_bytes: nil}
+      {:error, reason} ->
+        %{
+          available: false,
+          reason: Observability.classify_reason(reason),
+          documents: nil,
+          directories: nil,
+          by_top_subtree: %{},
+          db_bytes: nil,
+          wal_bytes: nil
+        }
     end
   end
 
@@ -97,8 +114,17 @@ defmodule AgentDb.Application.Status do
   @spec index_coverage() :: map()
   def index_coverage do
     case Runtime.vector_stats() do
-      {:ok, vector} -> vector
-      {:error, _} -> %{available: false, vectors: nil, documents: 0, reclaimable: nil}
+      {:ok, vector} ->
+        vector
+
+      {:error, reason} ->
+        %{
+          available: false,
+          reason: Observability.classify_reason(reason),
+          vectors: nil,
+          documents: 0,
+          reclaimable: nil
+        }
     end
   end
 

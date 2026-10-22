@@ -41,6 +41,7 @@ defmodule AgentDbWeb.Router do
       live("/admin/storage", Admin.StorageLive, :index)
       live("/admin/skills", Admin.SkillsLive, :index)
       live("/admin/sessions", Admin.SessionsLive, :index)
+      live("/admin/memories", Admin.MemoriesLive, :index)
       live("/admin/documents/:id/edit", DocumentEditorLive, :edit)
     end
   end

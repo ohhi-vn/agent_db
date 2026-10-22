@@ -12,6 +12,12 @@ defmodule AgentDb.Store.Writer do
 
   # -- Client API --
 
+  # Every write carries an explicit, bounded timeout: a caller that omits one
+  # gets the default rather than GenServer.call's five-second default, and a
+  # write that exceeds its bound reports a retryable classified error instead
+  # of taking the caller down with it.
+  @default_timeout 30_000
+
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
@@ -23,10 +29,7 @@ defmodule AgentDb.Store.Writer do
   """
   @spec call(write_fun(), non_neg_integer() | nil) :: term()
   def call(fun, timeout \\ nil) do
-    case timeout do
-      nil -> GenServer.call(__MODULE__, {:write, fun})
-      ms -> GenServer.call(__MODULE__, {:write, fun}, ms)
-    end
+    GenServer.call(__MODULE__, {:write, fun}, timeout || @default_timeout)
   end
 
   @doc "Returns the writer connection for read-only fallback use in tests."
@@ -64,21 +67,24 @@ defmodule AgentDb.Store.Writer do
     {:reply, state.conn, state}
   end
 
-  defp run_with_busy_retry(fun, conn) do
+  # A busy write is retried with a growing delay inside a bounded budget.
+  # Exhausting the budget reports a retryable classified error rather than a
+  # single fixed-delay retry that re-runs the callback once.
+  @max_busy_retries 5
+  @busy_base_ms 10
+  @busy_max_ms 200
+
+  defp run_with_busy_retry(fun, conn), do: run_with_busy_retry(fun, conn, 0)
+
+  defp run_with_busy_retry(fun, conn, attempt) do
     case run_callback(fun, conn) do
       {:error, _} = err when is_tuple(err) ->
-        if busy_error?(err) do
-          Process.sleep(10 + :rand.uniform(40))
-
-          case run_callback(fun, conn) do
-            {:error, _} = err2 ->
-              if busy_error?(err2), do: {:error, :storage_busy}, else: err2
-
-            other ->
-              other
-          end
+        if busy_error?(err) and attempt < @max_busy_retries do
+          delay = min(@busy_max_ms, @busy_base_ms * Integer.pow(2, attempt)) + :rand.uniform(20)
+          Process.sleep(delay)
+          run_with_busy_retry(fun, conn, attempt + 1)
         else
-          err
+          if busy_error?(err), do: {:error, :storage_busy}, else: err
         end
 
       other ->

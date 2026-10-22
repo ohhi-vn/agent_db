@@ -39,6 +39,11 @@ defmodule AgentDb.Adapters.SQLite do
   end
 
   @impl true
+  def get_nodes(uris) when is_list(uris) do
+    Reader.read(fn conn -> Nodes.get_many(conn, uris) end)
+  end
+
+  @impl true
   def put_document(uri, content, opts) do
     with {:ok, segments} <- AgentDb.URI.parse(uri) do
       jobs = Keyword.get(opts, :jobs, [])
@@ -360,32 +365,26 @@ defmodule AgentDb.Adapters.SQLite do
   end
 
   defp insert_embedding(conn, job_id, uri, embedding, dim) do
-    with :ok <- SQLite.ensure_vec_table(conn, dim) do
+    SQLite.transaction(conn, fn c ->
       table = SQLite.vec_table(dim)
 
-      result =
-        SQLite.exec_write(
-          conn,
-          """
-          INSERT INTO "#{table}" (embedding, uri)
-          VALUES (?1, ?2)
-          ON CONFLICT(uri) DO UPDATE SET embedding = excluded.embedding
-          """,
-          [embedding, uri]
-        )
-
-      case result do
-        :ok ->
-          _ = SQLite.set_active_dim(conn, dim)
-
-          finish(result, conn, job_id, fn ->
-            Nodes.update_updated_at(conn, uri, System.system_time(:millisecond))
-          end)
-
-        {:error, _} = err ->
-          err
+      with :ok <- SQLite.ensure_vec_table(c, dim),
+           :ok <-
+             SQLite.exec_write(
+               c,
+               """
+               INSERT INTO "#{table}" (embedding, uri)
+               VALUES (?1, ?2)
+               ON CONFLICT(uri) DO UPDATE SET embedding = excluded.embedding
+               """,
+               [embedding, uri]
+             ),
+           :ok <- SQLite.set_active_dim(c, dim),
+           :ok <- Nodes.update_updated_at(c, uri, System.system_time(:millisecond)),
+           :ok <- JobQueue.complete(c, job_id) do
+        {:ok, :stored}
       end
-    end
+    end)
   end
 
   defp store_layer(conn, job_id, uri, layer, text) do
@@ -410,9 +409,6 @@ defmodule AgentDb.Adapters.SQLite do
           :ok -> {:ok, :stored}
           {:error, _} = err -> err
         end
-
-      {:error, _} = err ->
-        err
     end
   end
 
@@ -621,21 +617,23 @@ defmodule AgentDb.Adapters.SQLite do
   def put_commit(session_id, destination_uri, hash, content) do
     with {:ok, segments} <- AgentDb.URI.parse(destination_uri) do
       Writer.call(fn conn ->
-        with :ok <- ensure_parents(conn, segments),
-             :ok <-
-               Nodes.ensure_dir(conn, destination_uri, parent_uri(segments), List.last(segments)),
-             :ok <-
-               Nodes.upsert_doc(
-                 conn,
-                 destination_uri,
-                 parent_uri(segments),
-                 List.last(segments),
-                 content,
-                 []
-               ),
-             :ok <- Commits.record(conn, session_id, destination_uri, hash) do
-          :ok
-        end
+        SQLite.transaction(conn, fn c ->
+          with :ok <- ensure_parents(c, segments),
+               :ok <-
+                 Nodes.ensure_dir(c, destination_uri, parent_uri(segments), List.last(segments)),
+               :ok <-
+                 Nodes.upsert_doc(
+                   c,
+                   destination_uri,
+                   parent_uri(segments),
+                   List.last(segments),
+                   content,
+                   []
+                 ),
+               :ok <- Commits.record(c, session_id, destination_uri, hash) do
+            :ok
+          end
+        end)
       end)
     end
   end
@@ -645,22 +643,111 @@ defmodule AgentDb.Adapters.SQLite do
   @impl true
   def put_memory(uri, value, confidence, source, opts \\ []) do
     with {:ok, segments} <- AgentDb.URI.parse(uri) do
+      jobs = Keyword.get(opts, :jobs, [])
+
       Writer.call(fn conn ->
-        with :ok <- ensure_parents(conn, segments),
-             :ok <-
-               Nodes.upsert_doc(conn, uri, parent_uri(segments), List.last(segments), value, []),
-             {:ok, _row} <- Memories.record(conn, uri, value, confidence, source, opts) do
-          :ok
-        else
-          {:error, _} = err -> err
-        end
+        SQLite.transaction(conn, fn conn ->
+          write_memory(conn, segments, uri, value, confidence, source, opts, jobs)
+        end)
       end)
     end
   end
 
+  # The document, the assertion, and the embedding job that makes the memory
+  # semantically searchable are one outcome: either all three are durable or
+  # none is. A memory left without its embedding job would be recorded and
+  # permanently invisible to vector search.
+  defp write_memory(conn, segments, uri, value, confidence, source, opts, jobs) do
+    with :ok <- ensure_parents(conn, segments),
+         :ok <- write_memory_document(conn, segments, uri, value, opts),
+         {:ok, _row} <- record_memory_assertion(conn, uri, value, confidence, source, opts),
+         :ok <- enqueue_jobs(conn, jobs) do
+      :ok
+    else
+      {:error, _} = err -> err
+    end
+  end
+
+  # Re-recording the value this URI already asserts changes nothing: the
+  # belief is already held, and a second assertion for it would supersede the
+  # first with an identical copy. The URI keeps its one assertion and its
+  # history stays as it was.
+  defp record_memory_assertion(conn, uri, value, confidence, source, opts) do
+    if Keyword.get(opts, :status, :active) == :active and
+         same_value_already_asserted?(conn, uri, value) do
+      {:ok, :unchanged}
+    else
+      Memories.record(conn, uri, value, confidence, source, opts)
+    end
+  end
+
+  defp same_value_already_asserted?(conn, uri, value) do
+    case Memories.active_at_value(conn, uri, value) do
+      {:ok, nil} -> false
+      {:ok, _row} -> true
+      {:error, _} -> false
+    end
+  end
+
+  # A candidate waits beside the belief it disagrees with; it must not take
+  # over the document the active belief is read through. A candidate at a URI
+  # holding no belief yet still gets its document, so the URI is a document of
+  # the tree like any other.
+  defp write_memory_document(conn, segments, uri, value, opts) do
+    if Keyword.get(opts, :status, :active) == :candidate and
+         memory_document_exists?(conn, uri) do
+      :ok
+    else
+      Nodes.upsert_doc(conn, uri, parent_uri(segments), List.last(segments), value, [])
+    end
+  end
+
+  defp memory_document_exists?(conn, uri) do
+    case Nodes.get(conn, uri) do
+      {:ok, nil} -> false
+      {:ok, _node} -> true
+      {:error, _} -> false
+    end
+  end
+
   @impl true
-  def recall_memories(prefix, term, statuses) do
-    Reader.read(fn conn -> Memories.list(conn, prefix, term, statuses) end)
+  def recall_memories(prefix, term, statuses, opts \\ []) do
+    Reader.read(fn conn -> Memories.list(conn, prefix, term, statuses, opts) end)
+  end
+
+  @impl true
+  def load_memory_vectors(uris) when is_list(uris) do
+    Reader.read(fn conn ->
+      case SQLite.get_active_dim(conn) do
+        {:ok, :unknown} ->
+          # Nothing has ever been embedded: an empty answer is the honest one.
+          {:ok, %{}}
+
+        {:ok, dim} ->
+          stored_vectors(conn, SQLite.vec_table(dim), uris)
+
+        {:error, _} = err ->
+          err
+      end
+    end)
+  end
+
+  # One query for the whole candidate set, filtered to the URIs it names and
+  # served from the primary key: the fetch is bounded by the call, not by a
+  # scan of the index.
+  defp stored_vectors(_conn, _table, []), do: {:ok, %{}}
+
+  defp stored_vectors(conn, table, uris) do
+    marks = Enum.map_join(uris, ", ", fn _ -> "?" end)
+
+    case SQLite.query(
+           conn,
+           "SELECT uri, embedding FROM \"#{table}\" WHERE uri IN (#{marks})",
+           uris
+         ) do
+      {:ok, rows} -> {:ok, Map.new(rows, fn [uri, vec] -> {uri, vec} end)}
+      {:error, _} = err -> err
+    end
   end
 
   @impl true
@@ -669,19 +756,93 @@ defmodule AgentDb.Adapters.SQLite do
   end
 
   @impl true
-  def promote_memory(uri) do
-    Writer.call(fn conn ->
-      case Memories.promote_candidate(conn, uri) do
-        {:ok, _row} -> {:ok, :promoted}
-        {:error, _} = err -> err
+  def memory_stats do
+    Reader.read(fn conn ->
+      with {:ok, type_rows} <-
+             SQLite.query(
+               conn,
+               "SELECT substr(uri, instr(uri, 'memories/') + 9) FROM memory_meta",
+               []
+             ),
+           {:ok, status_rows} <-
+             SQLite.query(conn, "SELECT status, count(*) FROM memory_meta GROUP BY status", []),
+           {:ok, [[pending]]} <-
+             SQLite.query(conn, "SELECT count(*) FROM memory_meta WHERE status = 'candidate'", []),
+           {:ok, [[never_surfaced]]} <-
+             SQLite.query(
+               conn,
+               "SELECT count(*) FROM memory_meta WHERE last_surfaced_at IS NULL",
+               []
+             ) do
+        by_type =
+          type_rows
+          |> Enum.map(fn [tail] ->
+            case String.split(tail, "/", parts: 2) do
+              [type | _] -> type
+              _ -> nil
+            end
+          end)
+          |> Enum.reject(&is_nil/1)
+          |> Enum.frequencies()
+
+        by_status =
+          status_rows
+          |> Map.new(fn [status, count] -> {String.to_atom(status), count} end)
+
+        {:ok,
+         %{
+           by_type: by_type,
+           by_status: by_status,
+           pending: pending,
+           never_surfaced: never_surfaced,
+           total: Enum.sum(Map.values(by_type)),
+           types: by_type,
+           statuses: by_status,
+           waiting: pending,
+           candidates: pending,
+           unsurfaced: never_surfaced,
+           never_seen: never_surfaced
+         }}
       end
     end)
   end
 
-  # A rejected candidate leaves nothing behind. Recording it overwrote the
-  # node document with the candidate value, so with no assertion left the
-  # whole subtree state goes (the same purge a forget gets); with an active
-  # belief remaining, the document is repaired to the active value.
+  @impl true
+  def promote_memory(uri) do
+    with {:ok, segments} <- AgentDb.URI.parse(uri) do
+      Writer.call(fn conn ->
+        SQLite.transaction(conn, fn c ->
+          with {:ok, promoted} <- Memories.promote_candidate(c, uri),
+               :ok <- ensure_parents(c, segments) do
+            # Promotion makes the candidate's value the active one, and the
+            # document is what an active belief is read through. A candidate
+            # recorded beside an active belief never wrote over that document,
+            # so this is what finishes the promotion there.
+            Nodes.upsert_doc(
+              c,
+              uri,
+              parent_uri(segments),
+              List.last(segments),
+              promoted.value,
+              []
+            )
+
+            {:ok, :promoted}
+          end
+        end)
+      end)
+    end
+  end
+
+  # A rejected candidate leaves nothing behind. A candidate never wrote over
+  # the document of the belief it disagreed with, so rejecting one does not
+  # disturb that document: with an active belief remaining the document is
+  # already correct, and with none remaining the document the candidate wrote
+  # for itself is removed.
+  #
+  # The removal is of the candidate's own rows and nothing beneath: a memory
+  # URI can hold child memories, and rejecting a candidate at one URI is not
+  # a request to forget the subtree under it.
   @impl true
   def reject_memory_candidate(uri) do
     with {:ok, segments} <- AgentDb.URI.parse(uri) do
@@ -690,14 +851,19 @@ defmodule AgentDb.Adapters.SQLite do
   end
 
   defp reject_candidate_state(conn, segments, uri) do
-    with :ok <- Memories.reject_candidate(conn, uri),
-         {:ok, active} <- Memories.active_at(conn, uri) do
-      if active == nil do
-        Nodes.purge_subtree(conn, uri)
-      else
-        Nodes.upsert_doc(conn, uri, parent_uri(segments), List.last(segments), active.value, [])
+    SQLite.transaction(conn, fn c ->
+      with :ok <- Memories.reject_candidate(c, uri),
+           {:ok, active} <- Memories.active_at(c, uri) do
+        if active == nil do
+          # No belief remains at this URI, so the document the candidate wrote
+          # for itself goes with it. Only this URI's node: a memory URI can hold
+          # child memories, and those are not part of what was rejected.
+          Nodes.remove_node(c, uri)
+        else
+          Nodes.upsert_doc(c, uri, parent_uri(segments), List.last(segments), active.value, [])
+        end
       end
-    end
+    end)
   end
 
   @impl true
@@ -735,7 +901,7 @@ defmodule AgentDb.Adapters.SQLite do
   defp pairs_in_dim(conn, rows, dim) do
     table = SQLite.vec_table(dim)
 
-    with {:ok, vectors} <- vectors_for(conn, table, rows) do
+    with {:ok, vectors} <- stored_vectors(conn, table, Enum.map(rows, & &1.uri)) do
       if map_size(vectors) < 2 do
         {:error, :embeddings_unavailable}
       else
@@ -744,27 +910,77 @@ defmodule AgentDb.Adapters.SQLite do
     end
   end
 
-  defp vectors_for(conn, table, rows) do
-    Enum.reduce_while(rows, {:ok, %{}}, fn row, {:ok, acc} ->
-      case SQLite.query_one(conn, "SELECT embedding FROM \"#{table}\" WHERE uri = ?1", [row.uri]) do
-        {:ok, nil} -> {:cont, {:ok, acc}}
-        {:ok, [blob]} -> {:cont, {:ok, Map.put(acc, row.uri, blob)}}
-        {:error, _} = err -> {:halt, err}
-      end
+  # Pairs are compared block by block over vectors decoded exactly once: the
+  # old loop issued one SELECT per memory and decompressed both float32 blobs
+  # for every pair it scored. The blocks cross in URI order, so each pair is
+  # scored at most once with `uri_a < uri_b`, and a block's slice of the pair
+  # space is the most that is materialized at any moment. The evaluation is
+  # pure and public behind `@doc false` because a host without the vector
+  # extension never sees a real `vec_nodes` table: the batching deserves a
+  # test all the same.
+  @doc false
+  @pair_batch 64
+
+  def similar_pairs(rows, vectors) do
+    uris =
+      rows
+      |> Enum.map(& &1.uri)
+      |> Enum.uniq()
+      |> Enum.sort()
+      |> Enum.filter(&Map.has_key?(vectors, &1))
+
+    decoded = Map.new(uris, fn uri -> {uri, decode_vector(Map.fetch!(vectors, uri))} end)
+    chunks = Enum.chunk_every(uris, @pair_batch)
+
+    chunks
+    |> Enum.with_index()
+    |> Stream.flat_map(fn {chunk, i} ->
+      self_pairs =
+        Stream.flat_map(chunk, fn a ->
+          chunk
+          |> Stream.filter(&(&1 > a))
+          |> Stream.map(&similar_pair(a, &1, decoded))
+        end)
+
+      cross_pairs =
+        chunks
+        |> Enum.take(i)
+        |> Stream.flat_map(fn left ->
+          Stream.flat_map(left, fn a -> Stream.map(chunk, &similar_pair(a, &1, decoded)) end)
+        end)
+
+      Stream.concat(self_pairs, cross_pairs)
     end)
+    |> Enum.to_list()
+    |> Enum.reject(&is_nil/1)
+    |> Enum.sort_by(& &1.similarity, :desc)
   end
 
-  defp similar_pairs(rows, vectors) do
-    uris = rows |> Enum.map(& &1.uri) |> Enum.filter(&Map.has_key?(vectors, &1)) |> Enum.uniq()
+  # A pair survives as a structured match, or it never shows: the similarity
+  # floor filters inside the stream, so a scored pair below it is not
+  # materialized. Same-type checking lives here so each pair parses its URIs
+  # once, not once per stream above it.
+  defp similar_pair(a, b, decoded) do
+    if same_memory_type?(a, b) do
+      sim = decoded_cosine(Map.fetch!(decoded, a), Map.fetch!(decoded, b))
 
-    for a <- uris,
-        b <- uris,
-        a < b,
-        same_memory_type?(a, b),
-        (sim = cosine(Map.fetch!(vectors, a), Map.fetch!(vectors, b))) >= @conflict_similarity do
-      %{uri_a: a, uri_b: b, similarity: sim}
+      if sim >= @conflict_similarity, do: %{uri_a: a, uri_b: b, similarity: sim}
     end
-    |> Enum.sort_by(& &1.similarity, :desc)
+  end
+
+  defp decoded_cosine({xs, nx}, {ys, ny}) do
+    if nx == 0.0 or ny == 0.0 do
+      0.0
+    else
+      dot = Enum.zip(xs, ys) |> Enum.map(fn {x, y} -> x * y end) |> Enum.sum()
+      dot / (nx * ny)
+    end
+  end
+
+  # The blob is decompressed once per URI, its norm carried with its values.
+  defp decode_vector(blob) do
+    xs = for <<x::float-32 <- blob>>, do: x
+    {xs, :math.sqrt(Enum.map(xs, &(&1 * &1)) |> Enum.sum())}
   end
 
   defp same_memory_type?(a, b), do: memory_type(a) == memory_type(b) and memory_type(a) != nil
@@ -775,20 +991,6 @@ defmodule AgentDb.Adapters.SQLite do
       _ -> nil
     end
   end
-
-  defp cosine(a, b)
-       when is_binary(a) and is_binary(b) and byte_size(a) > 0 and
-              byte_size(a) == byte_size(b) and rem(byte_size(a), 4) == 0 do
-    xs = for <<x::float-32 <- a>>, do: x
-    ys = for <<y::float-32 <- b>>, do: y
-    dot = Enum.zip(xs, ys) |> Enum.map(fn {x, y} -> x * y end) |> Enum.sum()
-    nx = :math.sqrt(Enum.map(xs, &(&1 * &1)) |> Enum.sum())
-    ny = :math.sqrt(Enum.map(ys, &(&1 * &1)) |> Enum.sum())
-
-    if nx == 0.0 or ny == 0.0, do: 0.0, else: dot / (nx * ny)
-  end
-
-  defp cosine(_, _), do: 0.0
 
   # -- durable work --
 

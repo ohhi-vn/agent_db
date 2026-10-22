@@ -129,6 +129,8 @@ defmodule AgentDbWeb.Mcp do
           "uri" => %{"type" => "string"},
           "type" => %{"type" => "string"},
           "term" => %{"type" => "string"},
+          "top_k" => %{"type" => "integer"},
+          "source" => %{"type" => "string"},
           "include_superseded" => %{"type" => "boolean"}
         },
         []
@@ -140,6 +142,7 @@ defmodule AgentDbWeb.Mcp do
           "uri" => %{"type" => "string"},
           "value" => %{"type" => "string"},
           "confidence" => %{"type" => "number"},
+          "importance" => %{"type" => "number"},
           "source" => %{"type" => "string"}
         },
         ["uri", "value"]
@@ -147,6 +150,31 @@ defmodule AgentDbWeb.Mcp do
       tool(
         "memory_forget",
         "Removes a memory and its provenance.",
+        %{
+          "uri" => %{"type" => "string"}
+        },
+        ["uri"]
+      ),
+      tool(
+        "memory_candidates",
+        "Lists memories waiting for review.",
+        %{
+          "uri" => %{"type" => "string"},
+          "type" => %{"type" => "string"}
+        },
+        []
+      ),
+      tool(
+        "memory_promote",
+        "Promotes a waiting candidate to the active assertion.",
+        %{
+          "uri" => %{"type" => "string"}
+        },
+        ["uri"]
+      ),
+      tool(
+        "memory_reject",
+        "Rejects a waiting candidate, leaving no trace.",
         %{
           "uri" => %{"type" => "string"}
         },
@@ -387,6 +415,8 @@ defmodule AgentDbWeb.Mcp do
       |> put_opt(:uri, args["uri"])
       |> put_opt(:type, args["type"])
       |> put_opt(:term, args["term"])
+      |> put_opt(:top_k, args["top_k"])
+      |> put_opt(:source, args["source"])
       |> put_opt(:include_superseded, args["include_superseded"])
 
     case AgentDb.recall(recall_opts) do
@@ -401,6 +431,7 @@ defmodule AgentDbWeb.Mcp do
       remember_opts =
         []
         |> put_opt(:confidence, args["confidence"])
+        |> put_opt(:importance, args["importance"])
         |> put_opt(:source, args["source"])
 
       case AgentDb.remember(uri, value, remember_opts) do
@@ -413,6 +444,36 @@ defmodule AgentDbWeb.Mcp do
   defp dispatch("memory_forget", args, _opts) do
     with {:ok, uri} <- required(args, "uri") do
       case AgentDb.forget(uri) do
+        :ok -> {:ok, %{"uri" => uri, "status" => "ok"}}
+        {:error, _} = err -> err
+      end
+    end
+  end
+
+  defp dispatch("memory_candidates", args, _opts) do
+    candidate_opts =
+      []
+      |> put_opt(:uri, args["uri"])
+      |> put_opt(:type, args["type"])
+
+    case AgentDb.pending_memory_candidates(candidate_opts) do
+      {:ok, memories} -> {:ok, %{"memories" => memories}}
+      {:error, _} = err -> err
+    end
+  end
+
+  defp dispatch("memory_promote", args, _opts) do
+    with {:ok, uri} <- required(args, "uri") do
+      case AgentDb.promote_memory(uri) do
+        {:ok, promoted} -> {:ok, %{"uri" => promoted, "status" => "ok"}}
+        {:error, _} = err -> err
+      end
+    end
+  end
+
+  defp dispatch("memory_reject", args, _opts) do
+    with {:ok, uri} <- required(args, "uri") do
+      case AgentDb.reject_memory_candidate(uri) do
         :ok -> {:ok, %{"uri" => uri, "status" => "ok"}}
         {:error, _} = err -> err
       end

@@ -65,19 +65,30 @@ defmodule AgentDb.Application.Documents do
   defp do_write(uri, content, opts) do
     async = Keyword.get(opts, :async, AgentDb.Config.async_writes())
 
-    with {:ok, segments} <- VikingURI.parse(uri),
-         jobs = jobs_for(uri, content, opts),
-         :ok <- persist(segments, content, opts, jobs) do
-      Cache.invalidate_write(uri)
+    case VikingURI.parse(uri) do
+      {:ok, segments} ->
+        jobs = jobs_for(uri, content, opts)
 
-      if async do
-        :ok
-      else
-        settle(uri, opts)
-      end
-    else
-      :root -> {:error, :is_root}
-      {:error, _} = err -> err
+        # Invalidate before the write as well as after: a reader that read the
+        # pre-write row must not leave a permanently stale cache entry behind.
+        Cache.invalidate_write(uri)
+
+        case persist(segments, content, opts, jobs) do
+          :ok ->
+            Cache.invalidate_write(uri)
+
+            if async do
+              :ok
+            else
+              settle(uri, opts)
+            end
+
+          {:error, _} = err ->
+            err
+        end
+
+      {:error, _} = err ->
+        err
     end
   end
 
@@ -260,11 +271,73 @@ defmodule AgentDb.Application.Documents do
     end)
   end
 
+  @doc """
+  Reads the layers for several URIs in one store operation.
+
+  Returns `%{uri => layers}` for the URIs that exist, so a caller showing
+  many documents does not pay one read per document. A missing URI is simply
+  absent from the answer.
+  """
+  @spec layers_batch([uri()]) :: map()
+  def layers_batch(uris) when is_list(uris) do
+    case Runtime.storage().get_nodes(uris) do
+      {:ok, nodes} ->
+        nodes
+        |> Enum.zip(uris)
+        |> Enum.reduce(%{}, fn {node, uri}, acc ->
+          if is_nil(node) do
+            acc
+          else
+            Map.put(acc, uri, layers_from_node(node))
+          end
+        end)
+
+      {:error, _} ->
+        %{}
+    end
+  end
+
   @type layer_view :: %{
           text: content(),
           source: :stored | :fallback | :unavailable,
           chars: non_neg_integer()
         }
+
+  defp layers_from_node(node) do
+    content = node.content || ""
+    abstract_stored = node.abstract
+    overview_stored = node.overview
+
+    abstract_text =
+      if is_binary(abstract_stored) and abstract_stored != "" do
+        abstract_stored
+      else
+        fallback_abstract(content)
+      end
+
+    overview_text =
+      if is_binary(overview_stored) and overview_stored != "" do
+        overview_stored
+      else
+        fallback_overview(content)
+      end
+
+    %{
+      abstract: %{
+        text: abstract_text,
+        source:
+          if(is_binary(abstract_stored) and abstract_stored != "", do: :stored, else: :fallback),
+        chars: String.length(abstract_text)
+      },
+      overview: %{
+        text: overview_text,
+        source:
+          if(is_binary(overview_stored) and overview_stored != "", do: :stored, else: :fallback),
+        chars: String.length(overview_text)
+      },
+      content: %{text: content, source: :stored, chars: String.length(content)}
+    }
+  end
 
   # What was stored decides the source: a persisted layer answers as stored, and
   # anything else on that read was derived by the fallback.

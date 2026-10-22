@@ -72,6 +72,24 @@ defmodule AgentDb.ObservabilityTest do
       assert_received {:telemetry, [:agent_db, :operation, :stop], _m, metadata}
       assert metadata.outcome == :error
     end
+
+    test "a production-path failure records its classified code in the sink, not the generic error" do
+      AgentDb.Observability.Sink.reset()
+
+      # A caller error through the public surface: the write cannot parse its
+      # URI, and the store answers `{:error, :invalid_uri}`.
+      assert {:error, :invalid_uri} = AgentDb.write("bogus://x.md", "content")
+
+      assert [entry] = AgentDb.recent_errors(1)
+      assert entry.operation == :write
+      assert entry.reason == :invalid_uri
+
+      # The recorded code is the code the transport reports for the same
+      # failure, so a recent-failure entry, a metric series, and a response
+      # join on the code alone.
+      assert Atom.to_string(entry.reason) == Observability.error_code(:invalid_uri)
+      assert Observability.error_message(:invalid_uri) == "invalid_uri"
+    end
   end
 
   describe "job timing and outcome" do
@@ -100,6 +118,28 @@ defmodule AgentDb.ObservabilityTest do
       refute Map.has_key?(metadata, :uri)
     end
 
+    test "each of the five outcomes reaches the sink under its own count" do
+      Observability.Sink.reset()
+
+      for outcome <- [:stored, :discarded, :deferred, :failed, :error] do
+        Observability.emit_job(:embed, outcome, 0, 1)
+      end
+
+      counts = AgentDb.operation_stats()
+      kind = %{kind: :embed}
+
+      # One count per outcome under its own label. A failed job is not counted
+      # under the successful outcome, nothing else collapsed under :ok by
+      # accident, and no counter appeared that the emission never made.
+      assert counts[{:job, kind}].counts[:ok] == 1
+      assert counts[{:job, kind}].counts[:discarded] == 1
+      assert counts[{:job, kind}].counts[:deferred] == 1
+      assert counts[{:job, kind}].counts[:failed] == 1
+      assert counts[{:job, kind}].counts[:error] == 1
+
+      assert counts |> Map.keys() |> Enum.sort() == [{:job, kind}]
+    end
+
     test "deferred remains distinguishable from failed" do
       handler_id = "obs-defer-#{System.unique_integer([:positive])}"
       test_pid = self()
@@ -116,11 +156,8 @@ defmodule AgentDb.ObservabilityTest do
       Observability.emit_job(:embed, :deferred, 0, 1)
       Observability.emit_job(:embed, :failed, 0, 1)
 
-      assert_received {:job_outcome, %{outcome: :ok, kind: :embed}}
-      # Both map to :ok via normalize, but the raw atoms differ at the call
-      # site (store returns :stored/:discarded, defer :deferred, fail :failed).
-      # Assert the calls themselves are distinct outcomes.
-      assert :deferred != :failed
+      assert_received {:job_outcome, %{outcome: :deferred, kind: :embed}}
+      assert_received {:job_outcome, %{outcome: :failed, kind: :embed}}
     end
   end
 

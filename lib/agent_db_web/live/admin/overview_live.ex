@@ -19,7 +19,8 @@ defmodule AgentDbWeb.Admin.OverviewLive do
       queue_detail: Context.queue_detail(@error_max),
       health: Context.health_check(),
       runtime: Context.runtime_snapshot(),
-      recent_errors: Context.recent_errors(@error_max)
+      recent_errors: Context.recent_errors(@error_max),
+      operation_stats: Context.operation_stats()
     )
   end
 
@@ -36,6 +37,7 @@ defmodule AgentDbWeb.Admin.OverviewLive do
       <AdminComponents.queue jobs={@jobs} detail={@queue_detail} />
       <AdminComponents.runtime runtime={@runtime} errors={@recent_errors} />
       <AdminComponents.health health={@health} />
+      <AdminComponents.operation_stats stats={@operation_stats} />
     </div>
     """
   end

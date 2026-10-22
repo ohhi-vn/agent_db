@@ -63,10 +63,10 @@ document content it cannot receive.
 
 | Entry point | What it does | Docs |
 |-------------|--------------|------|
-| [`AgentDb.remember/3`](https://hexdocs.pm/agent_db/AgentDb.html#remember/3) | Stores a durable fact with `confidence:`, `importance:`, `candidate:`, `source:` | [link](https://hexdocs.pm/agent_db/AgentDb.html#remember/3) |
-| [`AgentDb.recall/1`](https://hexdocs.pm/agent_db/AgentDb.html#recall/1) | Decay-aware recall with `include_superseded:` | [link](https://hexdocs.pm/agent_db/AgentDb.html#recall/1) |
+| [`AgentDb.remember/3`](https://hexdocs.pm/agent_db/AgentDb.html#remember/3) | Stores a durable fact with `confidence:`, `importance:`, `candidate:`, `source:`; document, assertion, and embedding job land as one outcome | [link](https://hexdocs.pm/agent_db/AgentDb.html#remember/3) |
+| [`AgentDb.recall/1`](https://hexdocs.pm/agent_db/AgentDb.html#recall/1) | Decay-aware recall with `include_superseded:`; each entry reports its own `type`, and a malformed URI is `{:error, :invalid_uri}` rather than a raise | [link](https://hexdocs.pm/agent_db/AgentDb.html#recall/1) |
 | [`AgentDb.forget/1`](https://hexdocs.pm/agent_db/AgentDb.html#forget/1) | Removes a memory | [link](https://hexdocs.pm/agent_db/AgentDb.html#forget/1) |
-| [`AgentDb.promote_memory/1`](https://hexdocs.pm/agent_db/AgentDb.html#promote_memory/1) | Promotes a candidate to durable | [link](https://hexdocs.pm/agent_db/AgentDb.html#promote_memory/1) |
+| [`AgentDb.promote_memory/1`](https://hexdocs.pm/agent_db/AgentDb.html#promote_memory/1) | Promotes a candidate to durable, carrying its value through the URI's document | [link](https://hexdocs.pm/agent_db/AgentDb.html#promote_memory/1) |
 | [`AgentDb.reject_memory_candidate/1`](https://hexdocs.pm/agent_db/AgentDb.html#reject_memory_candidate/1) | Rejects a candidate | [link](https://hexdocs.pm/agent_db/AgentDb.html#reject_memory_candidate/1) |
 | [`AgentDb.pending_memory_candidates/1`](https://hexdocs.pm/agent_db/AgentDb.html#pending_memory_candidates/1) | Candidates awaiting promotion | [link](https://hexdocs.pm/agent_db/AgentDb.html#pending_memory_candidates/1) |
 | [`AgentDb.memory_conflicts/1`](https://hexdocs.pm/agent_db/AgentDb.html#memory_conflicts/1) | Read-only conflict surfacing | [link](https://hexdocs.pm/agent_db/AgentDb.html#memory_conflicts/1) |

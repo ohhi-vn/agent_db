@@ -145,6 +145,14 @@ defmodule Mix.Tasks.AgentToolingTasksTest do
     refute match?({:ok, _}, Jason.decode(out))
   end
 
+  test "recall of a malformed scope exits non-zero with the reason" do
+    assert_raise Mix.Error, ~r/invalid_uri/, fn ->
+      capture_io(fn ->
+        Mix.Tasks.AgentDb.Recall.run(["notaschi", "--no-compile"])
+      end)
+    end
+  end
+
   test "recall --type filters by type as JSON" do
     {:ok, _} =
       AgentDb.remember("viking://user/memories/preferences/cli_type", "type filter check")

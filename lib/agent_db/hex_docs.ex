@@ -140,6 +140,22 @@ defmodule AgentDb.HexDocs do
   defp version_of(_), do: :unknown
 
   defp parse_lock(content) do
+    # mix.lock is Elixir source (`%{...}`), but evaluating it at runtime needs
+    # the project's compile context and can fail. Match the lock entries
+    # directly so discovery works from a plain file read, falling back to
+    # evaluation only when the regex finds nothing.
+    case Regex.scan(~r/"([^"]+)"\s*:\s*\{:hex,\s*:[^,]+,\s*"([^"]+)"/, content) do
+      [] ->
+        eval_lock(content)
+
+      matches ->
+        Enum.map(matches, fn [_, package, version] ->
+          %{package: package, version: version}
+        end)
+    end
+  end
+
+  defp eval_lock(content) do
     case Code.eval_string(content) do
       {lock, _} when is_map(lock) ->
         Enum.flat_map(lock, fn

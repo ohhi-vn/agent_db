@@ -162,26 +162,33 @@ defmodule AgentDb.Workers.JobWorker do
       start = System.monotonic_time(:millisecond)
 
       Observability.with_span("agent_db.job", %{kind: job.kind}, fn ->
-        outcome =
+        # The outcome is what the work did, and the reason is what a failure
+        # should say about it. Both travel to the measurement: a failed job
+        # is counted as failed and carries the code a transport would report
+        # for the same reason, and a deferred one stays out of the failure
+        # counts entirely.
+        {outcome, reason} =
           try do
             if job.kind in handler.kinds() do
               case handler.generate(job) do
                 {:ok, result} -> store(storage, handler, job, result)
                 {:error, :model_loading} -> defer(storage, job)
-                {:error, reason} -> fail(storage, job, reason)
+                {:error, failed} -> fail(storage, job, failed)
                 other -> fail(storage, job, {:invalid_job_result, other})
               end
             else
               fail(storage, job, {:unknown_job_kind, job.kind})
             end
           rescue
-            error -> fail(storage, job, {:worker_crash, error.__struct__})
+            error ->
+              fail(storage, job, {:worker_crash, error.__struct__})
           catch
-            kind, reason -> fail(storage, job, {:worker_catch, kind, reason})
+            kind, caught ->
+              fail(storage, job, {:worker_catch, kind, caught})
           end
 
         execution = System.monotonic_time(:millisecond) - start
-        Observability.emit_job(job.kind, outcome, queue_wait, execution)
+        Observability.emit_job(job.kind, outcome, queue_wait, execution, reason)
 
         Observability.log(:info, component: :worker, kind: job.kind, outcome: outcome)
 
@@ -222,13 +229,13 @@ defmodule AgentDb.Workers.JobWorker do
         # summary that lands behind it would never be seen. Whoever writes has
         # to drop what it made stale.
         AgentDb.Cache.invalidate_write(job.payload["uri"])
-        :stored
+        {:stored, nil}
 
       # The node was removed while the model was running. The job is already
       # done; its result is simply not wanted.
       {:ok, :discarded} ->
         Observability.log(:info, component: :worker, kind: job.kind, outcome: :discarded)
-        :discarded
+        {:discarded, nil}
 
       # The index could not be reached right now -- it raised, it is saturated,
       # or it is not loaded. That is "try again later", the same shape as a
@@ -245,7 +252,7 @@ defmodule AgentDb.Workers.JobWorker do
   defp defer(storage, job) do
     case storage.defer_job(job.id, @model_loading_delay_ms) do
       :ok ->
-        :deferred
+        {:deferred, nil}
 
       {:error, reason} ->
         Observability.log(:error,
@@ -255,7 +262,7 @@ defmodule AgentDb.Workers.JobWorker do
           reason: reason
         )
 
-        :error
+        {:error, reason}
     end
   end
 
@@ -272,7 +279,7 @@ defmodule AgentDb.Workers.JobWorker do
           reason: reason
         )
 
-        :failed
+        {:failed, reason}
 
       {:error, error} ->
         Observability.log(:error,
@@ -282,7 +289,7 @@ defmodule AgentDb.Workers.JobWorker do
           reason: error
         )
 
-        :error
+        {:error, error}
     end
   end
 end

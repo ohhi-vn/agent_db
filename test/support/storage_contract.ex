@@ -908,6 +908,118 @@ defmodule AgentDb.StorageContract do
           assert is_integer(touched.last_surfaced_at)
         end
 
+        test "a re-record of the value already asserted changes nothing" do
+          uri = "viking://user/memories/preferences/editor"
+
+          assert :ok = storage().put_memory(uri, "prefers Vim", 0.9, "s1")
+          assert :ok = storage().put_memory(uri, "prefers Vim", 0.9, "s2")
+
+          # The URI keeps its single assertion: an identical re-write neither
+          # supersedes it nor leaves a second one behind.
+          assert {:ok, history} = storage().recall_memories(uri, nil, [:active, :superseded])
+          assert [%{value: "prefers Vim", confidence: 0.9, source: "s1"}] = history
+        end
+
+        test "a candidate does not overwrite the active belief's document" do
+          uri = "viking://user/memories/preferences/shell"
+
+          assert :ok = storage().put_memory(uri, "prefers Zsh", 0.9, nil)
+          assert :ok = storage().put_memory(uri, "prefers Fish", 0.9, nil, status: :candidate)
+
+          assert {:ok, node} = storage().get_node(uri)
+          assert node.content == "prefers Zsh"
+        end
+
+        test "promoting a candidate carries its value through the document" do
+          uri = "viking://user/memories/preferences/editor-2"
+
+          assert :ok = storage().put_memory(uri, "prefers Zsh", 0.9, nil)
+          assert :ok = storage().put_memory(uri, "prefers Fish", 0.9, nil, status: :candidate)
+
+          assert {:ok, :promoted} = storage().promote_memory(uri)
+
+          assert {:ok, [active]} = storage().recall_memories(uri, nil, [:active])
+          assert active.value == "prefers Fish"
+
+          # Promotion finished the re-write the candidate waited outside of:
+          # the document the active belief is read through now reads it.
+          assert {:ok, node} = storage().get_node(uri)
+          assert node.content == "prefers Fish"
+        end
+
+        test "a memory write is atomic with its embedding job" do
+          uri = "viking://user/memories/preferences/language"
+          jobs = [{:embed, %{uri: uri, content: "prefers Elixir"}}]
+
+          assert :ok = storage().put_memory(uri, "prefers Elixir", 0.9, nil, jobs: jobs)
+
+          assert {:ok, node} = storage().get_node(uri)
+          assert node.content == "prefers Elixir"
+          assert {:ok, [_]} = storage().recall_memories(uri, nil, [:active])
+          assert storage().count_jobs(uri, ["pending", "running", "done", "failed"]) >= 1
+        end
+
+        test "an enqueue failure leaves no document, assertion, or job behind" do
+          uri = "viking://user/memories/preferences/quality"
+          jobs = [{:embed, %{uri: uri, content: "prefers Vim"}}]
+
+          # A queue that is not there makes the enqueue step of the write fail
+          # after the document and assertion have already been written. The
+          # atomicity is what leaves none of them behind.
+          restore = break_writes()
+
+          try do
+            assert {:error, _reason} =
+                     storage().put_memory(uri, "prefers Vim", 0.9, nil, jobs: jobs)
+          after
+            restore.()
+          end
+
+          assert {:ok, nil} = storage().get_node(uri)
+
+          assert {:ok, []} =
+                   storage().recall_memories(uri, nil, [:active, :superseded, :candidate])
+
+          assert 0 = storage().count_jobs(uri, ["pending", "running", "done", "failed"])
+        end
+
+        test "a recall is bounded in storage and reports that the bound was reached" do
+          base = "viking://user/memories/preferences/contract-bound"
+
+          for name <- ["one", "two", "three", "four", "five", "six"] do
+            assert :ok = storage().put_memory("#{base}/#{name}", "fact #{name}", 0.9, nil)
+          end
+
+          assert {:ok, bounded} =
+                   storage().recall_memories(base, nil, [:active], top_k: 4)
+
+          assert length(bounded) == 4
+          assert Enum.all?(bounded, & &1.truncated)
+
+          # The whole subtree fits a bound above it: nothing is reported cut.
+          assert {:ok, whole} = storage().recall_memories(base, nil, [:active])
+          assert length(whole) == 6
+          assert Enum.all?(whole, &(&1.truncated == false))
+
+          assert {:error, {:invalid_limit, 0}} =
+                   storage().recall_memories(base, nil, [:active], top_k: 0)
+        end
+
+        test "a recall is scoped by provenance" do
+          base = "viking://user/memories/preferences/contract-source"
+
+          assert :ok = storage().put_memory("#{base}/alpha", "from a", 0.9, "contract-a")
+          assert :ok = storage().put_memory("#{base}/beta", "from b", 0.9, "contract-b")
+          assert :ok = storage().put_memory("#{base}/anon", "from nowhere", 0.9, nil)
+
+          assert {:ok, [from_a]} =
+                   storage().recall_memories(base, nil, [:active], source: "contract-a")
+
+          assert %{source: "contract-a", truncated: false} = from_a
+
+          assert {:ok, []} = storage().recall_memories(base, nil, [:active], source: "contract-c")
+        end
+
         test "similar values at distinct URIs are reported as conflicts" do
           a = "viking://user/memories/preferences/first"
           b = "viking://user/memories/preferences/second"
@@ -945,6 +1057,108 @@ defmodule AgentDb.StorageContract do
 
             {:error, :embeddings_unavailable} ->
               # Hosts without the vector extension cannot evaluate.
+              :ok
+          end
+        end
+
+        test "the conflict read fetches its vectors in one bounded read" do
+          base = "viking://user/memories/preferences/contract-conflict-batch"
+          events = "viking://user/memories/events/contract-conflict-batch"
+
+          # One similar pair, and everything else on a different axis, so the
+          # expected pairs are known exactly whatever the row count.
+          rows = [
+            {"a", [1.0, 0.0, 0.0, 0.0]},
+            {"b", [0.99, 0.01, 0.0, 0.0]},
+            {"c", [0.0, 1.0, 0.0, 0.0]},
+            {"d", [0.0, 0.0, 1.0, 0.0]},
+            {"e", [0.0, 0.0, 0.0, 1.0]},
+            {"f", [0.0, 0.7, 0.7, 0.0]}
+          ]
+
+          for {name, _vec} <- rows do
+            assert :ok = storage().put_memory("#{base}/#{name}", "memory #{name}", 0.9, nil)
+          end
+
+          assert :ok = storage().put_memory("#{events}/a", "events a", 0.9, nil)
+          assert :ok = storage().put_memory("#{events}/b", "events b", 0.9, nil)
+
+          vectors = Map.new(rows, fn {name, vec} -> {"#{base}/#{name}", vec} end)
+
+          vectors =
+            Map.merge(vectors, %{
+              "#{events}/a" => [1.0, 0.0, 0.0, 0.0],
+              "#{events}/b" => [0.99, 0.01, 0.0, 0.0]
+            })
+
+          :ok = AgentDb.StorageContract.Helpers.store_vectors(storage(), vectors)
+
+          # A warm read first, so the probe measures the steady-state read and
+          # not whatever the first-ever call has to set up.
+          _ = storage().memory_conflict_pairs("viking://user/memories")
+
+          sqlite = AgentDb.Store.SQLite
+          sqlite.start_statement_probe()
+
+          result =
+            try do
+              storage().memory_conflict_pairs("viking://user/memories/preferences")
+            after
+              :ok
+            end
+
+          counted = sqlite.statement_count(self())
+          sqlite.stop_statement_probe()
+
+          case result do
+            {:ok, pairs} ->
+              # Only the a/b near-identical same-type pair crosses the floor;
+              # the events lookalikes are out of the scope and every other
+              # value is on its own axis.
+              assert [%{uri_a: first, uri_b: second, similarity: sim}] = pairs
+              assert Enum.sort([first, second]) == Enum.sort([base <> "/a", base <> "/b"])
+              assert sim > 0.9
+
+            {:error, :embeddings_unavailable} ->
+              :ok
+          end
+
+          # Bounded whatever the answer: the vec check, the active dimension,
+          # the row list, and one batched fetch of every vector together --
+          # never one statement per memory. With the rows seeded here a
+          # per-row fetch would have issued ten or more statements.
+          assert counted <= 6
+        end
+
+        test "stored vectors load from the index without inference" do
+          uri = "viking://user/memories/preferences/vector-loaded"
+          absent = "viking://user/memories/preferences/vector-absent"
+
+          assert :ok = storage().put_memory(uri, "likes Elixir a lot", 0.9, nil)
+          assert :ok = storage().put_memory(absent, "mutes notifications", 0.9, nil)
+
+          :ok =
+            AgentDb.StorageContract.Helpers.store_vectors(storage(), %{
+              uri => [1.0, 0.0, 0.0, 0.0]
+            })
+
+          case storage().load_memory_vectors([uri, absent]) do
+            {:ok, vectors} ->
+              # A host with an index answers with the stored vector keyed by
+              # URI, and a URI with no stored vector is simply absent.
+              if Map.has_key?(vectors, uri) do
+                vec = Map.fetch!(vectors, uri)
+                assert is_binary(vec)
+                assert rem(byte_size(vec), 4) == 0
+                assert byte_size(vec) == 4 * 4
+                refute Map.has_key?(vectors, absent)
+              else
+                # A host without one answers with the honest empty map: a
+                # caller falls back rather than failing a recall of its own.
+                assert vectors == %{}
+              end
+
+            {:error, :embeddings_unavailable} ->
               :ok
           end
         end

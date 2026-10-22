@@ -1,7 +1,29 @@
+defmodule AgentDb.MemoryTest.BrokenRecallStorage do
+  @moduledoc false
+  # A storage that answers the strict term read with an empty set but cannot
+  # answer any read without a term -- the widening broad read fails with the
+  # reader pool's own unavailability reason. Only the recall failure path's
+  # callbacks; nothing else.
+  def recall_memories(_scope, term, _statuses, _opts) when is_binary(term), do: {:ok, []}
+
+  def recall_memories(_scope, nil, _statuses, _opts), do: {:error, :storage_busy}
+  def recall_memories(_scope, nil, _statuses), do: {:error, :storage_busy}
+end
+
+defmodule AgentDb.MemoryTest.UnboundedDetailStorage do
+  @moduledoc false
+  # A storage whose reads fail with an unbounded detail, as a provider's
+  # native error shape can. What recall reports is the shared classification,
+  # never the detail.
+  def recall_memories(_scope, _term, _statuses, _opts), do: {:error, "disk I/O error"}
+end
+
 defmodule AgentDb.MemoryTest do
   use ExUnit.Case, async: false
 
   alias AgentDb.Cache
+  alias AgentDb.MemoryTest.BrokenRecallStorage
+  alias AgentDb.MemoryTest.UnboundedDetailStorage
   alias AgentDb.ML.ModelManager
   alias AgentDb.Store.{Reader, SQLite}
 
@@ -168,6 +190,118 @@ defmodule AgentDb.MemoryTest do
 
   test "recall rejects a uri outside the memories root" do
     assert {:error, {:not_a_memory_uri, _}} = AgentDb.recall("viking://resources/notes")
+  end
+
+  test "a malformed recall scope is an error, not a crash" do
+    assert {:error, :invalid_uri} = AgentDb.recall("notaschi")
+    assert {:error, :invalid_uri} = AgentDb.recall(uri: "notaschi")
+  end
+
+  test "the whole root recalls with each memory's own type" do
+    files = [
+      {@name, "profile"},
+      {@lang, "preferences"},
+      {"viking://user/memories/events/released", "events"},
+      {"viking://user/memories/entities/repos/agent_db", "entities"}
+    ]
+
+    for {uri, _type} <- files, do: {:ok, _} = AgentDb.remember(uri, "recall types " <> uri)
+
+    assert {:ok, found} = AgentDb.recall()
+    by_uri = Map.new(found, &{&1.uri, &1.type})
+
+    for {uri, type} <- files do
+      assert Map.fetch!(by_uri, uri) == type
+    end
+
+    # Nothing recalled reports an absent type.
+    assert Enum.all?(found, &is_binary(&1.type))
+  end
+
+  # -- bounding and provenance --
+
+  test "a recall is bounded and reports that the bound was reached" do
+    parent = "viking://user/memories/preferences/recall-bound"
+
+    for i <- 1..7, do: {:ok, _} = AgentDb.remember("#{parent}/f#{i}", "fact #{i}")
+
+    assert {:ok, bounded} = AgentDb.recall(uri: parent, top_k: 5)
+    assert length(bounded) == 5
+    assert Enum.all?(bounded, & &1.truncated)
+
+    # A bound above the answered set does not cut: the flag says so plainly.
+    assert {:ok, whole} = AgentDb.recall(uri: parent, top_k: 50)
+    assert length(whole) == 7
+    assert Enum.all?(whole, &(&1.truncated == false))
+  end
+
+  test "an unbounded recall reports the default bound it served" do
+    storage = AgentDb.Runtime.storage()
+    parent = "viking://user/memories/preferences/recall-default-bound"
+
+    for i <- 1..501 do
+      label = String.pad_leading(Integer.to_string(i), 3, "0")
+
+      :ok = storage.put_memory("#{parent}/f#{label}", "fact #{i}", 0.5, nil)
+    end
+
+    assert {:ok, rows} = AgentDb.recall(uri: parent)
+    assert length(rows) == 500
+    assert Enum.all?(rows, & &1.truncated)
+  end
+
+  test "a recall is scoped by provenance" do
+    {:ok, _} = AgentDb.remember(@lang, "prefers Elixir", source: "recall-session-a")
+    {:ok, _} = AgentDb.remember(@name, "ada", source: "recall-session-b")
+
+    assert {:ok, [from_a]} = AgentDb.recall(source: "recall-session-a")
+    assert from_a.uri == @lang
+    assert from_a.source == "recall-session-a"
+    assert from_a.truncated == false
+
+    assert {:ok, []} = AgentDb.recall(source: "recall-session-c")
+  end
+
+  test "an out-of-range bound is refused rather than substituted" do
+    assert {:error, {:invalid_limit, 0}} = AgentDb.recall(top_k: 0)
+    assert {:error, {:invalid_limit, 501}} = AgentDb.recall(top_k: 501)
+    assert {:error, {:invalid_limit, "ten"}} = AgentDb.recall(top_k: "ten")
+  end
+
+  # -- failures are answers, not empty results --
+
+  test "a failed store read is a classified error, never an empty recall" do
+    with_broken_recall(fn ->
+      # The strict read cannot be answered: the reason is the reader pool's
+      # own, bounded.
+      assert {:error, :storage_busy} = AgentDb.recall(uri: @lang)
+
+      # The strict term read answered empty, so the widening read ran -- and
+      # its failure is reported, not turned into `{:ok, []}`.
+      assert {:error, :storage_busy} = AgentDb.recall(uri: @lang, term: "elixir")
+    end)
+  end
+
+  test "a failure's unbounded detail maps to the shared classification" do
+    Application.put_env(:agent_db, :storage_adapter, UnboundedDetailStorage)
+
+    try do
+      assert {:error, :error} = AgentDb.recall(uri: @lang)
+    after
+      Application.delete_env(:agent_db, :storage_adapter)
+    end
+  end
+
+  # The store is made to refuse reads for exactly one recall, so the failure
+  # branch runs against a real `{:error, reason}` from the storage port.
+  defp with_broken_recall(fun) do
+    Application.put_env(:agent_db, :storage_adapter, BrokenRecallStorage)
+
+    try do
+      fun.()
+    after
+      Application.delete_env(:agent_db, :storage_adapter)
+    end
   end
 
   # -- provenance --
@@ -338,6 +472,22 @@ defmodule AgentDb.MemoryTest do
     assert {:ok, [0]} = count_jobs(@lang, "summarize_overview")
   end
 
+  test "recording without its embedding job leaves nothing behind" do
+    # Take the queue away mid-flight: the document and the assertion are
+    # already written when the enqueue fails, and the write is one outcome,
+    # so none of them survives the rollback.
+    restore = break_queue()
+
+    try do
+      assert {:error, _reason} = AgentDb.remember(@lang, "prefers Vim")
+    after
+      restore.()
+    end
+
+    assert {:ok, []} = AgentDb.recall(@lang)
+    assert {:error, :not_found} = AgentDb.read(@lang)
+  end
+
   test "recording and recall work with no model loaded" do
     assert %{embedding: %{loaded: false}, llm: %{loaded: false}} = ModelManager.model_status()
 
@@ -369,6 +519,20 @@ defmodule AgentDb.MemoryTest do
   end
 
   # -- helpers --
+
+  # Takes the job queue away, so an enqueue fails after the document and the
+  # assertion have already been written, and puts it back. The table is renamed
+  # rather than dropped, so work already queued before the break is still there
+  # to be drained when the queue returns.
+  defp break_queue do
+    rename = fn statement ->
+      AgentDb.Store.Writer.call(fn conn -> SQLite.exec(conn, statement) end)
+    end
+
+    rename.("ALTER TABLE job_queue RENAME TO job_queue_missing")
+
+    fn -> rename.("ALTER TABLE job_queue_missing RENAME TO job_queue") end
+  end
 
   defp count_memory_meta(uri) do
     Reader.read(fn conn ->

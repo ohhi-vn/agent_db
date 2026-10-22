@@ -34,6 +34,31 @@ defmodule AgentDb.Store.Nodes do
     end
   end
 
+  @doc "Fetches several nodes in one read."
+  @spec get_many(SQLite.conn(), [String.t()]) :: {:ok, [node_row() | nil]} | {:error, term()}
+  def get_many(_conn, []) do
+    {:ok, []}
+  end
+
+  def get_many(conn, uris) do
+    placeholders = Enum.map_join(uris, ", ", fn _ -> "?" end)
+
+    case SQLite.query(
+           conn,
+           "SELECT uri, parent_uri, name, kind, content, abstract, overview, enabled, group_tag FROM nodes WHERE uri IN (#{placeholders})",
+           uris
+         ) do
+      {:ok, rows} ->
+        nodes = Enum.map(rows, &row_to_node/1)
+        by_uri = Map.new(nodes, &{&1.uri, &1})
+
+        {:ok, Enum.map(uris, &Map.get(by_uri, &1))}
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
   @doc "Lists children (direct) of a parent URI, ordered by name."
   @spec children(SQLite.conn(), String.t()) :: {:ok, [node_row()]} | {:error, term()}
   def children(conn, parent_uri) do
@@ -158,8 +183,60 @@ defmodule AgentDb.Store.Nodes do
     )
   end
 
-  # Vec tables only exist when sqlite-vec loaded. Every dim table plus legacy
-  # `vec_nodes` is purged so a removed URI leaves rows in none of them.
+  @doc """
+  Removes the node at exactly `uri`, and the memory assertions recorded there,
+  leaving any descendant alone. On a connection the caller already holds.
+
+  A memory URI can hold child memories, so removing one memory is not a
+  request to remove the subtree beneath it. The vec rows for this URI go too,
+  so a removed node leaves no vector naming it.
+  """
+  @spec remove_node(SQLite.conn(), String.t()) :: :ok | {:error, term()}
+  def remove_node(conn, uri) do
+    with :ok <- delete_node_row(conn, uri),
+         :ok <- delete_memory_rows(conn, uri),
+         :ok <- delete_vec_rows(conn, uri) do
+      :ok
+    end
+  end
+
+  defp delete_node_row(conn, uri) do
+    SQLite.exec_write(conn, "DELETE FROM nodes WHERE uri = ?1", [uri])
+  end
+
+  defp delete_memory_rows(conn, uri) do
+    SQLite.exec_write(conn, "DELETE FROM memory_meta WHERE uri = ?1", [uri])
+  end
+
+  defp delete_vec_rows(conn, uri) do
+    if SQLite.vec_available?(conn) do
+      case SQLite.list_vec_dims(conn) do
+        {:ok, dims} ->
+          Enum.reduce_while(dims, :ok, fn dim, :ok ->
+            case SQLite.exec_write(
+                   conn,
+                   "DELETE FROM \"#{SQLite.vec_table(dim)}\" WHERE uri = ?1",
+                   [uri]
+                 ) do
+              :ok -> {:cont, :ok}
+              {:error, _} = err -> {:halt, err}
+            end
+          end)
+          |> case do
+            :ok -> delete_legacy_vec_row(conn, uri)
+            {:error, _} = err -> err
+          end
+
+        {:error, _} = err ->
+          err
+      end
+    else
+      :ok
+    end
+  end
+
+  # Vec tables only exist when sqlite-vec extension is not loaded, since the
+  # table does not exist there.
   defp delete_vec_nodes(conn, uri, prefix) do
     if SQLite.vec_available?(conn) do
       case SQLite.list_vec_dims(conn) do
@@ -199,6 +276,20 @@ defmodule AgentDb.Store.Nodes do
           "DELETE FROM vec_nodes WHERE uri = ?1 OR uri LIKE ?2 ESCAPE '\\'",
           [uri, prefix]
         )
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp delete_legacy_vec_row(conn, uri) do
+    case SQLite.query_one(
+           conn,
+           "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'vec_nodes'",
+           []
+         ) do
+      {:ok, [1]} ->
+        SQLite.exec_write(conn, "DELETE FROM vec_nodes WHERE uri = ?1", [uri])
 
       _ ->
         :ok

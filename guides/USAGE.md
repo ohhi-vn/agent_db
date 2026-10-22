@@ -141,9 +141,12 @@ abstracts or overviews. Empty match → `{:ok, []}`.
 
 Typed durable facts under `viking://user/memories/<type>/<name>`. Types:
 `profile`, `preferences`, `entities`, `events`, `experiences`. The URI is the
-identity: writing the same URI revises (old value superseded, still
-inspectable); a different URI adds. No model participates — fully
-deterministic.
+identity: writing a URI revises what it holds (old value superseded, still
+inspectable) rather than adding a second memory; a different URI adds its own.
+Re-recording the exact value a URI already holds changes nothing — one
+assertion stays there. No model participates in any of it; a record writes its
+document, its assertion, and its embedding job as one outcome, so a failed
+record leaves nothing behind.
 
 ```elixir
 {:ok, uri} = AgentDb.remember("viking://user/memories/preferences/language", "prefers Elixir",
@@ -156,14 +159,21 @@ deterministic.
 
 - `confidence:` 0.0–1.0, default `0.5` (`AgentDb.default_confidence/0`);
   `importance:` 0.0–1.0, default `0.5`. `candidate: true` records awaiting
-  promotion (also forced by near-zero confidence or duplicate values);
-  `promote_memory/1` activates, `reject_memory_candidate/1` removes without a
-  trace, `pending_memory_candidates/0` lists the review queue.
+  promotion (also forced by near-zero confidence, below `0.1`);
+  `promote_memory/1` activates — carrying the promoted value through the
+  URI's document — `reject_memory_candidate/1` removes without a trace,
+  `pending_memory_candidates/0` lists the review queue. A candidate recorded
+  beside an active belief never overwrites that belief's document: the URI
+  still reads the active value until promotion.
 - `recall()` with no args returns everything active; `type:` / `term:` /
   subtree URI filter; without a term results order by descending confidence,
   with a term by confidence + semantic similarity (exact matches boosted,
-  stale memories penalized); no match → `{:ok, []}`. Every recall records
-  surfacing on the rows it returns.
+  stale memories penalized, importance swaying near-equals); no match →
+  `{:ok, []}`. Every recalled memory
+  reports its own `type`, derived from its own URI rather than the scope the
+  recall was issued against. Every recall records surfacing on the rows it
+  returns. A recall against a malformed URI reports
+  `{:error, :invalid_uri}` rather than raising.
 - `memory_conflicts/0` reports similar active memories at distinct URIs
   read-only (no inference of its own); `{:error, :embeddings_unavailable}`
   when there is nothing stored to compare.

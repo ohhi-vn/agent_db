@@ -70,7 +70,8 @@ defmodule AgentDb.Core.Storage do
           status: :active | :superseded | :candidate,
           supersedes: integer() | nil,
           last_surfaced_at: integer() | nil,
-          updated_at: integer()
+          updated_at: integer(),
+          truncated: boolean() | nil
         }
 
   @typedoc "Two active memories at distinct URIs that may conflict."
@@ -123,6 +124,9 @@ defmodule AgentDb.Core.Storage do
 
   @doc "The node at `uri`, or `{:ok, nil}` when nothing is stored there."
   @callback get_node(String.t()) :: {:ok, tree_node() | nil} | {:error, term()}
+
+  @doc "The nodes at these URIs in one read, in the same order as the input (missing ones as nil)."
+  @callback get_nodes([String.t()]) :: {:ok, [tree_node() | nil]} | {:error, term()}
 
   @doc """
   Writes a document at `uri`, creating missing parent directories.
@@ -311,28 +315,79 @@ defmodule AgentDb.Core.Storage do
               {:ok, :ok} | {:error, term()}
 
   @doc """
-  Writes a memory's document and its assertion together, so a URI never holds a document no assertion backs.
+  Writes a memory's document, its assertion, and its required background work
+  together, so a URI never holds a document no assertion backs, and a memory
+  reported as recorded never lacks the job that makes it searchable.
 
-  `opts` carries `:importance` (0.0..1.0, defaults when absent) and `:status`
-  (`:active` by default, or `:candidate` for a record awaiting promotion).
+  `opts` carries `:importance` (0.0..1.0, defaults when absent), `:status`
+  (`:active` by default, or `:candidate` for a record awaiting promotion), and
+  `:jobs` -- the required background work for the write, as a list of
+  `{kind, payload}` pairs, as `put_document/3` takes. An active re-record of the
+  value the URI already asserts is a no-op: the URI keeps its one assertion. A
+  candidate recorded at a URI that already holds a document does not overwrite
+  that document: the active belief is what the document is read through, and
+  `promote_memory/1` is what repairs it on promotion. A candidate at a URI
+  holding no document still gets one, so the URI is a document of the tree
+  like any other.
+
   Implementations SHOULD accept the options as a trailing keyword with a
   default, so callers that pass none keep working unchanged.
   """
   @callback put_memory(String.t(), String.t(), float(), String.t() | nil, keyword()) ::
               {:ok, :ok} | {:error, term()}
 
-  @doc "Assertions at `prefix` or beneath it, most confident first."
-  @callback recall_memories(String.t(), String.t() | nil, [
-              :active | :superseded | :candidate
-            ]) ::
+  @doc """
+  Assertions at `prefix` or beneath it, most confident first.
+
+  `opts` bounds the read the way `search/2` bounds its legs:
+
+    - `:top_k` - the bound this read materialises, 1..500 (default 500).
+      Out of range is `{:error, {:invalid_limit, value}}` rather than a
+      silently substituted bound. Every returned row reports whether the
+      bound was reached as `truncated: true | false`, so a caller can tell
+      "there is nothing more" from "there is more than I asked for".
+    - `:source` - restricts to assertions recorded from that provenance.
+
+  Implementations SHOULD accept `opts` as a fourth argument with a default,
+  so existing three-argument calls keep working.
+  """
+  @callback recall_memories(
+              String.t(),
+              String.t() | nil,
+              [
+                :active | :superseded | :candidate
+              ],
+              keyword()
+            ) ::
               {:ok, [memory_row()]} | {:error, term()}
+
+  @doc """
+  The stored embedding vectors of these URIs, keyed by URI as float32 blobs.
+
+  Vectors come back from the active vector dimension only: a URI not yet
+  embedded, or embedded under another dimensionality, is simply absent from
+  the answer rather than an error. The read is storage-only -- it never waits
+  on inference and never triggers model work -- because it exists so the term
+  recall can rank from what is already on disk instead of re-embedding the
+  candidate values it was handed.
+  """
+  @callback load_memory_vectors([String.t()]) ::
+              {:ok, %{String.t() => binary()}} | {:error, term()}
 
   @doc "Whether any assertion is recorded at `uri`, superseded and candidate ones included."
   @callback memory_recorded?(String.t()) :: {:ok, boolean()} | {:error, term()}
 
   @doc """
+  Counts of memories per type and per status, the number waiting for review, and
+  the number never surfaced, computed by the store without materialising every
+  memory.
+  """
+  @callback memory_stats() :: {:ok, map()} | {:error, term()}
+
+  @doc """
   Promotes the latest candidate at `uri` to the active assertion, superseding
-  any prior active one. `{:error, :no_candidate}` when none is waiting.
+  any prior active one, and carries the promoted value through the read-through
+  document at `uri`. `{:error, :no_candidate}` when none is waiting.
   """
   @callback promote_memory(String.t()) :: {:ok, :promoted} | {:error, term()}
 

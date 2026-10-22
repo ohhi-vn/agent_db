@@ -64,6 +64,7 @@ defmodule AgentDbWeb.AdminComponents do
       <.nav_link page={:storage} label="Storage" href="/admin/storage" active={@active} />
       <.nav_link page={:skills} label="Skills" href="/admin/skills" active={@active} />
       <.nav_link page={:sessions} label="Sessions" href="/admin/sessions" active={@active} />
+      <.nav_link page={:memories} label="Memories" href="/admin/memories" active={@active} />
     </nav>
     """
   end
@@ -350,7 +351,11 @@ defmodule AgentDbWeb.AdminComponents do
     ~H"""
     <section class="admin-card admin-card-amber rounded-lg border border-gray-200 bg-white shadow-sm">
       <h2 class="admin-card-title px-4 py-3 font-medium text-gray-900">Queue</h2>
-      <dl class="grid grid-cols-5 gap-4 px-4 pb-2 text-sm">
+      <p :if={Map.get(@detail, :available, true) == false} class="px-4 pb-2 text-sm text-red-700">
+        Queue unavailable: <%= Map.get(@detail, :reason, :error) %>
+      </p>
+
+      <dl :if={Map.get(@detail, :available, true) != false} class="grid grid-cols-5 gap-4 px-4 pb-2 text-sm">
         <div :for={status <- [:pending, :running, :done, :failed]}>
           <dt class="text-gray-500"><%= status %></dt>
           <dd class="text-lg font-semibold text-gray-900"><%= Map.get(@jobs, status, 0) %></dd>
@@ -366,11 +371,15 @@ defmodule AgentDbWeb.AdminComponents do
       </ul>
       <ul id="failed-jobs" :if={Map.get(@detail, :failed, []) != []} class="divide-y divide-gray-100 border-t border-gray-200">
         <li :for={job <- @detail.failed} class="px-4 py-2 text-sm">
+          <span class="font-mono text-gray-900">#<%= job.id %></span>
           <span class="font-mono text-gray-900"><%= job.kind %></span>
           <span class="font-mono text-gray-500"><%= job.uri %></span>
           <span class="text-red-700"><%= job.last_error || "no reason recorded" %></span>
           <span class="text-gray-500">
             attempts <%= job.attempts %>/<%= job.max_attempts %>
+          </span>
+          <span class="text-gray-500">
+            failed at <%= format_ms(job.failed_at) %>
           </span>
         </li>
       </ul>
@@ -924,7 +933,12 @@ defmodule AgentDbWeb.AdminComponents do
     ~H"""
     <section class="admin-card admin-card-emerald rounded-lg border border-gray-200 bg-white shadow-sm">
       <h2 class="admin-card-title px-4 py-3 font-medium text-gray-900">Storage</h2>
-      <dl class="grid grid-cols-4 gap-4 px-4 pb-2 text-sm">
+
+      <p :if={Map.get(@storage, :available, true) == false} class="px-4 pb-2 text-sm text-red-700">
+        Storage unavailable: <%= Map.get(@storage, :reason, :error) %>
+      </p>
+
+      <dl :if={Map.get(@storage, :available, true) != false} class="grid grid-cols-4 gap-4 px-4 pb-2 text-sm">
         <div>
           <dt class="text-gray-500">documents</dt>
           <dd class="text-lg font-semibold text-gray-900"><%= Map.get(@storage, :documents, 0) %></dd>
@@ -1015,10 +1029,23 @@ defmodule AgentDbWeb.AdminComponents do
     ~H"""
     <section class="admin-card admin-card-teal rounded-lg border border-gray-200 bg-white shadow-sm">
       <h2 class="admin-card-title px-4 py-3 font-medium text-gray-900">Indexes</h2>
+
       <dl class="grid grid-cols-4 gap-4 px-4 pb-4 text-sm">
         <div>
           <dt class="text-gray-500">vector</dt>
           <dd class="font-mono text-gray-900"><%= vector_line(@coverage) %></dd>
+        </div>
+        <div>
+          <dt class="text-gray-500">active dim</dt>
+          <dd class="font-mono text-gray-900"><%= Map.get(@coverage, :active_dim, "—") %></dd>
+        </div>
+        <div>
+          <dt class="text-gray-500">reclaimable</dt>
+          <dd class="font-mono text-gray-900"><%= Map.get(@coverage, :reclaimable, 0) %></dd>
+        </div>
+        <div>
+          <dt class="text-gray-500">missing from active dim</dt>
+          <dd class="font-mono text-gray-900"><%= missing_from_active(@coverage) %></dd>
         </div>
         <div>
           <dt class="text-gray-500">code</dt>
@@ -1051,8 +1078,48 @@ defmodule AgentDbWeb.AdminComponents do
     end
   end
 
-  attr(:runtime, :map, required: true)
-  attr(:errors, :list, default: [])
+  defp missing_from_active(coverage) do
+    documents = Map.get(coverage, :documents, 0) || 0
+    vectors = Map.get(coverage, :vectors, 0) || 0
+
+    if Map.get(coverage, :available, false) do
+      max(documents - vectors, 0)
+    else
+      "index not available"
+    end
+  end
+
+  def operation_stats(assigns) do
+    ~H"""
+    <section class="admin-card admin-card-blue rounded-lg border border-gray-200 bg-white shadow-sm">
+      <h2 class="admin-card-title px-4 py-3 font-medium text-gray-900">Operation statistics</h2>
+      <table class="w-full text-sm">
+        <thead>
+          <tr class="text-left text-gray-500">
+            <th class="px-4 py-2">operation</th>
+            <th class="px-4 py-2">success</th>
+            <th class="px-4 py-2">failure</th>
+            <th class="px-4 py-2">error rate</th>
+            <th class="px-4 py-2">p50</th>
+            <th class="px-4 py-2">p95</th>
+          </tr>
+        </thead>
+        <tbody>
+          <%= for {{family, dimension}, info} <- @stats do %>
+            <tr>
+              <td class="px-4 py-2 font-mono"><%= Map.get(dimension, :operation) || Map.get(dimension, :kind) || family %></td>
+              <td class="px-4 py-2"><%= Map.get(info, :success, 0) %></td>
+              <td class="px-4 py-2"><%= Map.get(info, :failure, 0) %></td>
+              <td class="px-4 py-2"><%= :erlang.float_to_binary(Map.get(info, :error_rate, 0.0) * 1.0, decimals: 2) %></td>
+              <td class="px-4 py-2"><%= Map.get(info, :p50) %></td>
+              <td class="px-4 py-2"><%= Map.get(info, :p95) %></td>
+            </tr>
+          <% end %>
+        </tbody>
+      </table>
+    </section>
+    """
+  end
 
   @doc "How long the node has been up, what it is running, and what has failed."
   def runtime(assigns) do
@@ -1128,4 +1195,46 @@ defmodule AgentDbWeb.AdminComponents do
     do: "One of those files is larger than one import accepts."
 
   defp upload_error_to_string(reason), do: Context.skill_import_error(reason)
+
+  attr(:stats, :map, default: %{})
+
+  def memory_stats(assigns) do
+    ~H"""
+    <section class="admin-card admin-card-purple rounded-lg border border-gray-200 bg-white shadow-sm">
+      <h2 class="admin-card-title px-4 py-3 font-medium text-gray-900">Memory statistics</h2>
+      <p class="px-4 pb-2 text-sm text-gray-500">per type</p>
+      <ul class="px-4 pb-2 text-sm">
+        <li :for={{type, count} <- Enum.sort(Map.get(@stats, :by_type, Map.get(@stats, :types, %{})))}><%= type %>: <%= count %></li>
+      </ul>
+      <p class="px-4 pb-2 text-sm text-gray-500">per status</p>
+      <ul class="px-4 pb-2 text-sm">
+        <li :for={{status, count} <- Enum.sort(Map.get(@stats, :by_status, Map.get(@stats, :statuses, %{})))}><%= status %>: <%= count %></li>
+      </ul>
+      <p class="px-4 pb-2 text-sm text-gray-500">waiting for review: <%= Map.get(@stats, :pending, Map.get(@stats, :waiting, 0)) %></p>
+      <p class="px-4 pb-2 text-sm text-gray-500">never surfaced: <%= Map.get(@stats, :never_surfaced, Map.get(@stats, :unsurfaced, 0)) %></p>
+    </section>
+    """
+  end
+
+  attr(:candidates, :list, default: [])
+
+  def memory_candidates(assigns) do
+    ~H"""
+    <section class="admin-card admin-card-purple rounded-lg border border-gray-200 bg-white shadow-sm">
+      <h2 class="admin-card-title px-4 py-3 font-medium text-gray-900">Waiting for review</h2>
+      <ul :if={@candidates == []} class="px-4 pb-4 text-sm text-gray-500">
+        <li>No candidates waiting</li>
+      </ul>
+      <ul id="memory-candidates" :if={@candidates != []} class="divide-y divide-gray-100">
+        <li :for={m <- @candidates} class="px-4 py-2 text-sm">
+          <span class="font-mono text-gray-900"><%= m.uri %></span>
+          <span class="text-gray-700"><%= m.value %></span>
+          <button phx-click="promote" phx-value-uri={m.uri} class="ml-2 text-green-700">Promote</button>
+          <button phx-click="reject" phx-value-uri={m.uri} class="ml-2 text-red-700">Reject</button>
+          <button phx-click="forget" phx-value-uri={m.uri} class="ml-2 text-gray-700">Forget</button>
+        </li>
+      </ul>
+    </section>
+    """
+  end
 end

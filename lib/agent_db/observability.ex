@@ -45,7 +45,7 @@ defmodule AgentDb.Observability do
   the traffic through it.
   """
   @spec operation_stats() :: map()
-  def operation_stats, do: AgentDb.Observability.Sink.counts()
+  def operation_stats, do: AgentDb.Observability.Sink.stats()
 
   @doc """
   Runs `fun`, emitting a low-cardinality operation measurement.
@@ -59,40 +59,61 @@ defmodule AgentDb.Observability do
 
     try do
       result = with_correlation(otel_correlation(), fun)
-      emit_operation(operation, outcome_of(result), start, meta)
+      emit_operation(operation, outcome_of(result), reason_of(result), start, meta)
       result
     rescue
       error ->
-        emit_operation(operation, :error, start, meta)
+        emit_operation(operation, :error, nil, start, meta)
         reraise error, __STACKTRACE__
     catch
       :exit, reason ->
-        emit_operation(operation, :error, start, meta)
+        emit_operation(operation, :error, nil, start, meta)
         exit(reason)
 
       :throw, value ->
-        emit_operation(operation, :error, start, meta)
+        emit_operation(operation, :error, nil, start, meta)
         throw(value)
     end
   end
 
+  # The classified code rides with the measurement when the operation failed,
+  # so a sink entry, a metric series, and a transport error response join on
+  # one code. A crash carries none: nothing was returned, and the generic
+  # `:error` is its classification here exactly as it is in the transport.
+  defp reason_of({:error, reason}), do: reason
+  defp reason_of(_), do: nil
+
   @doc "Emits a job queue/execution measurement with queue-wait vs execution split."
-  @spec emit_job(atom() | term(), :ok | :error | atom(), non_neg_integer(), non_neg_integer()) ::
+  @spec emit_job(
+          atom() | term(),
+          :ok | :error | atom(),
+          non_neg_integer(),
+          non_neg_integer(),
+          term()
+        ) ::
           :ok
-  def emit_job(kind, outcome, queue_wait_ms, execution_ms) do
-    safe_emit(@job_event, %{queue_wait_ms: queue_wait_ms, execution_ms: execution_ms}, %{
-      kind: bounded_kind(kind),
-      outcome: normalize_outcome(outcome)
-    })
+  def emit_job(kind, outcome, queue_wait_ms, execution_ms, reason \\ nil) do
+    safe_emit(
+      @job_event,
+      %{queue_wait_ms: queue_wait_ms, execution_ms: execution_ms},
+      code_metadata(reason, %{
+        kind: bounded_kind(kind),
+        outcome: normalize_outcome(outcome)
+      })
+    )
   end
 
   @doc "Emits a model load/inference measurement."
-  @spec emit_model(atom() | term(), atom(), non_neg_integer()) :: :ok
-  def emit_model(role, outcome, duration_ms) do
-    safe_emit(@model_event, %{duration_ms: duration_ms}, %{
-      role: bounded_kind(role),
-      outcome: normalize_outcome(outcome)
-    })
+  @spec emit_model(atom() | term(), atom(), non_neg_integer(), term()) :: :ok
+  def emit_model(role, outcome, duration_ms, reason \\ nil) do
+    safe_emit(
+      @model_event,
+      %{duration_ms: duration_ms},
+      code_metadata(reason, %{
+        role: bounded_kind(role),
+        outcome: normalize_outcome(outcome)
+      })
+    )
   end
 
   @doc """
@@ -433,7 +454,7 @@ defmodule AgentDb.Observability do
   defp bounded_kind(kind) when is_atom(kind), do: kind
   defp bounded_kind(_), do: :unknown
 
-  defp emit_operation(operation, outcome, start, meta) do
+  defp emit_operation(operation, outcome, reason, start, meta) do
     duration = System.monotonic_time(:millisecond) - start
 
     safe_meta =
@@ -445,7 +466,7 @@ defmodule AgentDb.Observability do
         outcome: normalize_outcome(outcome)
       })
 
-    safe_emit(@operation_event, %{duration_ms: duration}, safe_meta)
+    safe_emit(@operation_event, %{duration_ms: duration}, code_metadata(reason, safe_meta))
   end
 
   defp outcome_of(:ok), do: :ok
@@ -453,10 +474,30 @@ defmodule AgentDb.Observability do
   defp outcome_of({:error, _}), do: :error
   defp outcome_of(_), do: :ok
 
+  # The metadata carries the code only when there is a reason behind it. The
+  # code is the transport's own flattening of the reason (`error_tag/1`), so
+  # the tag a client saw is the tag the metric and the log entry hold.
+  defp code_metadata(nil, metadata), do: metadata
+
+  defp code_metadata(reason, metadata) do
+    Map.put(metadata, :code, error_tag(reason))
+  end
+
+  # The fixed outcome set every measurement carries: the documented set the
+  # sink and the guide count. A background job's real ending keeps its own
+  # label -- its storage decided stored, its node disappeared discarded, its
+  # model still loading deferred, its attempts exhausted failed -- and
+  # whatever else arrives is never silently a success: until it is named it
+  # counts as an error, the honest nearest fact.
   defp normalize_outcome(:ok), do: :ok
+  defp normalize_outcome(:stored), do: :ok
   defp normalize_outcome(:error), do: :error
   defp normalize_outcome({:error, _}), do: :error
-  defp normalize_outcome(_), do: :ok
+  defp normalize_outcome(:deferred), do: :deferred
+  defp normalize_outcome(:failed), do: :failed
+  defp normalize_outcome(:discarded), do: :discarded
+
+  defp normalize_outcome(_), do: :error
 
   defp safe_emit(event, measurements, metadata) do
     try do

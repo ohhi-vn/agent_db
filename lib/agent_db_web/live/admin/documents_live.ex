@@ -216,9 +216,6 @@ defmodule AgentDbWeb.Admin.DocumentsLive do
 
       {:ok, %{updated: updated, failed: failed}} ->
         "#{verb} #{updated} document(s), #{failed} failed"
-
-      {:error, reason} ->
-        "Bulk action failed: #{Observability.error_message(reason)}"
     end
   end
 
@@ -238,9 +235,6 @@ defmodule AgentDbWeb.Admin.DocumentsLive do
 
       {:ok, %{updated: updated, failed: failed}} ->
         "Set group for #{updated} document(s) to #{group_word(tag)}, #{failed} failed"
-
-      {:error, reason} ->
-        "Bulk action failed: #{Observability.error_message(reason)}"
     end
   end
 

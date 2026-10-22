@@ -35,11 +35,17 @@ defmodule AgentDbWeb.Admin do
       @before_compile AgentDbWeb.Admin
 
       @impl Phoenix.LiveView
-      def mount(_params, _session, socket),
-        do: {:ok, AgentDbWeb.Admin.connect(__MODULE__, socket)}
+      def mount(_params, session, socket),
+        do: {:ok, AgentDbWeb.Admin.connect(__MODULE__, socket, session || %{})}
 
       @impl Phoenix.LiveView
-      def handle_params(_params, _uri, socket), do: {:noreply, load(socket)}
+      def handle_params(_params, _uri, socket) do
+        if socket.assigns[:_loaded] do
+          {:noreply, socket}
+        else
+          {:noreply, load(socket)}
+        end
+      end
 
       @impl Phoenix.LiveView
       def handle_info(message, socket) do
@@ -64,7 +70,12 @@ defmodule AgentDbWeb.Admin do
   end
 
   @doc false
-  def connect(page, socket) do
+  def connect(page, socket, session \\ %{}) do
+    session_key =
+      Map.get(session, "_csrf_token") || Map.get(session, "live_socket_id") || "default"
+
+    sidebar = sidebar_state(session_key)
+
     if connected?(socket) do
       # The root is an ancestor of every change, so one subscription sees all
       # writes, removals, replacements and commits. Process-scoped: it ends
@@ -81,12 +92,15 @@ defmodule AgentDbWeb.Admin do
     socket
     |> assign(
       active: page.admin_page(),
+      sidebar: sidebar,
+      _session_key: session_key,
       recent_changes: [],
       last_reload_ms: last_reload_ms,
       reload_pending: false,
       notice: nil
     )
     |> page.load()
+    |> assign(_loaded: true)
   end
 
   @doc false
@@ -115,6 +129,50 @@ defmodule AgentDbWeb.Admin do
   end
 
   def handle_info(_page, _message, socket), do: {:noreply, socket}
+
+  def handle_event("toggle_sidebar", _params, socket) do
+    sidebar = if socket.assigns[:sidebar] == "hidden", do: "shown", else: "hidden"
+    session_key = socket.assigns[:_session_key] || "default"
+    put_sidebar_state(session_key, sidebar)
+    {:noreply, assign(socket, sidebar: sidebar)}
+  end
+
+  defp sidebar_state(key) do
+    ensure_sidebar_table()
+
+    case :ets.lookup(:agent_db_sidebar, key) do
+      [{^key, value}] -> value
+      [] -> "shown"
+    end
+  rescue
+    _ -> "shown"
+  catch
+    _, _ -> "shown"
+  end
+
+  defp put_sidebar_state(key, value) do
+    ensure_sidebar_table()
+    :ets.insert(:agent_db_sidebar, {key, value})
+    :ok
+  rescue
+    _ -> :ok
+  catch
+    _, _ -> :ok
+  end
+
+  defp ensure_sidebar_table do
+    if :ets.whereis(:agent_db_sidebar) == :undefined do
+      :ets.new(:agent_db_sidebar, [
+        :set,
+        :named_table,
+        :public,
+        read_concurrency: true,
+        write_concurrency: true
+      ])
+    end
+
+    :ok
+  end
 
   # A reload refreshes the page's live sections and stamps the time, clearing any
   # pending coalesced reload. Operator working state (search results, import

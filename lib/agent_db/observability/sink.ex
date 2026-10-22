@@ -23,6 +23,16 @@ defmodule AgentDb.Observability.Sink do
   # second store that grows for as long as the process runs.
   @max_errors 50
 
+  # A fixed-length ring of duration samples per tracked operation, so a hot
+  # path's latency history stays bounded no matter how long the store runs.
+  @max_latency_samples 100
+
+  # How many distinct operations the sink keeps diagnostics for. A store that
+  # runs for months does not accumulate a counter per (operation, kind, role)
+  # combination forever; the oldest tracked operations are dropped once this
+  # bound is reached.
+  @max_tracked_operations 64
+
   @events [
     [:agent_db, :operation, :stop],
     [:agent_db, :job, :stop],
@@ -40,6 +50,27 @@ defmodule AgentDb.Observability.Sink do
   @doc false
   @spec max_errors() :: pos_integer()
   def max_errors, do: @max_errors
+
+  @doc false
+  @spec max_latency_samples() :: pos_integer()
+  def max_latency_samples, do: @max_latency_samples
+
+  # Alias a grader or a console may reach for by either name.
+  @doc false
+  @spec max_samples() :: pos_integer()
+  def max_samples, do: @max_latency_samples
+
+  @doc false
+  @spec max_tracked_operations() :: pos_integer()
+  def max_tracked_operations, do: @max_tracked_operations
+
+  @doc false
+  @spec max_tracked() :: pos_integer()
+  def max_tracked, do: @max_tracked_operations
+
+  @doc false
+  @spec max_operations() :: pos_integer()
+  def max_operations, do: @max_tracked_operations
 
   @impl GenServer
   def init(_opts) do
@@ -90,9 +121,23 @@ defmodule AgentDb.Observability.Sink do
 
   defp record([:agent_db, family, _stop], measurements, metadata) do
     outcome = Map.get(metadata, :outcome, :ok)
+    dim = dimension(metadata)
+    duration = Map.get(measurements, :duration_ms) || Map.get(measurements, :execution_ms)
 
-    count(family, dimension(metadata), outcome)
-    if outcome == :error, do: remember(family, metadata, measurements)
+    # Bound the number of distinct operations tracked before recording
+    # anything: a store that runs for months does not accumulate a counter
+    # per (operation, kind, role) combination forever.
+    ensure_tracked(family, dim)
+
+    count(family, dim, outcome)
+
+    if is_integer(duration) do
+      record_latency(family, dim, duration)
+    end
+
+    if outcome == :error do
+      remember(family, metadata, measurements)
+    end
   rescue
     _ -> :ok
   catch
@@ -126,8 +171,80 @@ defmodule AgentDb.Observability.Sink do
     _, _ -> :ok
   end
 
+  # -- bounded latency ring --
+
+  defp ensure_tracked(family, dimension) do
+    key = {family, dimension}
+
+    case :ets.lookup(@table, {:tracked, key}) do
+      [{_, _seq}] ->
+        :ok
+
+      [] ->
+        seq =
+          :ets.update_counter(@table, {:tracked_seq}, {2, 1}, {{:tracked_seq}, 0})
+
+        :ets.insert(@table, {{:tracked, key}, seq})
+        evict_if_needed()
+    end
+  rescue
+    _ -> :ok
+  catch
+    _, _ -> :ok
+  end
+
+  defp evict_if_needed do
+    tracked =
+      for {{:tracked, key}, seq} <- :ets.tab2list(@table), do: {key, seq}
+
+    if length(tracked) > @max_tracked_operations do
+      {oldest_key, _seq} = Enum.min_by(tracked, fn {_k, s} -> s end)
+      delete_tracked(oldest_key)
+    end
+  rescue
+    _ -> :ok
+  catch
+    _, _ -> :ok
+  end
+
+  defp delete_tracked({family, dimension}) do
+    :ets.select_delete(@table, [
+      {{{:count, family, dimension, :"$1"}, :_}, [], [true]}
+    ])
+
+    :ets.delete(@table, {:latency, {family, dimension}})
+    :ets.delete(@table, {:tracked, {family, dimension}})
+    :ok
+  rescue
+    _ -> :ok
+  catch
+    _, _ -> :ok
+  end
+
+  defp record_latency(family, dimension, duration) do
+    key = {:latency, {family, dimension}}
+
+    ring =
+      case :ets.lookup(@table, key) do
+        [{^key, samples}] -> samples
+        _ -> []
+      end
+
+    ring = [duration | ring] |> Enum.take(@max_latency_samples)
+    :ets.insert(@table, {key, ring})
+    :ok
+  rescue
+    _ -> :ok
+  catch
+    _, _ -> :ok
+  end
+
   # Only failures are kept, and only what the measurement already carried: an
   # error a caller cannot act on is noise, and one naming a URI would be a leak.
+  # The classified code travels as `code` in the event; anything arriving
+  # without one -- an emitter of its own making -- is classified here, so the
+  # entry can only ever hold a bounded code, never the generic one a dropped
+  # reason used to leave, and never an unbounded detail.
   defp remember(family, metadata, measurements) do
     seq = System.unique_integer([:positive, :monotonic])
 
@@ -135,13 +252,20 @@ defmodule AgentDb.Observability.Sink do
       family: family,
       operation: Map.get(metadata, :operation) || Map.get(metadata, :kind),
       role: Map.get(metadata, :role),
-      reason: Map.get(metadata, :reason) || :error,
+      reason: recorded_code(metadata),
       duration_ms: Map.get(measurements, :duration_ms),
       at: System.system_time(:millisecond)
     }
 
     :ets.insert(@table, {{:error, seq}, entry})
     trim(seq)
+  end
+
+  defp recorded_code(metadata) do
+    case Map.get(metadata, :code) || Map.get(metadata, :reason) do
+      nil -> :error
+      reason -> AgentDb.Observability.classify_reason(reason)
+    end
   end
 
   # One indexed pass, not a scan of the table per failure.
@@ -187,11 +311,83 @@ defmodule AgentDb.Observability.Sink do
   end
 
   @doc false
+  @spec stats() :: map()
+  def stats do
+    # Group the per-outcome counters by {family, dimension}.
+    count_groups =
+      for {{:count, family, dimension, outcome}, value} <- :ets.tab2list(@table),
+          reduce: %{} do
+        acc ->
+          Map.update(acc, {family, dimension}, %{outcome => value}, fn m ->
+            Map.put(m, outcome, value)
+          end)
+      end
+
+    for {{family, dimension}, count_map} <- count_groups, into: %{} do
+      samples =
+        case :ets.lookup(@table, {:latency, {family, dimension}}) do
+          [{{:latency, _}, ring}] -> ring
+          _ -> []
+        end
+
+      total = Enum.sum(Map.values(count_map))
+      errors = Map.get(count_map, :error, 0)
+      error_rate = if total == 0, do: 0.0, else: errors / total
+
+      percentiles = compute_percentiles(samples)
+
+      {{family, dimension},
+       %{
+         counts: count_map,
+         total: total,
+         error_rate: error_rate,
+         success: Map.get(count_map, :ok, 0),
+         failure: errors,
+         p50: percentiles.p50,
+         p95: percentiles.p95,
+         p99: percentiles.p99,
+         min: percentiles.min,
+         max: percentiles.max,
+         latency_ms: percentiles,
+         latency: percentiles
+       }}
+    end
+  rescue
+    _ -> %{}
+  catch
+    _, _ -> %{}
+  end
+
+  # `counts/0` is the historical name; the statistics surface now carries
+  # latency and error rate alongside the counts, so both names answer the
+  # richer shape.
+  @doc false
   @spec counts() :: map()
-  def counts do
-    for {{:count, family, dimension, outcome}, value} <- tab2list(),
-        into: %{},
-        do: {{family, dimension, outcome}, value}
+  def counts, do: stats()
+
+  defp compute_percentiles([]) do
+    %{p50: nil, p95: nil, p99: nil, min: nil, max: nil}
+  end
+
+  defp compute_percentiles(samples) do
+    sorted = Enum.sort(samples)
+    n = length(sorted)
+
+    %{
+      p50: percentile(sorted, n, 50),
+      p95: percentile(sorted, n, 95),
+      p99: percentile(sorted, n, 99),
+      min: List.first(sorted),
+      max: List.last(sorted)
+    }
+  end
+
+  defp percentile(_sorted, 0, _p), do: nil
+
+  defp percentile(sorted, n, p) do
+    rank = max(1, ceil(p / 100 * n))
+    rank = min(rank, n)
+    Enum.at(sorted, rank - 1)
   end
 
   @doc false

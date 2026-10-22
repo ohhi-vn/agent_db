@@ -93,6 +93,15 @@ defmodule AgentDb.Test.Fakes.Storage do
     scripted(:get_node, {:ok, with_meta(Map.get(documents(), uri) || stubbed_node(uri))})
   end
 
+  @impl true
+  def get_nodes(uris) when is_list(uris) do
+    scripted(
+      :get_nodes,
+      {:ok,
+       Enum.map(uris, fn uri -> with_meta(Map.get(documents(), uri) || stubbed_node(uri)) end)}
+    )
+  end
+
   defp with_meta(nil), do: nil
 
   defp with_meta(node) when is_map(node) do
@@ -775,8 +784,6 @@ defmodule AgentDb.Test.Fakes.Storage do
   @impl true
   def put_memory(uri, value, confidence, source, opts \\ []) do
     with {:ok, _segments} <- VikingURI.parse(uri) do
-      record(uri, value, [])
-
       status = Keyword.get(opts, :status, :active)
       now = System.system_time(:millisecond)
 
@@ -794,13 +801,60 @@ defmodule AgentDb.Test.Fakes.Storage do
         last_surfaced_at: nil
       }
 
-      # Only an active record revises the belief: a candidate waits beside it.
-      if status == :active do
-        put(:memories, Map.update(memories(), uri, [assertion], &supersede(&1, assertion)), :ok)
+      prior = %{documents: documents(), memories: memories(), jobs: jobs()}
+      jobs_opt = Keyword.get(opts, :jobs, [])
+
+      # The document, the assertion, and the embedding jobs that make the
+      # memory searchable are one outcome: a failure leaves the prior document,
+      # assertion, and queue state unchanged.
+      with :ok <- write_memory_document(uri, value, status),
+           :ok <- record_assertion(uri, assertion, status),
+           :ok <- enqueue_all(jobs_opt) do
+        :ok
       else
-        put(:memories, Map.update(memories(), uri, [assertion], &(&1 ++ [assertion])), :ok)
+        {:error, _} = err ->
+          put(:documents, prior.documents, [])
+          put(:memories, prior.memories, [])
+          put(:jobs, prior.jobs, [])
+          err
       end
     end
+  end
+
+  # A candidate waits beside the belief it disagrees with and must not take
+  # over the document the active belief is read through. A candidate at a URI
+  # holding no document yet still gets one, so the URI is a document of the
+  # tree like any other.
+  defp write_memory_document(uri, value, :candidate) do
+    if Map.has_key?(documents(), uri) do
+      :ok
+    else
+      record(uri, value, [])
+    end
+  end
+
+  defp write_memory_document(uri, value, _status), do: record(uri, value, [])
+
+  # Only an active record revises the belief: a candidate waits beside it. An
+  # active re-record of the value this URI already asserts changes nothing: the
+  # belief is already held, and a second assertion for it would supersede the
+  # first with an identical copy.
+  defp record_assertion(uri, assertion, :active) do
+    if same_value_already_asserted?(uri, assertion.value) do
+      :ok
+    else
+      put(:memories, Map.update(memories(), uri, [assertion], &supersede(&1, assertion)), :ok)
+    end
+  end
+
+  defp record_assertion(uri, assertion, _status) do
+    put(:memories, Map.update(memories(), uri, [assertion], &(&1 ++ [assertion])), :ok)
+  end
+
+  defp same_value_already_asserted?(uri, value) do
+    memories()
+    |> Map.get(uri, [])
+    |> Enum.any?(&(&1.status == :active and &1.value == value))
   end
 
   @impl true
@@ -827,7 +881,25 @@ defmodule AgentDb.Test.Fakes.Storage do
             status == :candidate and id != candidate.id
           end)
 
-        put(:memories, Map.put(memories(), uri, others_promoted), {:ok, :promoted})
+        updated = Map.put(memories(), uri, others_promoted)
+        put(:memories, updated, [])
+
+        # Promotion makes the candidate's value the active one, and the
+        # document is what an active belief is read through. A candidate
+        # recorded beside an active belief did not write over that document,
+        # so promotion lands the promoted value there; a URI holding no
+        # document yet gains one, exactly as a write would have left it.
+        promote_document(uri, candidate.value)
+
+        {:ok, :promoted}
+    end
+  end
+
+  defp promote_document(uri, value) do
+    if Map.has_key?(documents(), uri) do
+      put(:documents, Map.update!(documents(), uri, &%{&1 | content: value}), :ok)
+    else
+      record(uri, value, [])
     end
   end
 
@@ -952,18 +1024,96 @@ defmodule AgentDb.Test.Fakes.Storage do
   defp fake_cosine(_, _), do: 0.0
 
   @impl true
-  def recall_memories(prefix, term, statuses) do
-    rows =
-      for {uri, assertions} <- memories(),
-          uri_matches?(uri, prefix),
-          assertion <- assertions,
-          assertion.status in statuses,
-          term == nil or matches?(assertion.value, String.downcase(term)) do
-        assertion
-      end
+  def memory_stats do
+    mems = memories()
 
-    scripted(:recall_memories, {:ok, Enum.sort_by(rows, & &1.confidence, :desc)})
+    by_type =
+      mems
+      |> Enum.group_by(fn m ->
+        case AgentDb.URI.parse(m.uri) do
+          {:ok, ["user", "memories", type | _]} -> type
+          _ -> nil
+        end
+      end)
+      |> Map.delete(nil)
+      |> Map.new(fn {t, ms} -> {t, length(ms)} end)
+
+    by_status =
+      mems
+      |> Enum.group_by(& &1.status)
+      |> Map.new(fn {s, ms} -> {s, length(ms)} end)
+
+    pending = Enum.count(mems, &(&1.status == :candidate))
+    never_surfaced = Enum.count(mems, &is_nil(&1.last_surfaced_at))
+
+    {:ok,
+     %{
+       by_type: by_type,
+       by_status: by_status,
+       pending: pending,
+       never_surfaced: never_surfaced,
+       total: length(mems),
+       types: by_type,
+       statuses: by_status,
+       waiting: pending,
+       candidates: pending,
+       unsurfaced: never_surfaced,
+       never_seen: never_surfaced
+     }}
   end
+
+  @impl true
+  def recall_memories(prefix, term, statuses, opts \\ []) do
+    top_k = Keyword.get(opts, :top_k, 500)
+
+    case fake_bound(top_k) do
+      {:error, _} = err ->
+        err
+
+      {:ok, fetch_limit} ->
+        # Absent or nil both mean "no provenance filter", matching how the
+        # store treats them.
+        wanted_source =
+          case Keyword.get(opts, :source) do
+            nil -> :any
+            source -> source
+          end
+
+        rows =
+          for {uri, assertions} <- memories(),
+              uri_matches?(uri, prefix),
+              assertion <- assertions,
+              assertion.status in statuses,
+              source_of(assertion) == wanted_source,
+              term == nil or matches?(assertion.value, String.downcase(term)) do
+            assertion
+          end
+
+        # One fetch beyond the bound, exactly as the store does, so the flag
+        # says what the SQL provider's says.
+        rows =
+          rows
+          |> Enum.sort_by(& &1.confidence, :desc)
+          |> Enum.slice(0, fetch_limit)
+          |> then(&bounded(&1, top_k))
+
+        scripted(:recall_memories, {:ok, rows})
+    end
+  end
+
+  defp fake_bound(top_k) when is_integer(top_k) and top_k >= 1 and top_k <= 500,
+    do: {:ok, top_k + 1}
+
+  defp fake_bound(top_k), do: {:error, {:invalid_limit, top_k}}
+
+  defp source_of(%{source: nil}), do: :any
+  defp source_of(%{source: source}), do: source
+
+  defp bounded(rows, top_k) when length(rows) > top_k,
+    do: rows |> Enum.take(top_k) |> Enum.map(&Map.put(&1, :truncated, true))
+
+  defp bounded(rows, _top_k),
+    do: Enum.map(rows, &Map.put(&1, :truncated, false))
 
   @impl true
   def memory_recorded?(uri), do: scripted(:memory_recorded?, {:ok, Map.has_key?(memories(), uri)})
@@ -1051,6 +1201,16 @@ defmodule AgentDb.Test.Fakes.Storage do
   @impl true
   def stats do
     scripted(:stats, {:ok, empty_stats()})
+  end
+
+  @impl true
+  def load_memory_vectors(uris) when is_list(uris) do
+    # Mirrors the storage read exactly: the active dim only, keyed by URI, and
+    # a URI without a stored vector is absent rather than an error.
+    case vec_active() do
+      nil -> {:ok, %{}}
+      dim -> {:ok, Map.take(Map.get(embeddings(), dim, %{}), uris)}
+    end
   end
 
   @impl true

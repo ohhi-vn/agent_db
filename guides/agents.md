@@ -136,6 +136,7 @@ non-zero.
 | `context_list`, `context_tree` | `list`, `tree` |
 | `context_search`, `context_find`, `context_grep` | `search`, `find`, `grep` |
 | `memory_recall`, `memory_remember`, `memory_forget` | `recall`, `remember`, `forget` |
+| `memory_candidates`, `memory_promote`, `memory_reject` | `pending_memory_candidates`, `promote_memory`, `reject_memory_candidate` |
 | `session_create`, `session_append`, `session_get`, `session_commit` | `create_session`, `append_message`, `get_session`, `commit_session` |
 | `store_health` | `health_check` + `model_status` + `queue_stats` |
 
