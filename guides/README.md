@@ -13,6 +13,7 @@ you are trying to do.
 | [API-REFERENCE.md](API-REFERENCE.md) | Integrators | All four public interfaces — Elixir API, CLI, MCP tools, WebSocket events — with request/response shapes and the unified error catalog |
 | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) | Operators | Symptom-first diagnostics: each symptom with diagnostic commands, expected output, and resolutions |
 | [agents.md](agents.md) | Editor users | Canonical OpenCode and Zed setup snippets, WSL2 workflow, and CLI fallback |
+| [PUBLISHING.md](PUBLISHING.md) | Maintainers | Cutting and publishing a release to hex.pm (version bump, tag, verify, publish, revert) |
 
 The Elixir module API reference is generated from the code — see
 [mix docs](https://hexdocs.pm/agent_db/AgentDb.html) or run `mix docs`

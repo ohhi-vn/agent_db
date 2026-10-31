@@ -2,6 +2,8 @@
 
 **Embedded offline context store for AI agents** — a persistent URI-addressed tree with vector search, LLM summarization, and optional WebSocket API.
 
+*Node: This is pre-release version, not recommend for product env.*
+
 ## Guides
 
 The [guide index](guides/README.md) lists every guide with its audience. The
@@ -15,6 +17,7 @@ core path:
 - [Monitoring](guides/MONITORING.md) — `/admin` console, telemetry, logs, health checks, alerting.
 - [API reference](guides/API-REFERENCE.md) — Elixir API, CLI, MCP, and WebSocket surfaces with the shared error catalog.
 - [Troubleshooting](guides/TROUBLESHOOTING.md) — symptom-first diagnostics.
+- [Publishing](guides/PUBLISHING.md) — cutting and publishing a release to hex.pm.
 
 The Elixir API reference is generated from the code (`mix docs`) rather than
 written by hand, so it cannot drift from the modules it describes.

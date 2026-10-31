@@ -112,7 +112,7 @@ Documents.read/1
 - `AgentDb.Adapters.Inference.Ollama` — Remote Ollama
 - `AgentDb.Adapters.Inference.OpenAICompatible` — Remote OpenAI-compatible
 
-**Containment at the composition root** (`AgentDb.Runtime`): the runtime is
+**Containment at the composition root** (the runtime composition root): the runtime is
 where a vector-index answer is admitted into the rest of the store, so it is
 also where a failure is contained. A native engine — sqlite-vec is a loadable
 extension, and any that follows will be a NIF — can raise, and a raise inside a
@@ -211,7 +211,7 @@ running → complete() → done
 
 **Surfaces**:
 1. **HTTP REST** (`/api/v1/*`) — JSON API with Bearer auth option
-2. **MCP Streamable HTTP** (`POST /mcp`) — MCP tools/list/call over HTTP
+2. **MCP Streamable HTTP** (`POST /mcp`) — MCP tools/list/call over HTTP. The tool inventory and dispatch live in the core module `AgentDb.Mcp`, reached by both the HTTP edge and in-process sidecar callers; `AgentDbWeb.Mcp` is a compatibility shim.
 3. **WebSocket** (`ws://host:port/api`) — `v1.*` events with `traceparent` propagation
 
 **Authentication**:

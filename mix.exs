@@ -11,6 +11,7 @@ defmodule AgentDb.MixProject do
       start_permanent: Mix.env() == :prod,
       description: "Embedded offline context store for AI agents",
       source_url: "https://github.com/manhvu/agent_db",
+      homepage_url: "https://github.com/manhvu/agent_db",
       # The file set is declared rather than inferred. Hex's default selection
       # is "everything git tracks that is not ignored", and `models/` is
       # tracked here, so the default package would ship model binaries.
@@ -68,7 +69,8 @@ defmodule AgentDb.MixProject do
       licenses: ["MIT"],
       links: %{
         "GitHub" => "https://github.com/manhvu/agent_db",
-        "Docs" => "https://hexdocs.pm/agent_db"
+        "Docs" => "https://hexdocs.pm/agent_db",
+        "Homepage" => "https://github.com/manhvu/agent_db"
       },
       files: [
         "lib",
@@ -78,7 +80,8 @@ defmodule AgentDb.MixProject do
         "README.md",
         "LICENSE",
         "guides"
-      ]
+      ],
+      secret_scan: [ignore: []]
     ]
   end
 
@@ -105,7 +108,8 @@ defmodule AgentDb.MixProject do
         # with that page.
         {"guides/API-REFERENCE.md", filename: "guide-api-reference"},
         "guides/TROUBLESHOOTING.md",
-        "guides/agents.md"
+        "guides/agents.md",
+        "guides/PUBLISHING.md"
       ],
       groups_for_modules: [
         "Context store": [AgentDb, AgentDb.Core.Storage, AgentDb.Core.Transport, AgentDb.Archive],
@@ -146,7 +150,7 @@ defmodule AgentDb.MixProject do
       {:opentelemetry_api, "~> 1.5"},
       {:benchee, "~> 1.0", only: [:dev, :test], runtime: false},
       {:opentelemetry, "~> 1.7", only: [:dev, :test], runtime: false},
-      {:ex_doc, ">= 0.0.0", only: :dev, runtime: false},
+      {:ex_doc, "~> 0.40", only: :dev, runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev], runtime: false},
       # Asset and model-backend tooling. These declare `build_tools: ["mix"]`

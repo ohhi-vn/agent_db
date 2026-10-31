@@ -199,6 +199,29 @@ Confirm the live tool list with `tools/list` (what `tools/install.sh --check`
 asserts against `context_read`). With Bearer auth enabled, send the token as
 `Authorization: Bearer <token>`.
 
+### 3.1 Local (sidecar) invocation
+
+When AgentDb is embedded as a sidecar in a host Elixir application, the same
+tool inventory is reachable in-process through `AgentDb.Mcp`, without JSON-RPC
+or HTTP:
+
+```elixir
+# Discover the inventory
+tools = AgentDb.Mcp.tools()
+
+# Invoke a tool directly
+{:ok, %{"uri" => uri, "content" => content}} =
+  AgentDb.Mcp.call_tool("context_read", %{"uri" => uri})
+
+# Or speak JSON-RPC locally
+AgentDb.Mcp.handle_request(%{"jsonrpc" => "2.0", "id" => 1, "method" => "tools/list"}, [])
+```
+
+`AgentDb.Mcp.call_tool/3` returns `{:ok, term()}` or `{:error, reason}`. A tool
+deferred only because a model is still loading returns `{:error, :model_loading}`.
+`AgentDbWeb.Mcp` remains available as a compatibility shim delegating to
+`AgentDb.Mcp`.
+
 ## 4. WebSocket events (Phoenix Channel `/api`)
 
 Events are `{"event": "v1.*", "payload": {...}}`. The reply is

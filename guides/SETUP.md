@@ -89,6 +89,38 @@ AGENT_DB_HTTP_AUTH=true AGENT_DB_HTTP_AUTH_TOKENS=<token> iex -S mix
 Comma-separated tokens are split on `,` with whitespace trimmed. Serve beyond
 loopback only with Bearer enabled.
 
+## Running as a sidecar in another Elixir app
+
+AgentDb can be embedded as a dependency in a host Elixir application. Add it
+to the host's deps:
+
+```elixir
+def deps do
+  [{:agent_db, "~> 0.1.0"}]
+end
+```
+
+Start the store (the host usually does this in its own supervision tree) and
+disable the HTTP listener so no port is bound:
+
+```elixir
+config :agent_db, :http_enabled, false
+```
+
+```elixir
+{:ok, _} = Application.ensure_all_started(:agent_db)
+```
+
+Then invoke tools directly in-process:
+
+```elixir
+{:ok, _} = AgentDb.Mcp.call_tool("context_write", %{"uri" => uri, "content" => content})
+{:ok, %{"content" => text}} = AgentDb.Mcp.call_tool("context_read", %{"uri" => uri})
+```
+
+Data directory, database path, and model cache resolve from the host's working
+directory unless overridden via `:data_dir`, `:db_path`, and `:model_cache_dir`.
+
 ## Backends (Apple Silicon, CUDA)
 
 - `AGENT_DB_ML_BACKEND=auto` prefers EMLX on Apple Silicon macOS, EXLA

@@ -47,11 +47,11 @@ defmodule AgentDb.Observability.Sink do
   @spec table() :: atom()
   def table, do: @table
 
-  @doc false
+  @doc "Maximum number of recent failures retained."
   @spec max_errors() :: pos_integer()
   def max_errors, do: @max_errors
 
-  @doc false
+  @doc "Maximum number of duration samples retained per tracked operation."
   @spec max_latency_samples() :: pos_integer()
   def max_latency_samples, do: @max_latency_samples
 
@@ -60,7 +60,7 @@ defmodule AgentDb.Observability.Sink do
   @spec max_samples() :: pos_integer()
   def max_samples, do: @max_latency_samples
 
-  @doc false
+  @doc "Maximum number of distinct operations tracked."
   @spec max_tracked_operations() :: pos_integer()
   def max_tracked_operations, do: @max_tracked_operations
 

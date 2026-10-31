@@ -9,8 +9,8 @@ defmodule AgentDbWeb.Controllers.McpController do
   """
   use AgentDbWeb, :controller
 
+  alias AgentDb.Mcp
   alias AgentDb.Observability
-  alias AgentDbWeb.Mcp
 
   def handle(conn, params) do
     body = if is_map(params), do: Map.drop(params, ["controller", "action"]), else: %{}

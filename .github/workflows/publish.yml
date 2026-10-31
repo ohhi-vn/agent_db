@@ -1,0 +1,62 @@
+# Publishes the package and documentation to Hex.
+#
+# Triggered by version tags (v*) or manual dispatch. Runs only after the verify
+# workflow passes for the tagged commit. Prefers trusted publishing (OIDC);
+# falls back to the HEX_API_KEY secret when trusted publishing is unavailable.
+name: publish
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: verify before publish
+    uses: ./.github/workflows/verify.yml
+
+  publish:
+    name: publish to hex
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.20.4-otp-29"
+          otp-version: "29"
+
+      - name: Cache dependencies and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.hex
+            ~/.cache/rebar3
+            _build
+          key: ${{ runner.os }}-publish-otp29-mix-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-publish-otp29-mix-
+
+      - run: mix deps.get
+      - run: mix deps.compile
+
+      # Trusted publishing exchanges a short-lived OIDC token for a publish-only
+      # Hex token. Falls back to HEX_API_KEY when OIDC is not available.
+      - name: Publish package
+        env:
+          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
+        run: mix hex.publish --yes
+
+      - name: Publish documentation
+        env:
+          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
+        run: mix hex.publish docs --yes
