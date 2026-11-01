@@ -117,10 +117,10 @@ defmodule AgentDbWeb.Admin.SkillsLive do
     ~H"""
     <div class="p-8 space-y-8">
       <header>
-        <h1 class="text-2xl font-semibold text-gray-900">Skills</h1>
+        <h1 class="text-2xl font-semibold text-base-content">Skills</h1>
       </header>
 
-      <p :if={@notice} class="rounded bg-blue-50 px-3 py-2 text-sm text-blue-900"><%= @notice %></p>
+      <p :if={@notice} class="alert alert-info"><%= @notice %></p>
 
       <AdminComponents.import_skills
         uploads={@uploads}

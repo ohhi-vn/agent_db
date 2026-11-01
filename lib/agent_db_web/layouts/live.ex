@@ -8,7 +8,7 @@ defmodule AgentDbWeb.Layouts do
   def live(assigns) do
     ~H"""
     <!DOCTYPE html>
-    <html lang="en">
+    <html lang="en" data-theme="light">
       <head>
         <meta charset="utf-8"/>
         <meta name="viewport" content="width=device-width, initial-scale=1"/>
@@ -17,7 +17,7 @@ defmodule AgentDbWeb.Layouts do
         <link phx-track-static rel="stylesheet" href={AgentDbWeb.Endpoint.static_path("/assets/app.css")} />
         <script defer phx-track-static type="text/javascript" src={AgentDbWeb.Endpoint.static_path("/assets/app.js")}></script>
       </head>
-      <body class="bg-gray-50">
+      <body class="bg-base-200">
         <%= @inner_content %>
       </body>
     </html>
@@ -34,7 +34,7 @@ defmodule AgentDbWeb.Layouts do
 
     ~H"""
     <!DOCTYPE html>
-    <html lang="en">
+    <html lang="en" data-theme="light">
       <head>
         <meta charset="utf-8"/>
         <meta name="viewport" content="width=device-width, initial-scale=1"/>
@@ -43,9 +43,9 @@ defmodule AgentDbWeb.Layouts do
         <link phx-track-static rel="stylesheet" href={AgentDbWeb.Endpoint.static_path("/assets/app.css")} />
         <script defer phx-track-static type="text/javascript" src={AgentDbWeb.Endpoint.static_path("/assets/app.js")}></script>
       </head>
-      <body class="bg-gray-50">
+      <body class="bg-base-200">
         <div id="admin-shell" data-sidebar={@sidebar} class="flex min-h-screen flex-col">
-          <header class="admin-header flex items-center gap-3 bg-gradient-to-r from-indigo-700 via-blue-700 to-sky-600 px-4 py-3 text-white shadow">
+          <header class="admin-header navbar bg-primary text-primary-content shadow">
             <button
               id="sidebar-toggle"
               type="button"
@@ -53,7 +53,7 @@ defmodule AgentDbWeb.Layouts do
               aria-controls="admin-sidebar"
               aria-expanded={if (@sidebar || "shown") == "hidden", do: "false", else: "true"}
               aria-label="Toggle navigation sidebar"
-              class="rounded p-2 text-white hover:bg-white/15 focus:outline-none focus:ring-2 focus:ring-white/70"
+              class="btn btn-ghost btn-square btn-sm"
             >
               <svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true">
                 <path d="M3 5h14M3 10h14M3 15h14" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
@@ -61,14 +61,14 @@ defmodule AgentDbWeb.Layouts do
             </button>
             <div class="flex items-baseline gap-2">
               <span class="text-lg font-semibold tracking-tight">AgentDb</span>
-              <span class="text-sm text-blue-100">Admin Console</span>
+              <span class="text-sm text-primary-content/70">Admin Console</span>
             </div>
-            <span class="mx-2 hidden text-white/40 sm:inline">/</span>
-            <h1 class="text-sm font-medium text-white"><%= admin_title(@active) %></h1>
+            <span class="mx-2 hidden text-primary-content/40 sm:inline">/</span>
+            <h1 class="text-sm font-medium text-primary-content"><%= admin_title(@active) %></h1>
           </header>
           <div class="flex min-h-0 flex-1">
-            <aside id="admin-sidebar" class={["admin-sidebar w-56 shrink-0 border-r border-gray-200 bg-white", (@sidebar || "shown") == "hidden" && "hidden"]}>
-              <div class="border-b border-gray-100 px-4 py-3 text-xs font-semibold uppercase tracking-wider text-gray-500">
+            <aside id="admin-sidebar" class={["admin-sidebar w-56 shrink-0 border-r border-base-300 bg-base-100", (@sidebar || "shown") == "hidden" && "hidden"]}>
+              <div class="border-b border-base-300 px-4 py-3 text-xs font-semibold uppercase tracking-wider text-base-content/60">
                 Console
               </div>
               <div class="py-2">

@@ -103,11 +103,11 @@ defmodule AgentDbWeb.Admin.DocumentsLive do
     ~H"""
     <div class="p-8 space-y-8">
       <header class="flex items-baseline justify-between">
-        <h1 class="text-2xl font-semibold text-gray-900">Documents</h1>
-        <p class="text-sm text-gray-500"><%= @storage.documents %> documents</p>
+        <h1 class="text-2xl font-semibold text-base-content">Documents</h1>
+        <p class="text-sm text-base-content/70"><%= @storage.documents %> documents</p>
       </header>
 
-      <p :if={@notice} class="rounded bg-blue-50 px-3 py-2 text-sm text-blue-900"><%= @notice %></p>
+      <p :if={@notice} class="alert alert-info"><%= @notice %></p>
 
       <AdminComponents.search
         term={@search_term}

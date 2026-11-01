@@ -75,9 +75,9 @@ defmodule AgentDbWeb.DocumentEditorLive do
   def render(assigns) do
     ~H"""
     <div class="p-8 space-y-6">
-      <h1 class="font-mono text-sm text-gray-500"><%= @uri %></h1>
+      <h1 class="font-mono text-sm text-base-content/60"><%= @uri %></h1>
 
-      <p :if={@notice} class="rounded bg-blue-50 px-3 py-2 text-sm text-blue-900"><%= @notice %></p>
+      <p :if={@notice} class="alert alert-info"><%= @notice %></p>
 
       <form phx-submit="publish" class="space-y-4">
         <label for="document-draft" class="sr-only">Document content</label>
@@ -86,13 +86,13 @@ defmodule AgentDbWeb.DocumentEditorLive do
           name="draft"
           phx-change="edit"
           rows="20"
-          class="w-full rounded-lg border border-gray-300 p-3 font-mono text-sm"
+          class="textarea textarea-bordered w-full font-mono text-sm"
         ><%= @draft %></textarea>
 
         <div class="flex items-center gap-4">
-          <button type="submit" class="rounded bg-blue-600 px-4 py-2 text-sm text-white">Publish</button>
-          <span :if={not @saved} class="text-sm text-amber-700">Unsaved changes</span>
-          <span :if={@saved} class="text-sm text-gray-500">Saved</span>
+          <button type="submit" class="btn btn-primary btn-sm">Publish</button>
+          <span :if={not @saved} class="text-sm text-warning">Unsaved changes</span>
+          <span :if={@saved} class="text-sm text-base-content/60">Saved</span>
         </div>
       </form>
 

@@ -75,10 +75,10 @@ defmodule AgentDbWeb.Admin.MemoriesLive do
     ~H"""
     <div class="p-8 space-y-8">
       <header>
-        <h1 class="text-2xl font-semibold text-gray-900">Memories</h1>
+        <h1 class="text-2xl font-semibold text-base-content">Memories</h1>
       </header>
 
-      <p :if={@notice} class="rounded bg-blue-50 px-3 py-2 text-sm text-blue-900"><%= @notice %></p>
+      <p :if={@notice} class="alert alert-info"><%= @notice %></p>
 
       <AdminComponents.memory_stats stats={@stats} />
       <AdminComponents.memory_candidates candidates={@candidates} />

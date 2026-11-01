@@ -32,10 +32,10 @@ defmodule AgentDbWeb.AdminComponents do
   """
   def flash_group(assigns) do
     ~H"""
-    <div id="flash" aria-live="polite">
+    <div id="flash" aria-live="polite" class="space-y-2">
       <div
         :for={{kind, message} <- @flash}
-        class={["mx-6 mt-6 rounded border px-3 py-2 text-sm font-medium shadow-sm", flash_class(kind)]}
+        class={["alert", alert_class(kind)]}
         role={flash_role(kind)}
       >
         <%= message %>
@@ -47,9 +47,9 @@ defmodule AgentDbWeb.AdminComponents do
   defp flash_role("error"), do: "alert"
   defp flash_role(_), do: "status"
 
-  defp flash_class("error"), do: "border-red-300 bg-red-50 text-red-800"
-  defp flash_class("info"), do: "border-green-300 bg-green-50 text-green-800"
-  defp flash_class(_other), do: "border-gray-300 bg-gray-50 text-gray-800"
+  defp alert_class("error"), do: "alert-error"
+  defp alert_class("info"), do: "alert-success"
+  defp alert_class(_other), do: "alert-info"
 
   # -- navigation --
 
@@ -58,7 +58,7 @@ defmodule AgentDbWeb.AdminComponents do
   @doc "The console's sidebar navigation, marking the page currently shown."
   def sidebar(assigns) do
     ~H"""
-    <nav class="flex flex-col gap-1 px-2" aria-label="Console">
+    <nav class="menu menu-vertical gap-1 px-2" aria-label="Console">
       <.nav_link page={:overview} label="Overview" href="/admin" active={@active} />
       <.nav_link page={:documents} label="Documents" href="/admin/documents" active={@active} />
       <.nav_link page={:storage} label="Storage" href="/admin/storage" active={@active} />
@@ -86,10 +86,8 @@ defmodule AgentDbWeb.AdminComponents do
     """
   end
 
-  defp nav_class(true),
-    do: "bg-indigo-50 font-medium text-indigo-700 ring-1 ring-inset ring-indigo-100"
-
-  defp nav_class(false), do: "text-gray-700 hover:bg-gray-100"
+  defp nav_class(true), do: "active bg-primary text-primary-content font-medium"
+  defp nav_class(false), do: "text-base-content hover:bg-base-200"
 
   # -- recent changes --
 
@@ -98,15 +96,15 @@ defmodule AgentDbWeb.AdminComponents do
   @doc "The recent-change feed: URI, kind, and version only."
   def recent_changes(assigns) do
     ~H"""
-    <section class="admin-card admin-card-sky rounded-lg border border-gray-200 bg-white shadow-sm">
-      <h2 class="admin-card-title px-4 py-3 font-medium text-gray-900">Recent changes</h2>
-      <ul :if={@changes == []} class="px-4 pb-4 text-sm text-gray-500">
+    <section class="card bg-base-100 shadow-md rounded-lg border-t-4 border-sky-500">
+      <h2 class="card-title px-4 py-3 font-medium text-base-content">Recent changes</h2>
+      <ul :if={@changes == []} class="px-4 pb-4 text-sm text-base-content/70">
         <li>No changes yet</li>
       </ul>
-      <ul id="recent-changes" class="divide-y divide-gray-100">
+      <ul id="recent-changes" class="divide-y divide-base-200">
         <li :for={change <- @changes} class="flex items-center justify-between px-4 py-2 text-sm">
-          <span class="font-mono text-gray-900"><%= change.uri %></span>
-          <span class="font-mono text-gray-500"><%= change.kind %> &middot; v<%= change.version %></span>
+          <span class="font-mono text-base-content"><%= change.uri %></span>
+          <span class="font-mono text-base-content/70"><%= change.kind %> &middot; v<%= change.version %></span>
         </li>
       </ul>
     </section>
@@ -123,82 +121,82 @@ defmodule AgentDbWeb.AdminComponents do
   @doc "Where an operator imports Agent Skills from."
   def import_skills(assigns) do
     ~H"""
-    <section class="admin-card admin-card-violet rounded-lg border border-gray-200 bg-white shadow-sm">
-      <h2 class="admin-card-title px-4 py-3 font-medium text-gray-900">Import skills</h2>
+    <section class="card bg-base-100 shadow-md rounded-lg border-t-4 border-violet-500">
+      <h2 class="card-title px-4 py-3 font-medium text-base-content">Import skills</h2>
       <form id="import-skills" phx-change="validate" phx-submit="import_skills" class="space-y-4 px-4 pb-4">
         <div>
-          <label for="skill-user-id" class="block text-sm text-gray-700">User ID</label>
+          <label for="skill-user-id" class="block text-sm text-base-content/80">User ID</label>
           <input
             type="text"
             id="skill-user-id"
             name="user_id"
             value={@user_id}
             placeholder="alice"
-            class="mt-1 w-64 rounded border border-gray-300 px-2 py-1 font-mono text-sm"
+            class="input input-bordered input-sm w-64 font-mono"
           />
-          <p class="mt-1 text-sm text-gray-500">
+          <p class="mt-1 text-sm text-base-content/70">
             Skills are stored below <code class="font-mono">viking://user/&lt;user&gt;/skills</code>,
             one subtree per user.
           </p>
         </div>
 
         <div>
-          <label for="skill-folder" class="block text-sm text-gray-700">Skills folder</label>
+          <label for="skill-folder" class="block text-sm text-base-content/80">Skills folder</label>
           <.live_file_input upload={@uploads[:skill_folder]} webkitdirectory />
-          <p class="mt-1 text-sm text-gray-500">
+          <p class="mt-1 text-sm text-base-content/70">
             A folder holding one skill, or a collection of skill folders. Each skill needs a SKILL.md.
           </p>
           <ul class="mt-2 space-y-1">
             <li
               :for={entry <- @uploads.skill_folder.entries}
-              class="rounded bg-gray-50 px-2 py-1 text-xs text-gray-700"
+              class="badge badge-ghost badge-sm font-mono"
             >
               <%= entry.client_relative_path || entry.client_name %>
               <span :if={not entry.done?}><%= entry.progress %>%</span>
             </li>
           </ul>
-          <p :for={reason <- upload_errors(@uploads[:skill_folder])} class="mt-1 text-sm text-red-700">
+          <p :for={reason <- upload_errors(@uploads[:skill_folder])} class="mt-1 text-sm text-error">
             <%= upload_error_to_string(reason) %>
           </p>
         </div>
 
         <div>
-          <label for="skill-archive" class="block text-sm text-gray-700">Skills archive</label>
+          <label for="skill-archive" class="block text-sm text-base-content/80">Skills archive</label>
           <.live_file_input upload={@uploads[:skill_archive]} />
-          <p class="mt-1 text-sm text-gray-500">
+          <p class="mt-1 text-sm text-base-content/70">
             A .tar or .tar.gz holding the same folders, optionally under one wrapper directory.
           </p>
           <ul class="mt-2 space-y-1">
             <li
               :for={entry <- @uploads.skill_archive.entries}
-              class="rounded bg-gray-50 px-2 py-1 text-xs text-gray-700"
+              class="badge badge-ghost badge-sm font-mono"
             >
               <%= entry.client_name %>
               <span :if={not entry.done?}><%= entry.progress %>%</span>
             </li>
           </ul>
-          <p :for={reason <- upload_errors(@uploads[:skill_archive])} class="mt-1 text-sm text-red-700">
+          <p :for={reason <- upload_errors(@uploads[:skill_archive])} class="mt-1 text-sm text-error">
             <%= upload_error_to_string(reason) %>
           </p>
         </div>
 
-        <p class="text-sm text-gray-500">
+        <p class="text-sm text-base-content/70">
           UTF-8 text only, at most <%= @limits.max_entries %> files and
           <%= @limits.max_bytes %> bytes. A skill whose name is already stored is replaced whole.
         </p>
 
-        <button type="submit" class="rounded bg-blue-600 px-4 py-2 text-sm text-white">
+        <button type="submit" class="btn btn-primary btn-sm">
           Import skills
         </button>
       </form>
 
-      <ul :if={@results != []} class="divide-y divide-gray-100 border-t border-gray-200">
+      <ul :if={@results != []} class="divide-y divide-base-200 border-t border-base-300">
         <li :for={result <- @results} class="flex items-center justify-between px-4 py-2 text-sm">
-          <span class="font-mono text-gray-900"><%= result.name %></span>
-          <span :if={result.status == :failed} class="text-red-700">
+          <span class="font-mono text-base-content"><%= result.name %></span>
+          <span :if={result.status == :failed} class="text-error">
             <%= Context.skill_import_error(result.reason) %>
           </span>
-          <span :if={result.status != :failed} class="text-gray-500">
+          <span :if={result.status != :failed} class="text-base-content/70">
             <%= result.status %> &middot; <%= result.files %> files
           </span>
         </li>
@@ -217,43 +215,43 @@ defmodule AgentDbWeb.AdminComponents do
   @doc "Document search over the store, linking each hit to the editor."
   def search(assigns) do
     ~H"""
-    <section class="admin-card admin-card-cyan rounded-lg border border-gray-200 bg-white shadow-sm">
-      <h2 class="admin-card-title px-4 py-3 font-medium text-gray-900">Search documents</h2>
+    <section class="card bg-base-100 shadow-md rounded-lg border-t-4 border-cyan-500">
+      <h2 class="card-title px-4 py-3 font-medium text-base-content">Search documents</h2>
       <form id="doc-search" phx-submit="search" class="space-y-4 px-4 pb-4">
         <div class="flex flex-wrap items-end gap-4">
           <div>
-            <label for="search-term" class="block text-sm text-gray-700">Search term</label>
+            <label for="search-term" class="block text-sm text-base-content/80">Search term</label>
             <input
               type="text"
               id="search-term"
               name="term"
               value={@term}
               placeholder="keyword"
-              class="mt-1 w-64 rounded border border-gray-300 px-2 py-1 font-mono text-sm"
+              class="input input-bordered input-sm w-64 font-mono"
             />
           </div>
           <div>
-            <label for="search-scope" class="block text-sm text-gray-700">Scope (optional URI)</label>
+            <label for="search-scope" class="block text-sm text-base-content/80">Scope (optional URI)</label>
             <input
               type="text"
               id="search-scope"
               name="scope"
               value={@scope}
               placeholder="viking://resources/project"
-              class="mt-1 w-64 rounded border border-gray-300 px-2 py-1 font-mono text-sm"
+              class="input input-bordered input-sm w-64 font-mono"
             />
           </div>
-          <button type="submit" class="rounded bg-blue-600 px-4 py-2 text-sm text-white">Search</button>
+          <button type="submit" class="btn btn-primary btn-sm">Search</button>
         </div>
-        <p :if={@notice} class="text-sm text-gray-500"><%= @notice %></p>
+        <p :if={@notice} class="text-sm text-base-content/70"><%= @notice %></p>
       </form>
 
-      <ul :if={@results != []} class="divide-y divide-gray-100 border-t border-gray-200">
+      <ul :if={@results != []} class="divide-y divide-base-200 border-t border-base-300">
         <li :for={result <- @results} class="flex items-center justify-between px-4 py-2 text-sm">
-          <a class="font-mono text-blue-700 hover:underline" href={"/admin/documents/#{URI.encode_www_form(result.uri)}/edit"}>
+          <a class="font-mono text-primary hover:underline" href={"/admin/documents/#{URI.encode_www_form(result.uri)}/edit"}>
             <%= result.uri %>
           </a>
-          <span :if={Map.has_key?(result, :score)} class="text-gray-500">
+          <span :if={Map.has_key?(result, :score)} class="text-base-content/70">
             <%= Float.round(Map.get(result, :score) / 1, 3) %>
           </span>
         </li>
@@ -269,9 +267,9 @@ defmodule AgentDbWeb.AdminComponents do
   @doc "Model state per role, with load duration and live inference count."
   def models(assigns) do
     ~H"""
-    <section class="admin-card admin-card-indigo rounded-lg border border-gray-200 bg-white shadow-sm">
-      <h2 class="admin-card-title px-4 py-3 font-medium text-gray-900">Models</h2>
-      <p class="px-4 pb-2 text-sm text-gray-500">
+    <section class="card bg-base-100 shadow-md rounded-lg border-t-4 border-indigo-500">
+      <h2 class="card-title px-4 py-3 font-medium text-base-content">Models</h2>
+      <p class="px-4 pb-2 text-sm text-base-content/70">
         Provider: <%= Map.get(@models, :provider, "unknown") %> &middot; Backend: <%= Map.get(
           @models,
           :backend,
@@ -282,10 +280,10 @@ defmodule AgentDbWeb.AdminComponents do
       </p>
       <dl class="grid grid-cols-2 gap-4 px-4 pb-4 text-sm">
         <div :for={{role, entry} <- models_summary(@models)}>
-          <dt class="text-gray-500"><%= role %></dt>
-          <dd class="font-mono text-gray-900"><%= model_state(entry) %></dd>
-          <dd class="font-mono text-sm text-gray-700"><%= model_identity(role, entry) %></dd>
-          <dd class="font-mono text-sm text-gray-700">
+          <dt class="text-base-content/70"><%= role %></dt>
+          <dd class="font-mono text-base-content"><%= model_state(entry) %></dd>
+          <dd class="font-mono text-sm text-base-content/80"><%= model_identity(role, entry) %></dd>
+          <dd class="font-mono text-sm text-base-content/80">
             Last load: <%= format_ms(Map.get(entry, :last_load_ms)) %> &middot;
             Last inference: <%= format_ms(Map.get(entry, :last_latency_ms)) %>
           </dd>
@@ -349,36 +347,36 @@ defmodule AgentDbWeb.AdminComponents do
   @doc "Background work: what is outstanding, how far behind, and what failed."
   def queue(assigns) do
     ~H"""
-    <section class="admin-card admin-card-amber rounded-lg border border-gray-200 bg-white shadow-sm">
-      <h2 class="admin-card-title px-4 py-3 font-medium text-gray-900">Queue</h2>
-      <p :if={Map.get(@detail, :available, true) == false} class="px-4 pb-2 text-sm text-red-700">
+    <section class="card bg-base-100 shadow-md rounded-lg border-t-4 border-amber-500">
+      <h2 class="card-title px-4 py-3 font-medium text-base-content">Queue</h2>
+      <p :if={Map.get(@detail, :available, true) == false} class="px-4 pb-2 text-sm text-error">
         Queue unavailable: <%= Map.get(@detail, :reason, :error) %>
       </p>
 
       <dl :if={Map.get(@detail, :available, true) != false} class="grid grid-cols-5 gap-4 px-4 pb-2 text-sm">
         <div :for={status <- [:pending, :running, :done, :failed]}>
-          <dt class="text-gray-500"><%= status %></dt>
-          <dd class="text-lg font-semibold text-gray-900"><%= Map.get(@jobs, status, 0) %></dd>
+          <dt class="text-base-content/70"><%= status %></dt>
+          <dd class="text-lg font-semibold text-base-content"><%= Map.get(@jobs, status, 0) %></dd>
         </div>
         <div>
-          <dt class="text-gray-500">oldest pending</dt>
-          <dd class="text-lg font-semibold text-gray-900"><%= format_ms(Map.get(@detail, :oldest_pending_ms)) %></dd>
+          <dt class="text-base-content/70">oldest pending</dt>
+          <dd class="text-lg font-semibold text-base-content"><%= format_ms(Map.get(@detail, :oldest_pending_ms)) %></dd>
         </div>
       </dl>
 
-      <ul :if={Map.get(@detail, :failed, []) == []} class="px-4 pb-4 text-sm text-gray-500">
+      <ul :if={Map.get(@detail, :failed, []) == []} class="px-4 pb-4 text-sm text-base-content/70">
         <li>No failed jobs</li>
       </ul>
-      <ul id="failed-jobs" :if={Map.get(@detail, :failed, []) != []} class="divide-y divide-gray-100 border-t border-gray-200">
+      <ul id="failed-jobs" :if={Map.get(@detail, :failed, []) != []} class="divide-y divide-base-200 border-t border-base-300">
         <li :for={job <- @detail.failed} class="px-4 py-2 text-sm">
-          <span class="font-mono text-gray-900">#<%= job.id %></span>
-          <span class="font-mono text-gray-900"><%= job.kind %></span>
-          <span class="font-mono text-gray-500"><%= job.uri %></span>
-          <span class="text-red-700"><%= job.last_error || "no reason recorded" %></span>
-          <span class="text-gray-500">
+          <span class="font-mono text-base-content">#<%= job.id %></span>
+          <span class="font-mono text-base-content"><%= job.kind %></span>
+          <span class="font-mono text-base-content/70"><%= job.uri %></span>
+          <span class="text-error"><%= job.last_error || "no reason recorded" %></span>
+          <span class="text-base-content/70">
             attempts <%= job.attempts %>/<%= job.max_attempts %>
           </span>
-          <span class="text-gray-500">
+          <span class="text-base-content/70">
             failed at <%= format_ms(job.failed_at) %>
           </span>
         </li>
@@ -394,16 +392,18 @@ defmodule AgentDbWeb.AdminComponents do
   @doc "The store's own health checks, per check rather than as one verdict."
   def health(assigns) do
     ~H"""
-    <section class="admin-card admin-card-emerald rounded-lg border border-gray-200 bg-white shadow-sm">
-      <h2 class="admin-card-title px-4 py-3 font-medium text-gray-900">Health</h2>
+    <section class="card bg-base-100 shadow-md rounded-lg border-t-4 border-emerald-500">
+      <h2 class="card-title px-4 py-3 font-medium text-base-content">Health</h2>
       <dl class="grid grid-cols-3 gap-4 px-4 pb-4 text-sm">
         <div>
-          <dt class="text-gray-500">status</dt>
-          <dd class="font-mono text-gray-900"><%= Map.get(@health, :status, "unknown") %></dd>
+          <dt class="text-base-content/70">status</dt>
+          <dd class="font-mono text-base-content"><%= Map.get(@health, :status, "unknown") %></dd>
         </div>
         <div :for={{check, ok} <- Map.get(@health, :checks, %{})}>
-          <dt class="text-gray-500"><%= check %></dt>
-          <dd class="font-mono text-gray-900"><%= if ok, do: "ok", else: "down" %></dd>
+          <dt class="text-base-content/70"><%= check %></dt>
+          <dd class={["font-mono", if(ok, do: "text-success", else: "text-error")]}>
+            <%= if ok, do: "ok", else: "down" %>
+          </dd>
         </div>
       </dl>
     </section>
@@ -419,30 +419,30 @@ defmodule AgentDbWeb.AdminComponents do
   @doc "Looking a session up by id; the store keeps no index to list them by."
   def session_lookup(assigns) do
     ~H"""
-    <section class="admin-card admin-card-rose rounded-lg border border-gray-200 bg-white shadow-sm">
-      <h2 class="admin-card-title px-4 py-3 font-medium text-gray-900">Session lookup</h2>
+    <section class="card bg-base-100 shadow-md rounded-lg border-t-4 border-rose-500">
+      <h2 class="card-title px-4 py-3 font-medium text-base-content">Session lookup</h2>
       <form id="session-lookup" phx-submit="lookup_session" class="space-y-4 px-4 pb-4">
         <div class="flex flex-wrap items-end gap-4">
           <div>
-            <label for="session-id" class="block text-sm text-gray-700">Session ID</label>
+            <label for="session-id" class="block text-sm text-base-content/80">Session ID</label>
             <input
               type="text"
               id="session-id"
               name="session_id"
               value={@session_id}
               placeholder="session id"
-              class="mt-1 w-64 rounded border border-gray-300 px-2 py-1 font-mono text-sm"
+              class="input input-bordered input-sm w-64 font-mono"
             />
           </div>
-          <button type="submit" class="rounded bg-blue-600 px-4 py-2 text-sm text-white">Look up session</button>
+          <button type="submit" class="btn btn-primary btn-sm">Look up session</button>
         </div>
-        <p :if={@notice} class="text-sm text-gray-500"><%= @notice %></p>
+        <p :if={@notice} class="text-sm text-base-content/70"><%= @notice %></p>
       </form>
 
-      <ul :if={@messages != []} class="divide-y divide-gray-100 border-t border-gray-200">
+      <ul :if={@messages != []} class="divide-y divide-base-200 border-t border-base-300">
         <li :for={message <- @messages} class="px-4 py-2 text-sm">
-          <span class="font-mono text-gray-500"><%= message.seq %> [<%= message.role %>]</span>
-          <span class="text-gray-900"><%= message.content %></span>
+          <span class="font-mono text-base-content/70"><%= message.seq %> [<%= message.role %>]</span>
+          <span class="text-base-content"><%= message.content %></span>
         </li>
       </ul>
     </section>
@@ -465,15 +465,15 @@ defmodule AgentDbWeb.AdminComponents do
   """
   def documents(assigns) do
     ~H"""
-    <section class="admin-card admin-card-sky rounded-lg border border-gray-200 bg-white shadow-sm">
-      <h2 class="admin-card-title px-4 py-3 font-medium text-gray-900">Documents</h2>
-      <ul :if={@documents.names == []} class="px-4 pb-4 text-sm text-gray-500">
+    <section class="card bg-base-100 shadow-md rounded-lg border-t-4 border-sky-500">
+      <h2 class="card-title px-4 py-3 font-medium text-base-content">Documents</h2>
+      <ul :if={@documents.names == []} class="px-4 pb-4 text-sm text-base-content/70">
         <li>No documents</li>
       </ul>
-      <ul class="divide-y divide-gray-100">
+      <ul class="divide-y divide-base-200">
         <li :for={name <- @documents.names} class="flex items-center justify-between px-4 py-2">
           <a
-            class="font-mono text-sm text-blue-700 hover:underline"
+            class="font-mono text-sm text-primary hover:underline"
             href={"/admin/documents/#{URI.encode_www_form(child_uri(@root, name))}/edit"}
           >
             <%= name %>
@@ -488,21 +488,21 @@ defmodule AgentDbWeb.AdminComponents do
         </li>
       </ul>
 
-      <div :if={@documents.meta.total_pages > 1} class="flex items-center gap-4 border-t border-gray-200 px-4 py-3 text-sm">
-        <span class="text-gray-500">
+      <div :if={@documents.meta.total_pages > 1} class="flex items-center gap-4 border-t border-base-300 px-4 py-3 text-sm">
+        <span class="text-base-content/70">
           Page <%= @documents.meta.page %> of <%= @documents.meta.total_pages %>
           (<%= @documents.meta.total %> entries at this level)
         </span>
         <a
           :if={@documents.meta.page > 1}
-          class="text-blue-700 hover:underline"
+          class="text-primary hover:underline"
           href={page_href(@documents.meta, -1)}
         >
           Previous
         </a>
         <a
           :if={@documents.meta.page < @documents.meta.total_pages}
-          class="text-blue-700 hover:underline"
+          class="text-primary hover:underline"
           href={page_href(@documents.meta, 1)}
         >
           Next
@@ -525,30 +525,30 @@ defmodule AgentDbWeb.AdminComponents do
   """
   def documents_all(assigns) do
     ~H"""
-    <section class="admin-card admin-card-sky rounded-lg border border-gray-200 bg-white shadow-sm">
-      <h2 class="admin-card-title px-4 py-3 font-medium text-gray-900">All documents</h2>
+    <section class="card bg-base-100 shadow-md rounded-lg border-t-4 border-sky-500">
+      <h2 class="card-title px-4 py-3 font-medium text-base-content">All documents</h2>
       <form id="all-doc-filter" phx-submit="filter_all" class="space-y-4 px-4 pb-4">
         <div class="flex flex-wrap items-end gap-4">
           <div>
-            <label for="all-substring" class="block text-sm text-gray-700">Filter (substring)</label>
+            <label for="all-substring" class="block text-sm text-base-content/80">Filter (substring)</label>
             <input
               type="text"
               id="all-substring"
               name="substring"
               value={@substring}
               placeholder="auth"
-              class="mt-1 w-64 rounded border border-gray-300 px-2 py-1 font-mono text-sm"
+              class="input input-bordered input-sm w-64 font-mono"
             />
           </div>
           <div>
-            <label for="all-group" class="block text-sm text-gray-700">Group</label>
+            <label for="all-group" class="block text-sm text-base-content/80">Group</label>
             <input
               type="text"
               id="all-group"
               name="group"
               value={@group}
               placeholder="resources"
-              class="mt-1 w-64 rounded border border-gray-300 px-2 py-1 font-mono text-sm"
+              class="input input-bordered input-sm w-64 font-mono"
             />
           </div>
           <div class="flex items-center gap-2">
@@ -558,53 +558,53 @@ defmodule AgentDbWeb.AdminComponents do
               name="show_disabled"
               value="true"
               checked={@show_disabled}
-              class="rounded border border-gray-300"
+              class="checkbox checkbox-sm"
             />
-            <label for="all-show-disabled" class="text-sm text-gray-700">Include disabled</label>
+            <label for="all-show-disabled" class="text-sm text-base-content/80">Include disabled</label>
           </div>
-          <button type="submit" class="rounded bg-blue-600 px-4 py-2 text-sm text-white">Apply</button>
+          <button type="submit" class="btn btn-primary btn-sm">Apply</button>
         </div>
       </form>
 
-      <div class="flex flex-wrap items-center gap-4 border-t border-gray-200 px-4 py-3 text-sm">
-        <span class="text-gray-500">
+      <div class="flex flex-wrap items-center gap-4 border-t border-base-300 px-4 py-3 text-sm">
+        <span class="text-base-content/70">
           <%= @listing.meta.total %> documents (page <%= @listing.meta.page %> of <%= @listing.meta.total_pages %>)
         </span>
         <button phx-click="bulk_disable_all" class="text-sm text-red-600 hover:underline">
           Disable filtered
         </button>
-        <button phx-click="bulk_enable_all" class="text-sm text-blue-700 hover:underline">
+        <button phx-click="bulk_enable_all" class="text-sm text-primary hover:underline">
           Enable filtered
         </button>
       </div>
 
       <form id="bulk-group-all" phx-submit="bulk_set_group_all" class="flex flex-wrap items-end gap-4 px-4 pb-4">
         <div>
-          <label for="bulk-group-tag" class="block text-sm text-gray-700">Set group for filtered</label>
+          <label for="bulk-group-tag" class="block text-sm text-base-content/80">Set group for filtered</label>
           <input
             type="text"
             id="bulk-group-tag"
             name="group_tag"
             placeholder="release-1 (empty clears)"
-            class="mt-1 w-64 rounded border border-gray-300 px-2 py-1 font-mono text-sm"
+            class="input input-bordered input-sm w-64 font-mono"
           />
         </div>
-        <button type="submit" class="rounded bg-blue-600 px-4 py-2 text-sm text-white">Apply group</button>
+        <button type="submit" class="btn btn-primary btn-sm">Apply group</button>
       </form>
 
-      <ul :if={@listing.data == []} class="px-4 pb-4 text-sm text-gray-500">
+      <ul :if={@listing.data == []} class="px-4 pb-4 text-sm text-base-content/70">
         <li>No documents match</li>
       </ul>
-      <ul class="divide-y divide-gray-100">
+      <ul class="divide-y divide-base-200">
         <li :for={row <- @listing.data} class="px-4 py-2">
           <div class="flex items-center justify-between">
             <a
-              class="font-mono text-sm text-blue-700 hover:underline"
+              class="font-mono text-sm text-primary hover:underline"
               href={"/admin/documents/#{URI.encode_www_form(row.uri)}/edit"}
             >
               <%= row.uri %>
             </a>
-            <span class="text-sm text-gray-500">
+            <span class={["text-sm", if(row.enabled, do: "text-success", else: "text-base-content/60")]}>
               <%= if row.enabled, do: "enabled", else: "disabled" %> &middot; <%= group_label(row.group_tag) %>
             </span>
           </div>
@@ -613,7 +613,7 @@ defmodule AgentDbWeb.AdminComponents do
               phx-click="toggle_enabled"
               phx-value-uri={row.uri}
               phx-value-enabled={to_string(row.enabled)}
-              class="text-sm text-blue-700 hover:underline"
+              class="text-sm text-primary hover:underline"
             >
               <%= if row.enabled, do: "Disable", else: "Enable" %>
             </button>
@@ -624,23 +624,23 @@ defmodule AgentDbWeb.AdminComponents do
                 name="group_tag"
                 value={row.group_tag}
                 placeholder="group (empty clears)"
-                class="w-40 rounded border border-gray-300 px-2 py-1 font-mono text-sm"
+                class="input input-bordered input-sm w-40 font-mono"
               />
-              <button type="submit" class="text-sm text-blue-700 hover:underline">Set group</button>
+              <button type="submit" class="text-sm text-primary hover:underline">Set group</button>
             </form>
           </div>
         </li>
       </ul>
 
-      <div :if={@listing.meta.total_pages > 1} class="flex items-center gap-4 border-t border-gray-200 px-4 py-3 text-sm">
-        <span class="text-gray-500">
+      <div :if={@listing.meta.total_pages > 1} class="flex items-center gap-4 border-t border-base-300 px-4 py-3 text-sm">
+        <span class="text-base-content/70">
           Page <%= @listing.meta.page %> of <%= @listing.meta.total_pages %>
         </span>
         <button
           :if={@listing.meta.page > 1}
           phx-click="all_page"
           phx-value-page={@listing.meta.page - 1}
-          class="text-blue-700 hover:underline"
+          class="text-primary hover:underline"
         >
           Previous
         </button>
@@ -648,7 +648,7 @@ defmodule AgentDbWeb.AdminComponents do
           :if={@listing.meta.page < @listing.meta.total_pages}
           phx-click="all_page"
           phx-value-page={@listing.meta.page + 1}
-          class="text-blue-700 hover:underline"
+          class="text-primary hover:underline"
         >
           Next
         </button>
@@ -673,41 +673,41 @@ defmodule AgentDbWeb.AdminComponents do
   """
   def skills_inventory(assigns) do
     ~H"""
-    <section class="admin-card admin-card-violet rounded-lg border border-gray-200 bg-white shadow-sm">
-      <h2 class="admin-card-title px-4 py-3 font-medium text-gray-900">Installed skills</h2>
+    <section class="card bg-base-100 shadow-md rounded-lg border-t-4 border-violet-500">
+      <h2 class="card-title px-4 py-3 font-medium text-base-content">Installed skills</h2>
       <form id="skill-filter" phx-submit="filter_skills" class="space-y-4 px-4 pb-4">
         <div class="flex flex-wrap items-end gap-4">
           <div>
-            <label for="skill-filter-text" class="block text-sm text-gray-700">Search skills</label>
+            <label for="skill-filter-text" class="block text-sm text-base-content/80">Search skills</label>
             <input
               type="text"
               id="skill-filter-text"
               name="substring"
               value={@substring}
               placeholder="review"
-              class="mt-1 w-64 rounded border border-gray-300 px-2 py-1 font-mono text-sm"
+              class="input input-bordered input-sm w-64 font-mono"
             />
           </div>
           <div>
-            <label for="skill-filter-owner" class="block text-sm text-gray-700">Owner</label>
+            <label for="skill-filter-owner" class="block text-sm text-base-content/80">Owner</label>
             <input
               type="text"
               id="skill-filter-owner"
               name="owner"
               value={@owner}
               placeholder="alice"
-              class="mt-1 w-64 rounded border border-gray-300 px-2 py-1 font-mono text-sm"
+              class="input input-bordered input-sm w-64 font-mono"
             />
           </div>
           <div>
-            <label for="skill-filter-group" class="block text-sm text-gray-700">Group</label>
+            <label for="skill-filter-group" class="block text-sm text-base-content/80">Group</label>
             <input
               type="text"
               id="skill-filter-group"
               name="group"
               value={@group}
               placeholder="reviewers"
-              class="mt-1 w-64 rounded border border-gray-300 px-2 py-1 font-mono text-sm"
+              class="input input-bordered input-sm w-64 font-mono"
             />
           </div>
           <div class="flex items-center gap-2">
@@ -717,65 +717,65 @@ defmodule AgentDbWeb.AdminComponents do
               name="show_disabled"
               value="true"
               checked={@show_disabled}
-              class="rounded border border-gray-300"
+              class="checkbox checkbox-sm"
             />
-            <label for="skill-show-disabled" class="text-sm text-gray-700">Include disabled</label>
+            <label for="skill-show-disabled" class="text-sm text-base-content/80">Include disabled</label>
           </div>
-          <button type="submit" class="rounded bg-blue-600 px-4 py-2 text-sm text-white">Apply</button>
+          <button type="submit" class="btn btn-primary btn-sm">Apply</button>
         </div>
       </form>
 
-      <div class="flex flex-wrap items-center gap-4 border-t border-gray-200 px-4 py-3 text-sm">
-        <span class="text-gray-500">
+      <div class="flex flex-wrap items-center gap-4 border-t border-base-300 px-4 py-3 text-sm">
+        <span class="text-base-content/70">
           <%= @inventory.meta.total %> skills (page <%= @inventory.meta.page %> of <%= @inventory.meta.total_pages %>)
         </span>
         <button phx-click="bulk_disable_skills" class="text-sm text-red-600 hover:underline">
           Disable filtered
         </button>
-        <button phx-click="bulk_enable_skills" class="text-sm text-blue-700 hover:underline">
+        <button phx-click="bulk_enable_skills" class="text-sm text-primary hover:underline">
           Enable filtered
         </button>
       </div>
 
       <form id="bulk-group-skills" phx-submit="bulk_set_group_skills" class="flex flex-wrap items-end gap-4 px-4 pb-4">
         <div>
-          <label for="bulk-skill-group-tag" class="block text-sm text-gray-700">Set group for filtered</label>
+          <label for="bulk-skill-group-tag" class="block text-sm text-base-content/80">Set group for filtered</label>
           <input
             type="text"
             id="bulk-skill-group-tag"
             name="group_tag"
             placeholder="reviewers (empty clears)"
-            class="mt-1 w-64 rounded border border-gray-300 px-2 py-1 font-mono text-sm"
+            class="input input-bordered input-sm w-64 font-mono"
           />
         </div>
-        <button type="submit" class="rounded bg-blue-600 px-4 py-2 text-sm text-white">Apply group</button>
+        <button type="submit" class="btn btn-primary btn-sm">Apply group</button>
       </form>
 
-      <ul :if={@inventory.data == []} class="px-4 pb-4 text-sm text-gray-500">
+      <ul :if={@inventory.data == []} class="px-4 pb-4 text-sm text-base-content/70">
         <li>No skills installed</li>
       </ul>
-      <ul class="divide-y divide-gray-100">
+      <ul class="divide-y divide-base-200">
         <li :for={row <- @inventory.data} class="px-4 py-2">
           <div class="flex items-center justify-between">
-            <span class="font-mono text-sm text-gray-900"><%= row.name %></span>
-            <span class="text-sm text-gray-500">
+            <span class="font-mono text-sm text-base-content"><%= row.name %></span>
+            <span class="text-sm text-base-content/70">
               <%= row.owner %> &middot; <%= row.files %> files &middot; <%= if row.enabled, do: "enabled", else: "disabled" %> &middot; <%= group_label(row.group_tag) %>
             </span>
           </div>
-          <p class="font-mono text-sm text-gray-500"><%= row.uri %></p>
+          <p class="font-mono text-sm text-base-content/70"><%= row.uri %></p>
           <div class="mt-1 flex items-center gap-4">
             <button
               phx-click="toggle_skill"
               phx-value-uri={row.uri}
               phx-value-enabled={to_string(row.enabled)}
-              class="text-sm text-blue-700 hover:underline"
+              class="text-sm text-primary hover:underline"
             >
               <%= if row.enabled, do: "Disable", else: "Enable" %>
             </button>
             <button
               phx-click="toggle_llm_view"
               phx-value-uri={row.uri}
-              class="text-sm text-blue-700 hover:underline"
+              class="text-sm text-primary hover:underline"
             >
               <%= if @llm_uri == row.uri, do: "Hide LLM view", else: "LLM view" %>
             </button>
@@ -786,18 +786,18 @@ defmodule AgentDbWeb.AdminComponents do
                 name="group_tag"
                 value={row.group_tag}
                 placeholder="group (empty clears)"
-                class="w-40 rounded border border-gray-300 px-2 py-1 font-mono text-sm"
+                class="input input-bordered input-sm w-40 font-mono"
               />
-              <button type="submit" class="text-sm text-blue-700 hover:underline">Set group</button>
+              <button type="submit" class="text-sm text-primary hover:underline">Set group</button>
             </form>
           </div>
-          <div :if={@llm_uri == row.uri} class="mt-2 space-y-3 border-t border-gray-100 pt-2">
-            <p :if={is_nil(@llm_view) or @llm_view[:error]} class="text-sm text-gray-500">
+          <div :if={@llm_uri == row.uri} class="mt-2 space-y-3 border-t border-base-200 pt-2">
+            <p :if={is_nil(@llm_view) or @llm_view[:error]} class="text-sm text-base-content/70">
               Could not load files for this skill.
             </p>
             <p
               :if={!is_nil(@llm_view) and !@llm_view[:error] and @llm_view.files == []}
-              class="text-sm text-gray-500"
+              class="text-sm text-base-content/70"
             >
               No files stored under this skill.
             </p>
@@ -806,14 +806,14 @@ defmodule AgentDbWeb.AdminComponents do
               :if={!is_nil(@llm_view) and !@llm_view[:error] and @llm_view.meta.total_pages > 1}
               class="flex items-center gap-4 text-sm"
             >
-              <span class="text-gray-500">
+              <span class="text-base-content/70">
                 Page <%= @llm_view.meta.page %> of <%= @llm_view.meta.total_pages %>
               </span>
               <button
                 :if={@llm_view.meta.page > 1}
                 phx-click="llm_files_page"
                 phx-value-page={@llm_view.meta.page - 1}
-                class="text-blue-700 hover:underline"
+                class="text-primary hover:underline"
               >
                 Previous
               </button>
@@ -821,7 +821,7 @@ defmodule AgentDbWeb.AdminComponents do
                 :if={@llm_view.meta.page < @llm_view.meta.total_pages}
                 phx-click="llm_files_page"
                 phx-value-page={@llm_view.meta.page + 1}
-                class="text-blue-700 hover:underline"
+                class="text-primary hover:underline"
               >
                 Next
               </button>
@@ -830,15 +830,15 @@ defmodule AgentDbWeb.AdminComponents do
         </li>
       </ul>
 
-      <div :if={@inventory.meta.total_pages > 1} class="flex items-center gap-4 border-t border-gray-200 px-4 py-3 text-sm">
-        <span class="text-gray-500">
+      <div :if={@inventory.meta.total_pages > 1} class="flex items-center gap-4 border-t border-base-300 px-4 py-3 text-sm">
+        <span class="text-base-content/70">
           Page <%= @inventory.meta.page %> of <%= @inventory.meta.total_pages %>
         </span>
         <button
           :if={@inventory.meta.page > 1}
           phx-click="skills_page"
           phx-value-page={@inventory.meta.page - 1}
-          class="text-blue-700 hover:underline"
+          class="text-primary hover:underline"
         >
           Previous
         </button>
@@ -846,7 +846,7 @@ defmodule AgentDbWeb.AdminComponents do
           :if={@inventory.meta.page < @inventory.meta.total_pages}
           phx-click="skills_page"
           phx-value-page={@inventory.meta.page + 1}
-          class="text-blue-700 hover:underline"
+          class="text-primary hover:underline"
         >
           Next
         </button>
@@ -877,8 +877,8 @@ defmodule AgentDbWeb.AdminComponents do
   """
   def llm_layers(assigns) do
     ~H"""
-    <section class="admin-card admin-card-indigo rounded-lg border border-gray-200 bg-white shadow-sm">
-      <h2 class="admin-card-title px-4 py-3 font-medium text-gray-900"><%= @title %></h2>
+    <section class="card bg-base-100 shadow-md rounded-lg border-t-4 border-indigo-500">
+      <h2 class="card-title px-4 py-3 font-medium text-base-content"><%= @title %></h2>
       <div class="space-y-4 px-4 pb-4">
         <.llm_layer label="Abstract (L0)" layer={@layers.l0} />
         <.llm_layer label="Overview (L1)" layer={@layers.l1} />
@@ -895,33 +895,33 @@ defmodule AgentDbWeb.AdminComponents do
     ~H"""
     <div>
       <div class="flex items-baseline gap-2 text-sm">
-        <h3 class="font-medium text-gray-900"><%= @label %></h3>
-        <span class={["rounded px-2 py-0.5 font-mono text-xs", layer_badge_class(@layer.source)]}>
+        <h3 class="font-medium text-base-content"><%= @label %></h3>
+        <span class={["badge badge-sm font-mono", layer_badge_class(@layer.source)]}>
           <%= @layer.source %>
         </span>
-        <span class="font-mono text-xs text-gray-500"><%= @layer.chars %> chars</span>
+        <span class="font-mono text-xs text-base-content/70"><%= @layer.chars %> chars</span>
       </div>
-      <p :if={@layer.source == :unavailable} class="mt-1 text-sm text-gray-500">Not available.</p>
+      <p :if={@layer.source == :unavailable} class="mt-1 text-sm text-base-content/70">Not available.</p>
       <pre
         :if={@layer.source != :unavailable and @layer.chars <= 500}
-        class="mt-1 whitespace-pre-wrap rounded bg-gray-50 px-3 py-2 font-mono text-sm text-gray-900"
+        class="mt-1 whitespace-pre-wrap rounded bg-base-200 px-3 py-2 font-mono text-sm text-base-content"
       ><%= @layer.text %></pre>
       <div :if={@layer.source != :unavailable and @layer.chars > 500} class="mt-1">
-        <pre class="whitespace-pre-wrap rounded bg-gray-50 px-3 py-2 font-mono text-sm text-gray-900"><%= String.slice(@layer.text, 0, 500) %>…</pre>
+        <pre class="whitespace-pre-wrap rounded bg-base-200 px-3 py-2 font-mono text-sm text-base-content"><%= String.slice(@layer.text, 0, 500) %>…</pre>
         <details class="mt-1">
-          <summary class="cursor-pointer text-sm text-blue-700 hover:underline">
+          <summary class="cursor-pointer text-sm text-primary hover:underline">
             Show full <%= @label %> (<%= @layer.chars %> chars)
           </summary>
-          <pre class="mt-1 max-h-96 overflow-auto whitespace-pre-wrap rounded bg-gray-50 px-3 py-2 font-mono text-sm text-gray-900"><%= @layer.text %></pre>
+          <pre class="mt-1 max-h-96 overflow-auto whitespace-pre-wrap rounded bg-base-200 px-3 py-2 font-mono text-sm text-base-content"><%= @layer.text %></pre>
         </details>
       </div>
     </div>
     """
   end
 
-  defp layer_badge_class(:stored), do: "bg-green-50 text-green-800"
-  defp layer_badge_class(:fallback), do: "bg-amber-50 text-amber-700"
-  defp layer_badge_class(_other), do: "bg-gray-50 text-gray-500"
+  defp layer_badge_class(:stored), do: "badge-success"
+  defp layer_badge_class(:fallback), do: "badge-warning"
+  defp layer_badge_class(_other), do: "badge-ghost"
 
   # -- storage, cache, indexes, runtime --
 
@@ -931,56 +931,56 @@ defmodule AgentDbWeb.AdminComponents do
   @doc "What the store holds, and how much of that is the cache rather than content."
   def footprint(assigns) do
     ~H"""
-    <section class="admin-card admin-card-emerald rounded-lg border border-gray-200 bg-white shadow-sm">
-      <h2 class="admin-card-title px-4 py-3 font-medium text-gray-900">Storage</h2>
+    <section class="card bg-base-100 shadow-md rounded-lg border-t-4 border-emerald-500">
+      <h2 class="card-title px-4 py-3 font-medium text-base-content">Storage</h2>
 
-      <p :if={Map.get(@storage, :available, true) == false} class="px-4 pb-2 text-sm text-red-700">
+      <p :if={Map.get(@storage, :available, true) == false} class="px-4 pb-2 text-sm text-error">
         Storage unavailable: <%= Map.get(@storage, :reason, :error) %>
       </p>
 
       <dl :if={Map.get(@storage, :available, true) != false} class="grid grid-cols-4 gap-4 px-4 pb-2 text-sm">
         <div>
-          <dt class="text-gray-500">documents</dt>
-          <dd class="text-lg font-semibold text-gray-900"><%= Map.get(@storage, :documents, 0) %></dd>
+          <dt class="text-base-content/70">documents</dt>
+          <dd class="text-lg font-semibold text-base-content"><%= Map.get(@storage, :documents, 0) %></dd>
         </div>
         <div>
-          <dt class="text-gray-500">directories</dt>
-          <dd class="text-lg font-semibold text-gray-900"><%= Map.get(@storage, :directories, 0) %></dd>
+          <dt class="text-base-content/70">directories</dt>
+          <dd class="text-lg font-semibold text-base-content"><%= Map.get(@storage, :directories, 0) %></dd>
         </div>
         <div>
-          <dt class="text-gray-500">database</dt>
-          <dd class="font-mono text-gray-900"><%= format_bytes(Map.get(@storage, :db_bytes)) %></dd>
+          <dt class="text-base-content/70">database</dt>
+          <dd class="font-mono text-base-content"><%= format_bytes(Map.get(@storage, :db_bytes)) %></dd>
         </div>
         <div>
-          <dt class="text-gray-500">write-ahead log</dt>
-          <dd class="font-mono text-gray-900"><%= format_bytes(Map.get(@storage, :wal_bytes)) %></dd>
+          <dt class="text-base-content/70">write-ahead log</dt>
+          <dd class="font-mono text-base-content"><%= format_bytes(Map.get(@storage, :wal_bytes)) %></dd>
         </div>
       </dl>
 
       <dl class="grid grid-cols-3 gap-4 px-4 pb-4 text-sm">
         <div :for={{subtree, count} <- Enum.sort(Map.get(@storage, :by_top_subtree, %{}))}>
-          <dt class="text-gray-500"><%= subtree_label(subtree) %></dt>
-          <dd class="font-mono text-gray-900"><%= count %> docs</dd>
+          <dt class="text-base-content/70"><%= subtree_label(subtree) %></dt>
+          <dd class="font-mono text-base-content"><%= count %> docs</dd>
         </div>
       </dl>
 
-      <p class="px-4 pb-2 text-sm text-gray-500">Cache</p>
+      <p class="px-4 pb-2 text-sm text-base-content/70">Cache</p>
       <dl class="grid grid-cols-3 gap-4 px-4 pb-4 text-sm">
         <div>
-          <dt class="text-gray-500">nodes</dt>
-          <dd class="font-mono text-gray-900">
+          <dt class="text-base-content/70">nodes</dt>
+          <dd class="font-mono text-base-content">
             <%= entry_text(Map.get(@cache, :node_cache, %{})) %>
           </dd>
         </div>
         <div>
-          <dt class="text-gray-500">listings</dt>
-          <dd class="font-mono text-gray-900">
+          <dt class="text-base-content/70">listings</dt>
+          <dd class="font-mono text-base-content">
             <%= entry_text(Map.get(@cache, :dir_cache, %{})) %>
           </dd>
         </div>
         <div>
-          <dt class="text-gray-500">total</dt>
-          <dd class="font-mono text-gray-900"><%= format_bytes(Map.get(@cache, :total_bytes)) %></dd>
+          <dt class="text-base-content/70">total</dt>
+          <dd class="font-mono text-base-content"><%= format_bytes(Map.get(@cache, :total_bytes)) %></dd>
         </div>
       </dl>
     </section>
@@ -1027,41 +1027,41 @@ defmodule AgentDbWeb.AdminComponents do
   """
   def indexes(assigns) do
     ~H"""
-    <section class="admin-card admin-card-teal rounded-lg border border-gray-200 bg-white shadow-sm">
-      <h2 class="admin-card-title px-4 py-3 font-medium text-gray-900">Indexes</h2>
+    <section class="card bg-base-100 shadow-md rounded-lg border-t-4 border-teal-500">
+      <h2 class="card-title px-4 py-3 font-medium text-base-content">Indexes</h2>
 
       <dl class="grid grid-cols-4 gap-4 px-4 pb-4 text-sm">
         <div>
-          <dt class="text-gray-500">vector</dt>
-          <dd class="font-mono text-gray-900"><%= vector_line(@coverage) %></dd>
+          <dt class="text-base-content/70">vector</dt>
+          <dd class="font-mono text-base-content"><%= vector_line(@coverage) %></dd>
         </div>
         <div>
-          <dt class="text-gray-500">active dim</dt>
-          <dd class="font-mono text-gray-900"><%= Map.get(@coverage, :active_dim, "—") %></dd>
+          <dt class="text-base-content/70">active dim</dt>
+          <dd class="font-mono text-base-content"><%= Map.get(@coverage, :active_dim, "—") %></dd>
         </div>
         <div>
-          <dt class="text-gray-500">reclaimable</dt>
-          <dd class="font-mono text-gray-900"><%= Map.get(@coverage, :reclaimable, 0) %></dd>
+          <dt class="text-base-content/70">reclaimable</dt>
+          <dd class="font-mono text-base-content"><%= Map.get(@coverage, :reclaimable, 0) %></dd>
         </div>
         <div>
-          <dt class="text-gray-500">missing from active dim</dt>
-          <dd class="font-mono text-gray-900"><%= missing_from_active(@coverage) %></dd>
+          <dt class="text-base-content/70">missing from active dim</dt>
+          <dd class="font-mono text-base-content"><%= missing_from_active(@coverage) %></dd>
         </div>
         <div>
-          <dt class="text-gray-500">code</dt>
-          <dd class="font-mono text-gray-900">
+          <dt class="text-base-content/70">code</dt>
+          <dd class="font-mono text-base-content">
             <%= Map.get(@coverage, :code_documents, 0) %> docs
           </dd>
         </div>
         <div>
-          <dt class="text-gray-500">hex docs</dt>
-          <dd class="font-mono text-gray-900">
+          <dt class="text-base-content/70">hex docs</dt>
+          <dd class="font-mono text-base-content">
             <%= Map.get(@coverage, :hex_documents, 0) %> docs
           </dd>
         </div>
         <div>
-          <dt class="text-gray-500">locked packages</dt>
-          <dd class="font-mono text-gray-900">
+          <dt class="text-base-content/70">locked packages</dt>
+          <dd class="font-mono text-base-content">
             <%= Map.get(@coverage, :hex_packages, 0) %> of <%= Map.get(@coverage, :hex_locked, 0) %> covered
           </dd>
         </div>
@@ -1091,11 +1091,11 @@ defmodule AgentDbWeb.AdminComponents do
 
   def operation_stats(assigns) do
     ~H"""
-    <section class="admin-card admin-card-blue rounded-lg border border-gray-200 bg-white shadow-sm">
-      <h2 class="admin-card-title px-4 py-3 font-medium text-gray-900">Operation statistics</h2>
+    <section class="card bg-base-100 shadow-md rounded-lg border-t-4 border-blue-500">
+      <h2 class="card-title px-4 py-3 font-medium text-base-content">Operation statistics</h2>
       <table class="w-full text-sm">
         <thead>
-          <tr class="text-left text-gray-500">
+          <tr class="text-left text-base-content/70">
             <th class="px-4 py-2">operation</th>
             <th class="px-4 py-2">success</th>
             <th class="px-4 py-2">failure</th>
@@ -1124,46 +1124,46 @@ defmodule AgentDbWeb.AdminComponents do
   @doc "How long the node has been up, what it is running, and what has failed."
   def runtime(assigns) do
     ~H"""
-    <section class="admin-card admin-card-orange rounded-lg border border-gray-200 bg-white shadow-sm">
-      <h2 class="admin-card-title px-4 py-3 font-medium text-gray-900">Runtime</h2>
-      <p :if={@runtime[:error]} class="px-4 pb-2 text-sm text-gray-500">
+    <section class="card bg-base-100 shadow-md rounded-lg border-t-4 border-orange-500">
+      <h2 class="card-title px-4 py-3 font-medium text-base-content">Runtime</h2>
+      <p :if={@runtime[:error]} class="px-4 pb-2 text-sm text-base-content/70">
         A runtime snapshot could not be taken.
       </p>
       <dl :if={!@runtime[:error]} class="grid grid-cols-5 gap-4 px-4 pb-2 text-sm">
         <div>
-          <dt class="text-gray-500">uptime</dt>
-          <dd class="font-mono text-gray-900"><%= format_ms(Map.get(@runtime, :uptime_ms)) %></dd>
+          <dt class="text-base-content/70">uptime</dt>
+          <dd class="font-mono text-base-content"><%= format_ms(Map.get(@runtime, :uptime_ms)) %></dd>
         </div>
         <div>
-          <dt class="text-gray-500">processes</dt>
-          <dd class="font-mono text-gray-900">
+          <dt class="text-base-content/70">processes</dt>
+          <dd class="font-mono text-base-content">
             <%= process_count(@runtime) %>
           </dd>
         </div>
         <div>
-          <dt class="text-gray-500">supervisors</dt>
-          <dd class="font-mono text-gray-900"><%= length(Map.get(@runtime, :supervisors, [])) %></dd>
+          <dt class="text-base-content/70">supervisors</dt>
+          <dd class="font-mono text-base-content"><%= length(Map.get(@runtime, :supervisors, [])) %></dd>
         </div>
         <div>
-          <dt class="text-gray-500">ETS tables</dt>
-          <dd class="font-mono text-gray-900"><%= length(Map.get(@runtime, :ets, [])) %></dd>
+          <dt class="text-base-content/70">ETS tables</dt>
+          <dd class="font-mono text-base-content"><%= length(Map.get(@runtime, :ets, [])) %></dd>
         </div>
         <div>
-          <dt class="text-gray-500">BEAM memory</dt>
-          <dd class="font-mono text-gray-900">
+          <dt class="text-base-content/70">BEAM memory</dt>
+          <dd class="font-mono text-base-content">
             <%= format_bytes(Map.get(Map.get(@runtime, :memory, %{}), :total)) %>
           </dd>
         </div>
       </dl>
 
-      <p class="px-4 pb-2 text-sm text-gray-500">Recent failures</p>
-      <ul :if={@errors == []} class="px-4 pb-4 text-sm text-gray-500">
+      <p class="px-4 pb-2 text-sm text-base-content/70">Recent failures</p>
+      <ul :if={@errors == []} class="px-4 pb-4 text-sm text-base-content/70">
         <li>No recorded failures</li>
       </ul>
-      <ul id="recent-errors" :if={@errors != []} class="divide-y divide-gray-100 border-t border-gray-200">
+      <ul id="recent-errors" :if={@errors != []} class="divide-y divide-base-200 border-t border-base-300">
         <li :for={entry <- @errors} class="flex items-center justify-between px-4 py-2 text-sm">
-          <span class="font-mono text-gray-900"><%= entry.operation || entry.family %></span>
-          <span class="text-red-700"><%= entry.reason %></span>
+          <span class="font-mono text-base-content"><%= entry.operation || entry.family %></span>
+          <span class="text-error"><%= entry.reason %></span>
         </li>
       </ul>
     </section>
@@ -1200,18 +1200,18 @@ defmodule AgentDbWeb.AdminComponents do
 
   def memory_stats(assigns) do
     ~H"""
-    <section class="admin-card admin-card-purple rounded-lg border border-gray-200 bg-white shadow-sm">
-      <h2 class="admin-card-title px-4 py-3 font-medium text-gray-900">Memory statistics</h2>
-      <p class="px-4 pb-2 text-sm text-gray-500">per type</p>
+    <section class="card bg-base-100 shadow-md rounded-lg border-t-4 border-purple-500">
+      <h2 class="card-title px-4 py-3 font-medium text-base-content">Memory statistics</h2>
+      <p class="px-4 pb-2 text-sm text-base-content/70">per type</p>
       <ul class="px-4 pb-2 text-sm">
         <li :for={{type, count} <- Enum.sort(Map.get(@stats, :by_type, Map.get(@stats, :types, %{})))}><%= type %>: <%= count %></li>
       </ul>
-      <p class="px-4 pb-2 text-sm text-gray-500">per status</p>
+      <p class="px-4 pb-2 text-sm text-base-content/70">per status</p>
       <ul class="px-4 pb-2 text-sm">
         <li :for={{status, count} <- Enum.sort(Map.get(@stats, :by_status, Map.get(@stats, :statuses, %{})))}><%= status %>: <%= count %></li>
       </ul>
-      <p class="px-4 pb-2 text-sm text-gray-500">waiting for review: <%= Map.get(@stats, :pending, Map.get(@stats, :waiting, 0)) %></p>
-      <p class="px-4 pb-2 text-sm text-gray-500">never surfaced: <%= Map.get(@stats, :never_surfaced, Map.get(@stats, :unsurfaced, 0)) %></p>
+      <p class="px-4 pb-2 text-sm text-base-content/70">waiting for review: <%= Map.get(@stats, :pending, Map.get(@stats, :waiting, 0)) %></p>
+      <p class="px-4 pb-2 text-sm text-base-content/70">never surfaced: <%= Map.get(@stats, :never_surfaced, Map.get(@stats, :unsurfaced, 0)) %></p>
     </section>
     """
   end
@@ -1220,18 +1220,18 @@ defmodule AgentDbWeb.AdminComponents do
 
   def memory_candidates(assigns) do
     ~H"""
-    <section class="admin-card admin-card-purple rounded-lg border border-gray-200 bg-white shadow-sm">
-      <h2 class="admin-card-title px-4 py-3 font-medium text-gray-900">Waiting for review</h2>
-      <ul :if={@candidates == []} class="px-4 pb-4 text-sm text-gray-500">
+    <section class="card bg-base-100 shadow-md rounded-lg border-t-4 border-purple-500">
+      <h2 class="card-title px-4 py-3 font-medium text-base-content">Waiting for review</h2>
+      <ul :if={@candidates == []} class="px-4 pb-4 text-sm text-base-content/70">
         <li>No candidates waiting</li>
       </ul>
-      <ul id="memory-candidates" :if={@candidates != []} class="divide-y divide-gray-100">
+      <ul id="memory-candidates" :if={@candidates != []} class="divide-y divide-base-200">
         <li :for={m <- @candidates} class="px-4 py-2 text-sm">
-          <span class="font-mono text-gray-900"><%= m.uri %></span>
-          <span class="text-gray-700"><%= m.value %></span>
+          <span class="font-mono text-base-content"><%= m.uri %></span>
+          <span class="text-base-content/80"><%= m.value %></span>
           <button phx-click="promote" phx-value-uri={m.uri} class="ml-2 text-green-700">Promote</button>
-          <button phx-click="reject" phx-value-uri={m.uri} class="ml-2 text-red-700">Reject</button>
-          <button phx-click="forget" phx-value-uri={m.uri} class="ml-2 text-gray-700">Forget</button>
+          <button phx-click="reject" phx-value-uri={m.uri} class="ml-2 text-error">Reject</button>
+          <button phx-click="forget" phx-value-uri={m.uri} class="ml-2 text-base-content/80">Forget</button>
         </li>
       </ul>
     </section>

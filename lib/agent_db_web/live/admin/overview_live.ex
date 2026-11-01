@@ -29,7 +29,7 @@ defmodule AgentDbWeb.Admin.OverviewLive do
     ~H"""
     <div class="p-8 space-y-8">
       <header>
-        <h1 class="text-2xl font-semibold text-gray-900">Overview</h1>
+        <h1 class="text-2xl font-semibold text-base-content">Overview</h1>
       </header>
 
       <AdminComponents.recent_changes changes={@recent_changes} />

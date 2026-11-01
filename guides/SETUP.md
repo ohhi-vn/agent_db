@@ -251,6 +251,14 @@ mix run --no-start tools/verify_package.exs
 `mix lint:quick` exists because Dialyzer's PLT analysis dominates the runtime;
 use it while working and `mix lint` before pushing.
 
+### Console assets
+
+The `/admin` console is styled with Tailwind CSS plus the daisyUI component
+library, installed as an npm dependency under `assets/`. Rebuild the committed
+stylesheet with `mix assets.build` (or `mix assets.deploy` for the digested
+production bundle) after changing console markup; the daisyUI theme is `light`
+by default.
+
 ### Reading the output
 
 A **cold** build compiles the EXLA/Nx/Phoenix tree and prints thousands of
